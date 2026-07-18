@@ -695,6 +695,18 @@ test_cloudflare_preflight() (
   address_in_cloudflare_ranges 2606:4700::1234 || fail "known Cloudflare IPv6 rejected"
   address_in_cloudflare_ranges 203.0.113.1 && fail "outside IPv4 accepted as Cloudflare"
   address_in_cloudflare_ranges bad-ip && fail "malformed IP accepted as Cloudflare"
+  : >"$temp_dir/empty-ranges"
+  validate_cloudflare_range_file "$temp_dir/empty-ranges" 4 &&
+    fail "empty Cloudflare range file accepted"
+  printf ' \n\t\n' >"$temp_dir/whitespace-ranges"
+  validate_cloudflare_range_file "$temp_dir/whitespace-ranges" 6 &&
+    fail "whitespace-only Cloudflare range file accepted"
+  printf '%s\n' '2606:4700::/32' >"$temp_dir/wrong-family-ranges"
+  validate_cloudflare_range_file "$temp_dir/wrong-family-ranges" 4 &&
+    fail "wrong-family Cloudflare range accepted"
+  printf '%s\n' '104.16.1.1/13' >"$temp_dir/non-strict-ranges"
+  validate_cloudflare_range_file "$temp_dir/non-strict-ranges" 4 &&
+    fail "non-strict Cloudflare range accepted"
 
   getent() {
     [[ "$1 $2" == 'ahosts vpn.example.com' ]] || return 1
@@ -741,10 +753,53 @@ test_environment_preflight() (
   assert_fails "must be different" validate_unique_public_ports
   legacy_nginx_config_path /etc/nginx/conf.d/v2ray-vpn.example.com.conf || fail "legacy Nginx path rejected"
   legacy_nginx_config_path /tmp/v2ray-vpn.example.com.conf && fail "non-project Nginx path accepted"
-  ss() { printf '%s\n' 'LISTEN 0 4096 0.0.0.0:443 0.0.0.0:* users:(("other",pid=1,fd=3))'; }
+
+  nginx() {
+    [[ "$1" == '-T' ]] || return 1
+    cat <<'NGINX'
+# configuration file /etc/nginx/conf.d/v2ray-vpn.example.com.conf:
+server {
+  listen 8443 ssl;
+  location / { return 200 "ok\n"; }
+  proxy_set_header Upgrade $http_upgrade;
+  proxy_pass http://127.0.0.1:31001;
+}
+NGINX
+  }
+  legacy_nginx_config_for_port_is_project_owned 8443 ||
+    fail "matching legacy Nginx listener was not recognized"
+  legacy_nginx_config_for_port_is_project_owned 443 &&
+    fail "legacy Nginx config was accepted for an unrelated port"
+
+  ss() {
+    if [[ "$#" -eq 3 && "$1 $2 $3" == '-H -ltnp sport = :443' ]]; then
+      printf '%s\n' 'LISTEN 0 4096 0.0.0.0:443 0.0.0.0:* users:(("nginx",pid=1,fd=3))'
+    elif [[ "$#" -eq 3 && "$1 $2 $3" == '-H -ltnp sport = :8443' ]]; then
+      :
+    elif [[ "$#" -eq 1 && "$1" == '-lntp' ]]; then
+      printf '%s\n' 'State Recv-Q Send-Q Local Address:Port Peer Address:Port Process' \
+        'LISTEN 0 4096 0.0.0.0:443 0.0.0.0:* users:(("nginx",pid=1,fd=3))'
+    else
+      return 1
+    fi
+  }
   REALITY_PORT="443"
   CLOUDFLARE_PORT="8443"
-  assert_fails "listener conflict" check_public_port_listeners
+  assert_fails "State Recv-Q Send-Q" check_public_port_listeners
+
+  nginx() {
+    [[ "$1" == '-T' ]] || return 1
+    cat <<'NGINX'
+# configuration file /etc/nginx/conf.d/v2ray-vpn.example.com.conf:
+server {
+  listen 443 ssl;
+  location / { return 200 "ok\n"; }
+  proxy_set_header Upgrade $http_upgrade;
+  proxy_pass http://127.0.0.1:31001;
+}
+NGINX
+  }
+  check_public_port_listeners
 )
 
 test_environment_preflight

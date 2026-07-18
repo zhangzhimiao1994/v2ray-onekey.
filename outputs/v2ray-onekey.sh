@@ -478,13 +478,17 @@ import ipaddress
 import sys
 
 try:
+    found_range = False
     with open(sys.argv[1], encoding="utf-8") as handle:
         for raw_line in handle:
             line = raw_line.strip()
             if not line:
                 continue
+            found_range = True
             if ipaddress.ip_network(line, strict=True).version != int(sys.argv[2]):
                 raise ValueError(line)
+    if not found_range:
+        raise ValueError("no ranges")
 except (OSError, ValueError):
     raise SystemExit(1)
 PY
@@ -544,21 +548,71 @@ legacy_project_nginx_exists() {
   return 1
 }
 
+legacy_nginx_config_for_port_is_project_owned() {
+  local port="$1" nginx_output
+  nginx_output="$(nginx -T 2>&1)" || return 1
+  printf '%s\n' "$nginx_output" | python3 -c '
+import re
+import sys
+
+port = re.escape(sys.argv[1])
+path_pattern = re.compile(r"/etc/nginx/conf\.d/v2ray-[A-Za-z0-9.-]+\.conf")
+listen_pattern = re.compile(
+    rf"^\s*listen\s+(?:(?:\[[0-9A-Fa-f:]+\]|[0-9.]+):)?{port}(?=\s|;)",
+    re.MULTILINE,
+)
+header_pattern = re.compile(r"^# configuration file (.+):$")
+required_signatures = (
+    "proxy_set_header Upgrade",
+    "proxy_pass http://127.0.0.1:",
+    "return 200 \"ok",
+)
+
+
+def project_owned(path, content):
+    return (
+        path_pattern.fullmatch(path) is not None
+        and listen_pattern.search(content) is not None
+        and all(signature in content for signature in required_signatures)
+    )
+
+
+path = None
+content = []
+for line in sys.stdin:
+    header = header_pattern.match(line.rstrip("\n"))
+    if header:
+        if path is not None and project_owned(path, "".join(content)):
+            raise SystemExit(0)
+        path = header.group(1)
+        content = []
+    elif path is not None:
+        content.append(line)
+if path is not None and project_owned(path, "".join(content)):
+    raise SystemExit(0)
+raise SystemExit(1)
+' "$port"
+}
+
 listener_is_managed() {
-  local listener="$1"
+  local listener="$1" port="$2"
   [[ "$listener" == *xray* || "$listener" == *v2ray* ]] && return 0
-  [[ "$listener" == *nginx* ]] && legacy_project_nginx_exists
+  [[ "$listener" == *nginx* ]] && legacy_nginx_config_for_port_is_project_owned "$port"
 }
 
 check_public_port_listeners() {
-  local port listeners listener
+  local port listeners listener full_listeners
   for port in "${REALITY_PORT:-}" "${CLOUDFLARE_PORT:-}"; do
     [[ -n "$port" ]] || continue
     listeners="$(ss -H -ltnp "sport = :$port" 2>&1)" || die "Unable to inspect listeners with ss: $listeners"
     [[ -z "$listeners" ]] && continue
     while IFS= read -r listener; do
       [[ -z "$listener" ]] && continue
-      listener_is_managed "$listener" || die "Public port $port listener conflict: $listener"
+      listener_is_managed "$listener" "$port" && continue
+      full_listeners="$(ss -lntp 2>&1)" || full_listeners="ss -lntp failed: $full_listeners"
+      die "Public port $port listener conflict: $listener
+ss -lntp output:
+$full_listeners"
     done <<<"$listeners"
   done
 }
