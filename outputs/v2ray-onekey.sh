@@ -33,14 +33,33 @@ valid_domain() {
   [[ "$1" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ ]]
 }
 
-valid_port() {
+normalize_port() {
   local port="${1:-}"
   [[ "$port" =~ ^[0-9]+$ ]] || return 1
   while [[ "$port" == 0* ]]; do
     port="${port#0}"
   done
-  [[ -n "$port" && ${#port} -le 5 ]] || return 1
+  printf '%s\n' "${port:-0}"
+}
+
+valid_port() {
+  local port=""
+  port="$(normalize_port "${1:-}")" || return 1
+  [[ ${#port} -le 5 ]] || return 1
   (( 10#$port >= 1 && 10#$port <= 65535 ))
+}
+
+valid_ipv4() {
+  local address="${1:-}"
+  local octet=""
+  local -a octets=()
+  [[ "$address" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)\.([0-9]+)$ ]] || return 1
+  octets=("${BASH_REMATCH[@]:1}")
+  for octet in "${octets[@]}"; do
+    octet="$(normalize_port "$octet")" || return 1
+    [[ ${#octet} -le 3 ]] || return 1
+    (( 10#$octet <= 255 )) || return 1
+  done
 }
 
 valid_reality_target() {
@@ -50,7 +69,7 @@ valid_reality_target() {
   [[ "$target" == *:* ]] || return 1
   hostname="${target%:*}"
   port="${target##*:}"
-  [[ "$hostname" =~ ^[^[:space:]:]+$ ]] || return 1
+  valid_domain "$hostname" || valid_ipv4 "$hostname" || return 1
   valid_port "$port"
 }
 
@@ -214,10 +233,12 @@ validate_options() {
 
   if mode_has_reality; then
     valid_port "$REALITY_PORT" || die "Invalid REALITY port: $REALITY_PORT"
+    REALITY_PORT="$(normalize_port "$REALITY_PORT")"
     valid_reality_target "$REALITY_TARGET" || die "Invalid REALITY target: $REALITY_TARGET (expected HOST:PORT)"
   fi
   if mode_has_cloudflare; then
     valid_port "$CLOUDFLARE_PORT" || die "Invalid Cloudflare port: $CLOUDFLARE_PORT"
+    CLOUDFLARE_PORT="$(normalize_port "$CLOUDFLARE_PORT")"
   fi
   if [[ "$MODE" == "dual" && "$REALITY_PORT" == "$CLOUDFLARE_PORT" ]]; then
     die "REALITY and Cloudflare public ports must be different in dual mode"

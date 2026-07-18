@@ -129,7 +129,15 @@ valid_port "65535" || fail "valid port rejected"
 valid_port "65536" && fail "invalid port accepted"
 valid_port "18446744073709551617" && fail "overflowing port accepted"
 valid_port "00008" || fail "leading-zero decimal port rejected"
+assert_eq "8" "$(normalize_port 00008)" "normalized decimal port"
+assert_eq "0" "$(normalize_port 00000)" "normalized all-zero port"
+valid_port "00000" && fail "all-zero port accepted"
 valid_reality_target "example.net:443" || fail "valid REALITY target rejected"
+valid_reality_target "192.0.2.1:443" || fail "valid IPv4 REALITY target rejected"
+valid_reality_target "/path:443" && fail "path-like REALITY hostname accepted"
+valid_reality_target "*:443" && fail "wildcard REALITY hostname accepted"
+valid_reality_target "bad host:443" && fail "whitespace in REALITY hostname accepted"
+valid_reality_target "192.0.2.256:443" && fail "out-of-range IPv4 REALITY hostname accepted"
 valid_reality_target "example.net" && fail "REALITY target without a port accepted"
 valid_reality_target "example.net:65536" && fail "REALITY target with an invalid port accepted"
 
@@ -193,15 +201,21 @@ validate_values dual vpn.example.com admin@example.com 1443 2443
 assert_eq "1443" "$REALITY_PORT" "custom REALITY port"
 assert_eq "2443" "$CLOUDFLARE_PORT" "custom Cloudflare port"
 
+validate_values dual vpn.example.com admin@example.com 01443 02443
+assert_eq "1443" "$REALITY_PORT" "canonical REALITY port"
+assert_eq "2443" "$CLOUDFLARE_PORT" "canonical Cloudflare port"
+
 reset_options
 assert_fails "--mode is required" select_mode </dev/null
-assert_fails "--mode requires a value" parse_args --mode
-assert_fails "--domain requires a value" parse_args --domain
+for option in --mode --domain --email --reality-port --cloudflare-port --reality-target --reality-uuid --cloudflare-uuid --ws-path; do
+  assert_fails "$option requires a value" parse_args "$option"
+done
 assert_fails "--domain is required" validate_values cloudflare "" admin@example.com "" ""
 assert_fails "--email is required" validate_values cloudflare vpn.example.com "" "" ""
 assert_fails "Invalid domain" validate_values cloudflare bad_domain admin@example.com "" ""
 assert_fails "Invalid REALITY port" validate_values reality "" "" 65536 ""
 assert_fails "must be different" validate_values dual vpn.example.com admin@example.com 443 443
+assert_fails "must be different" validate_values dual vpn.example.com admin@example.com 0443 443
 validate_reality_target_value example.net:443
 assert_fails "Invalid REALITY target" validate_reality_target_value example.net
 assert_fails "Invalid REALITY target" validate_reality_target_value example.net:65536
