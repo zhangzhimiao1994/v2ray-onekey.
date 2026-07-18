@@ -13,13 +13,23 @@
 
 - `root` 权限，以及使用 `systemd` 的 Linux 服务器。
 - 系统提供 `apt`、`dnf` 或 `yum` 包管理器。
-- 服务器至少有一个可从客户端访问的公网 IPv4 或 IPv6 地址。
+- `reality` 和 `dual` 模式需要可从客户端访问的公网 IPv4；当前脚本使用仅支持 IPv4 的地址发现服务生成 REALITY 导入链接。
+- `cloudflare` 模式可以使用工作正常的源站公网 IPv4 或 IPv6，并配置对应的 `A` 或 `AAAA` 记录。
 - 云服务商安全组和服务器防火墙允许所选 TCP 端口。
 - Cloudflare 模式还需要域名、有效邮箱，以及指向本机的 DNS 记录。
 
 脚本直接安装 Xray、Nginx、Certbot 并创建 systemd 服务。部署服务器不需要 Docker；Docker 仅供维护者运行测试。
 
 ## 快速部署
+
+在新 VPS 上先克隆项目。仓库名末尾确实包含一个点，以下 HTTPS 地址和目录名中的两个点及末尾点都不能省略：
+
+```bash
+git clone https://github.com/zhangzhimiao1994/v2ray-onekey..git
+cd 'v2ray-onekey.'
+```
+
+如果系统尚未安装 `git`，请先使用系统的 `apt`、`dnf` 或 `yum` 安装。进入项目目录后再运行以下命令。
 
 交互式选择模式：
 
@@ -70,6 +80,18 @@ Cloudflare 代理支持的 HTTPS 公网端口仅限 `443`、`2053`、`2083`、`2
 - 相同域名与端口的 Nginx 配置会被拒绝，避免证书签发或流量路由到错误站点。
 - REALITY 是独立 TCP 入口，不能与 Nginx 共享同一个端口。
 
+## REALITY 目标站点
+
+`--reality-target HOST:PORT` 用于设置 REALITY 握手的目标 HTTPS 站点，默认值是 `www.microsoft.com:443`。安装器会从 VPS 探测该目标是否可达。
+
+请选择服务器能够稳定访问的普通 HTTPS 站点，优先考虑与 VPS 位于同一 ASN 或邻近网络、且没有使用 Cloudflare 代理的站点。例如：
+
+```bash
+sudo bash outputs/v2ray-onekey.sh --mode reality --reality-target www.apple.com:443
+```
+
+目标站点需要按 VPS 所在网络实际测试和选择；它只是 REALITY 配置的一部分，不能保证 IP 或连接不会被封锁。
+
 ## Cloudflare 配置
 
 域名不是必需项。只使用 REALITY 时跳过本节；选择 `cloudflare` 或 `dual` 时，按以下步骤配置。
@@ -78,10 +100,13 @@ Cloudflare 代理支持的 HTTPS 公网端口仅限 `443`、`2053`、`2083`、`2
 2. 将该主机名的 Proxy status 设置为橙色云朵，即 **Proxied**。
 3. 在 **Network > WebSockets** 中开启 WebSockets。
 4. 在 **SSL/TLS** 中将加密模式设为 **Full (strict)**。
-5. 在云安全组和服务器防火墙放行源站端口：`cloudflare` 模式放行 TCP `80`、`443`；`dual` 模式放行 TCP `80`、`443`、`8443`。使用自定义端口时按实际值放行。
-6. 双入口模式中，REALITY 默认通过服务器 IP 和 `443` 直连，不能放到 Cloudflare 代理后面；Cloudflare 仅代理域名对应的 WebSocket + TLS 入口。
+5. TCP `80` 必须保持公网可达，供 Let's Encrypt HTTP-01 验证使用。Cloudflare TLS 回源端口（默认 `443` 或 `8443`）在条件允许时，建议在云安全组或服务商防火墙中仅允许 [Cloudflare 官方当前 IP 段](https://www.cloudflare.com/ips/) 访问，降低绕过 Cloudflare 直连源站的风险。
+6. `cloudflare` 模式需要开放 TCP `80` 和 `443`；`dual` 模式需要开放 TCP `80`、`443` 和 `8443`。使用自定义端口时按实际值配置。REALITY 端口必须保持公网直连，不能限制为仅 Cloudflare 来源。
+7. 双入口模式中，REALITY 默认通过服务器 IP 和 `443` 直连，不能放到 Cloudflare 代理后面；Cloudflare 仅代理域名对应的 WebSocket + TLS 入口。
 
 Let's Encrypt 使用 HTTP-01 验证，因此 TCP `80` 必须能从公网访问。如果域名开启代理后证书签发失败，可先将该 DNS 记录临时切换为 **DNS only**，重新运行脚本；签发成功后再恢复橙色云朵。
+
+安装器仅在检测到 UFW 或 firewalld 已处于活动状态时，自动放行所选本机端口。云服务商安全组、服务商防火墙及其来源 IP 限制仍需用户自行配置和维护；Cloudflare IP 段可能更新，防火墙规则应始终以官方当前列表为准。
 
 ## 导入客户端
 
@@ -136,5 +161,6 @@ ss -lntp
 - [XTLS REALITY 配置](https://xtls.github.io/en/config/transports/reality.html)
 - [Xray 官方安装脚本](https://github.com/XTLS/Xray-install)
 - [Cloudflare 支持的网络端口](https://developers.cloudflare.com/fundamentals/reference/network-ports/)
+- [Cloudflare IP 地址与源站访问控制](https://developers.cloudflare.com/fundamentals/concepts/cloudflare-ip-addresses/)
 - [Cloudflare WebSockets](https://developers.cloudflare.com/network/websockets/)
 - [Cloudflare Full (strict)](https://developers.cloudflare.com/ssl/origin-configuration/ssl-modes/full-strict/)
