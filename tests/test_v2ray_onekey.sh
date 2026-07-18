@@ -219,6 +219,8 @@ validate_values dual vpn.example.com admin@example.com 01443 02443
 assert_eq "1443" "$REALITY_PORT" "canonical REALITY port"
 assert_eq "2443" "$CLOUDFLARE_PORT" "canonical Cloudflare port"
 
+validate_values cloudflare vpn.example.com admin@example.com "" "" "" "" "/valid._~-"
+
 reset_options
 assert_fails "--mode is required" select_mode </dev/null
 for option in --mode --domain --email --reality-port --cloudflare-port --reality-target --reality-uuid --cloudflare-uuid --ws-path; do
@@ -235,7 +237,8 @@ assert_fails "Invalid REALITY target" validate_reality_target_value example.net
 assert_fails "Invalid REALITY target" validate_reality_target_value example.net:65536
 assert_fails "Invalid REALITY UUID" validate_values reality "" "" "" "" bad-uuid
 assert_fails "Invalid Cloudflare UUID" validate_values cloudflare vpn.example.com admin@example.com "" "" "" bad-uuid
-assert_fails "WebSocket path must start with /" validate_values cloudflare vpn.example.com admin@example.com "" "" "" "" private
+assert_fails "WebSocket path" validate_values cloudflare vpn.example.com admin@example.com "" "" "" "" private
+assert_fails "WebSocket path" validate_values cloudflare vpn.example.com admin@example.com "" "" "" "" '/invalid;path'
 
 test_renderers() (
   local temp_dir
@@ -562,6 +565,9 @@ EOF
   sed -i 's/^REALITY_SHORT_ID=.*/REALITY_SHORT_ID=not-hex/' "$STATE_FILE"
   assert_fails "Invalid REALITY short ID" load_state
   sed -i 's/^REALITY_SHORT_ID=.*/REALITY_SHORT_ID=0123456789abcdef/' "$STATE_FILE"
+  sed -i 's/^REALITY_SHORT_ID=.*/REALITY_SHORT_ID=0123456789abcde/' "$STATE_FILE"
+  assert_fails "Invalid REALITY short ID" load_state
+  sed -i 's/^REALITY_SHORT_ID=.*/REALITY_SHORT_ID=0123456789abcdef/' "$STATE_FILE"
   sed -i 's/^CLOUDFLARE_UUID=.*/CLOUDFLARE_UUID=22222222-2222-4222-8222-222222222222/' "$STATE_FILE"
   assert_fails "Inactive Cloudflare state" load_state
 
@@ -588,6 +594,10 @@ EOF
   sed -i 's/^CLOUDFLARE_UUID=.*/CLOUDFLARE_UUID=22222222-2222-4222-8222-222222222222/' "$STATE_FILE"
   sed -i 's|^WS_PATH=.*|WS_PATH=invalid|' "$STATE_FILE"
   assert_fails "WebSocket path" load_state
+  sed -i 's|^WS_PATH=.*|WS_PATH=/ws|' "$STATE_FILE"
+  sed -i 's|^WS_PATH=.*|WS_PATH=/ws\\;\\$\\(touch\\ SHOULD_NOT_EXIST\\)|' "$STATE_FILE"
+  assert_fails "WebSocket path" load_state
+  [[ ! -e SHOULD_NOT_EXIST ]] || fail "invalid WebSocket path executed state data"
   sed -i 's|^WS_PATH=.*|WS_PATH=/ws|' "$STATE_FILE"
   sed -i 's/^REALITY_UUID=.*/REALITY_UUID=11111111-1111-4111-8111-111111111111/' "$STATE_FILE"
   assert_fails "Inactive REALITY state" load_state
@@ -814,6 +824,14 @@ test_cloudflare_preflight() (
     fail "IPv4 range download did not receive timeout flags"
   grep -Fq 'https://www.cloudflare.com/ips-v6 10 30' "$curl_log" ||
     fail "IPv6 range download did not receive timeout flags"
+  CLOUDFLARE_CONNECT_TIMEOUT=0
+  assert_fails "Invalid Cloudflare connect timeout" download_cloudflare_ranges
+  CLOUDFLARE_CONNECT_TIMEOUT=abc
+  assert_fails "Invalid Cloudflare connect timeout" download_cloudflare_ranges
+  CLOUDFLARE_CONNECT_TIMEOUT=10
+  CLOUDFLARE_MAX_TIME=301
+  assert_fails "Invalid Cloudflare max timeout" download_cloudflare_ranges
+  CLOUDFLARE_MAX_TIME=30
   [[ -f "$RUNTIME_DIR/ips-v4" && -f "$RUNTIME_DIR/ips-v6" ]] || fail "range files were not downloaded"
 )
 

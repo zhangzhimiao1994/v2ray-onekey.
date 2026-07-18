@@ -248,7 +248,8 @@ validate_options() {
 
   [[ -z "$REALITY_UUID" ]] || valid_uuid "$REALITY_UUID" || die "Invalid REALITY UUID: $REALITY_UUID"
   [[ -z "$CLOUDFLARE_UUID" ]] || valid_uuid "$CLOUDFLARE_UUID" || die "Invalid Cloudflare UUID: $CLOUDFLARE_UUID"
-  [[ -z "$WS_PATH" || "$WS_PATH" == /* ]] || die "WebSocket path must start with /"
+  [[ -z "$WS_PATH" ]] || valid_ws_path "$WS_PATH" ||
+    die "WebSocket path must use / followed by A-Z, a-z, 0-9, ., _, ~, or -"
 }
 
 STATE_KEYS=(
@@ -328,11 +329,11 @@ valid_x25519_key() {
 }
 
 valid_reality_short_id() {
-  [[ "$1" =~ ^[A-Fa-f0-9]{1,16}$ ]]
+  [[ "$1" =~ ^[A-Fa-f0-9]{2,16}$ ]] && (( ${#1} % 2 == 0 ))
 }
 
 valid_ws_path() {
-  [[ "$1" =~ ^/[^[:space:]]+$ ]]
+  [[ "$1" =~ ^/[A-Za-z0-9._~\-]+$ ]]
 }
 
 save_state() (
@@ -525,6 +526,10 @@ PY
 
 download_cloudflare_ranges() (
   local run_dir v4 v6 temp_v4 temp_v6
+  valid_cloudflare_timeout "$CLOUDFLARE_CONNECT_TIMEOUT" ||
+    die "Invalid Cloudflare connect timeout: $CLOUDFLARE_CONNECT_TIMEOUT"
+  valid_cloudflare_timeout "$CLOUDFLARE_MAX_TIME" ||
+    die "Invalid Cloudflare max timeout: $CLOUDFLARE_MAX_TIME"
   run_dir="${RUNTIME_DIR:-/run/v2ray-onekey}"
   v4="${CLOUDFLARE_IPV4_FILE:-$run_dir/ips-v4}"
   v6="${CLOUDFLARE_IPV6_FILE:-$run_dir/ips-v6}"
@@ -541,6 +546,10 @@ download_cloudflare_ranges() (
   mv -f -- "$temp_v4" "$v4"
   mv -f -- "$temp_v6" "$v6"
 )
+
+valid_cloudflare_timeout() {
+  [[ "$1" =~ ^[0-9]{1,3}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 300 ))
+}
 
 validate_reality_target() {
   local target="$1" hostname
