@@ -989,6 +989,47 @@ NGINX
   nginx() {
     [[ "$1" == '-T' ]] || return 1
     cat <<'NGINX'
+# configuration file /etc/nginx/conf.d/implicit-http.conf:
+server {
+  server_name vpn.example.com;
+}
+NGINX
+  }
+  nginx_has_unmanaged_domain_conflict 80 vpn.example.com ||
+    fail "same-domain implicit TCP 80 Nginx block was not rejected"
+  nginx_has_unmanaged_domain_conflict 8443 vpn.example.com &&
+    fail "implicit TCP 80 Nginx block was treated as a non-80 listener"
+
+  nginx() {
+    [[ "$1" == '-T' ]] || return 1
+    cat <<'NGINX'
+# configuration file /etc/nginx/conf.d/implicit-other.conf:
+server {
+  server_name other.example.com;
+}
+NGINX
+  }
+  nginx_has_unmanaged_domain_conflict 80 vpn.example.com &&
+    fail "different-domain implicit TCP 80 block caused a conflict"
+
+  nginx() {
+    [[ "$1" == '-T' ]] || return 1
+    cat <<'NGINX'
+# configuration file /etc/nginx/conf.d/explicit-non-http.conf:
+server {
+  listen 8443 ssl;
+  server_name vpn.example.com;
+}
+NGINX
+  }
+  nginx_has_unmanaged_domain_conflict 80 vpn.example.com &&
+    fail "explicit non-80 Nginx block was also treated as implicit TCP 80"
+  nginx_has_unmanaged_domain_conflict 8443 vpn.example.com ||
+    fail "explicit non-80 same-domain Nginx conflict was missed"
+
+  nginx() {
+    [[ "$1" == '-T' ]] || return 1
+    cat <<'NGINX'
 # configuration file /etc/nginx/conf.d/unrelated.conf:
 server {
   listen 80;
@@ -1301,7 +1342,7 @@ EOF
   service_log="$temp_dir/services.log"
   cat >"$BACKUP_DIR/services" <<'EOF'
 v2ray	active	enabled
-xray	inactive	disabled
+xray	active	disabled
 nginx	active	enabled
 EOF
   systemctl() { printf '%s\n' "$*" >>"$service_log"; }
@@ -1309,11 +1350,16 @@ EOF
   assert_eq "old-config" "$(cat "$XRAY_CONFIG")" "rollback restored config"
   [[ ! -e "$STATE_FILE" ]] || fail "rollback did not remove newly created state"
   grep -Fq 'restart v2ray' "$service_log" || fail "rollback did not restart active V2Ray with restored config"
-  grep -Fq 'stop xray' "$service_log" || fail "rollback did not stop previously inactive Xray"
-  [[ "$(grep -n '^stop xray$' "$service_log" | cut -d: -f1)" -lt \
-    "$(grep -n '^restart v2ray$' "$service_log" | cut -d: -f1)" ]] ||
-    fail "rollback restarted V2Ray before stopping the newly installed Xray"
+  grep -Fq 'restart xray' "$service_log" || fail "rollback did not restart active Xray with restored config"
   grep -Fq 'restart nginx' "$service_log" || fail "rollback did not restart active Nginx with restored config"
+  local service
+  for service in v2ray xray nginx; do
+    grep -Fqx "stop $service" "$service_log" || fail "rollback did not stop $service before restoration"
+    grep -Fqx "restart $service" "$service_log" || fail "rollback did not restart active $service"
+  done
+  [[ "$(grep -n '^stop ' "$service_log" | tail -n 1 | cut -d: -f1)" -lt \
+    "$(grep -n '^restart ' "$service_log" | head -n 1 | cut -d: -f1)" ]] ||
+    fail "rollback restarted a proxy before every managed service was stopped"
   grep -Fq 'enable v2ray' "$service_log" || fail "rollback did not restore enabled V2Ray"
   grep -Fq 'disable xray' "$service_log" || fail "rollback did not restore disabled Xray"
 
@@ -1321,9 +1367,12 @@ EOF
   NGINX_SITE="$temp_dir/current-site.conf"
   legacy_nginx_config_path() { [[ "$1" == "$legacy" ]]; }
   cat >"$legacy" <<'EOF'
-proxy_set_header Upgrade $http_upgrade;
-proxy_pass http://127.0.0.1:31001;
-return 200 "ok\n";
+# legacy comment outside the server block
+server {
+  proxy_set_header Upgrade $http_upgrade;
+  proxy_pass http://127.0.0.1:31001;
+  return 200 "ok\n";
+}
 EOF
   BACKUP_DIR="$temp_dir/legacy-backup"
   RUN_TIMESTAMP="20260718T000000Z"
@@ -1341,6 +1390,57 @@ EOF
 
 test_transaction_backup_and_rollback
 printf 'PASS: transactional backup and rollback tests\n'
+
+test_mixed_legacy_nginx_file_is_never_disabled() (
+  local temp_dir owned mixed owned_disabled
+  temp_dir="$(mktemp -d)"
+  trap 'rm -rf "$temp_dir"' RETURN
+  owned="$temp_dir/v2ray-owned.conf"
+  mixed="$temp_dir/v2ray-mixed.conf"
+  NGINX_SITE="$temp_dir/v2ray-onekey.conf"
+  BACKUP_DIR="$temp_dir/backup"
+  RUN_TIMESTAMP="20260719T010000Z"
+  legacy_nginx_config_path() { [[ "$1" == "$owned" || "$1" == "$mixed" ]]; }
+  legacy_nginx_config_paths() { printf '%s\n' "$owned" "$mixed"; }
+
+  cat >"$owned" <<'EOF'
+# comments outside the only server block are allowed
+server {
+  proxy_set_header Upgrade $http_upgrade;
+  proxy_pass http://127.0.0.1:31001;
+  return 200 "ok\n";
+}
+EOF
+  cat >"$mixed" <<'EOF'
+server {
+  proxy_set_header Upgrade $http_upgrade;
+  proxy_pass http://127.0.0.1:31001;
+  return 200 "ok\n";
+}
+server {
+  listen 9443 ssl;
+  server_name unrelated.example.com;
+}
+EOF
+
+  init_backup_metadata
+  collect_owned_legacy_nginx_files
+  grep -Fqx "$owned" "$BACKUP_DIR/legacy-files" || fail "owned legacy Nginx file was not collected"
+  grep -Fqx "$mixed" "$BACKUP_DIR/legacy-files" && fail "mixed legacy Nginx file was collected"
+  [[ -f "$BACKUP_DIR$owned" ]] || fail "owned legacy Nginx file was not backed up"
+  [[ ! -e "$BACKUP_DIR$mixed" ]] || fail "mixed legacy Nginx file was backed up"
+
+  disable_owned_legacy_nginx_files
+  owned_disabled="${owned}.v2ray-onekey-disabled-${RUN_TIMESTAMP}"
+  [[ -f "$owned_disabled" && ! -e "$owned" ]] || fail "owned legacy Nginx file was not disabled"
+  [[ -f "$mixed" ]] || fail "mixed legacy Nginx file was renamed or disabled"
+  if grep -Fq "$mixed" "$BACKUP_DIR/legacy-renames"; then
+    fail "mixed legacy Nginx rename was recorded"
+  fi
+)
+
+test_mixed_legacy_nginx_file_is_never_disabled
+printf 'PASS: mixed legacy Nginx ownership tests\n'
 
 test_reality_mode_removes_owned_cloudflare_files_transactionally() (
   local temp_dir service_log
@@ -1412,9 +1512,12 @@ test_deployment_lock_and_backup_collision() (
   printf '2147483647\n' >"$DEPLOYMENT_LOCK_DIR/owner"
   chmod 600 "$DEPLOYMENT_LOCK_DIR/owner"
   LOCK_HELD="0"
-  acquire_deployment_lock
-  assert_eq "$BASHPID" "$(cat "$DEPLOYMENT_LOCK_DIR/owner")" "stale lock owner replacement"
-  release_deployment_lock
+  assert_fails "manually remove this exact lock directory: $DEPLOYMENT_LOCK_DIR" acquire_deployment_lock
+  [[ -d "$DEPLOYMENT_LOCK_DIR" ]] || fail "stale deployment lock was removed"
+  assert_eq "2147483647" "$(cat "$DEPLOYMENT_LOCK_DIR/owner")" "stale lock owner preservation"
+  printf 'invalid-pid\n' >"$DEPLOYMENT_LOCK_DIR/owner"
+  assert_fails "manually remove this exact lock directory: $DEPLOYMENT_LOCK_DIR" acquire_deployment_lock
+  assert_eq "invalid-pid" "$(cat "$DEPLOYMENT_LOCK_DIR/owner")" "invalid lock owner preservation"
 
   BACKUP_ROOT="$temp_dir/backups"
   RUN_TIMESTAMP="20260719T000000Z"

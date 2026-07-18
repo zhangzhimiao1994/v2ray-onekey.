@@ -689,9 +689,126 @@ legacy_nginx_config_is_project_owned() {
   local path="$1"
   legacy_nginx_config_path "$path" || return 1
   [[ -f "$path" && ! -L "$path" ]] || return 1
-  grep -Fq 'proxy_set_header Upgrade' "$path" &&
-    grep -Fq 'proxy_pass http://127.0.0.1:' "$path" &&
-    grep -Fq 'return 200 "ok' "$path"
+  python3 - "$path" <<'PY'
+import pathlib
+import sys
+
+
+def matching_brace(text, opening):
+    depth = 0
+    quote = None
+    escaped = False
+    comment = False
+    for index in range(opening, len(text)):
+        character = text[index]
+        if comment:
+            if character == "\n":
+                comment = False
+            continue
+        if quote:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = None
+            continue
+        if character == "#":
+            comment = True
+        elif character in ('"', "'"):
+            quote = character
+        elif character == "{":
+            depth += 1
+        elif character == "}":
+            depth -= 1
+            if depth == 0:
+                return index
+    return None
+
+
+def next_server_opening(text, start):
+    index = start
+    quote = None
+    escaped = False
+    comment = False
+    while index < len(text):
+        character = text[index]
+        if comment:
+            if character == "\n":
+                comment = False
+            index += 1
+            continue
+        if quote:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = None
+            index += 1
+            continue
+        if character == "#":
+            comment = True
+            index += 1
+            continue
+        if character in ('"', "'"):
+            quote = character
+            index += 1
+            continue
+        if text.startswith("server", index):
+            before = text[index - 1] if index else ""
+            after_index = index + len("server")
+            after = text[after_index] if after_index < len(text) else ""
+            if not (before.isalnum() or before == "_") and not (after.isalnum() or after == "_"):
+                while after_index < len(text) and text[after_index].isspace():
+                    after_index += 1
+                if after_index < len(text) and text[after_index] == "{":
+                    return index, after_index
+        index += 1
+    return None
+
+
+try:
+    content = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+except (OSError, UnicodeError):
+    raise SystemExit(1)
+
+blocks = []
+spans = []
+position = 0
+while True:
+    server_opening = next_server_opening(content, position)
+    if server_opening is None:
+        break
+    server_start, opening = server_opening
+    closing = matching_brace(content, opening)
+    if closing is None:
+        raise SystemExit(1)
+    blocks.append(content[opening + 1:closing])
+    spans.append((server_start, closing + 1))
+    position = closing + 1
+
+if len(blocks) != 1:
+    raise SystemExit(1)
+
+outside_parts = []
+position = 0
+for opening, closing in spans:
+    outside_parts.append(content[position:opening])
+    position = closing
+outside_parts.append(content[position:])
+outside = "".join(outside_parts)
+outside = "\n".join(line.split("#", 1)[0] for line in outside.splitlines())
+if outside.strip():
+    raise SystemExit(1)
+
+signatures = (
+    "proxy_set_header Upgrade",
+    "proxy_pass http://127.0.0.1:",
+    'return 200 "ok',
+)
+raise SystemExit(0 if all(signature in blocks[0] for signature in signatures) else 1)
+PY
 }
 
 current_nginx_config_is_project_owned() {
@@ -740,11 +857,18 @@ PY
 
 legacy_project_nginx_exists() {
   local path
-  for path in /etc/nginx/conf.d/v2ray-*.conf; do
-    [[ -e "$path" ]] || continue
+  while IFS= read -r path; do
     legacy_nginx_config_is_project_owned "$path" && return 0
-  done
+  done < <(legacy_nginx_config_paths)
   return 1
+}
+
+legacy_nginx_config_paths() {
+  local path
+  for path in /etc/nginx/conf.d/v2ray-*.conf; do
+    [[ -e "$path" || -L "$path" ]] || continue
+    printf '%s\n' "$path"
+  done
 }
 
 managed_path_allowed() {
@@ -788,7 +912,7 @@ lock_has_only_owner_file() {
 }
 
 acquire_deployment_lock() {
-  local attempt owner owner_mode owner_uid stale_path lock_pid="$BASHPID" lock_parent
+  local owner owner_mode owner_uid lock_pid="$BASHPID" lock_parent
   [[ "${LOCK_HELD:-0}" != "1" ]] || return 0
   [[ "$DEPLOYMENT_LOCK_DIR" == /* && "$DEPLOYMENT_LOCK_DIR" != *$'\n'* ]] ||
     die "Invalid deployment lock path: $DEPLOYMENT_LOCK_DIR"
@@ -796,46 +920,33 @@ acquire_deployment_lock() {
   [[ ! -L "$lock_parent" ]] || die "Refusing symlink deployment lock parent: $lock_parent"
   [[ -d "$lock_parent" ]] || install -d -m 0755 "$lock_parent"
 
-  for attempt in 1 2 3; do
-    if mkdir -m 0700 -- "$DEPLOYMENT_LOCK_DIR" 2>/dev/null; then
-      if ! (umask 077; printf '%s\n' "$lock_pid" >"$DEPLOYMENT_LOCK_DIR/owner"); then
-        rm -f -- "$DEPLOYMENT_LOCK_DIR/owner"
-        rmdir -- "$DEPLOYMENT_LOCK_DIR" 2>/dev/null || true
-        die "Unable to record deployment lock owner: $DEPLOYMENT_LOCK_DIR"
-      fi
-      if ! chmod 0600 "$DEPLOYMENT_LOCK_DIR/owner"; then
-        rm -f -- "$DEPLOYMENT_LOCK_DIR/owner"
-        rmdir -- "$DEPLOYMENT_LOCK_DIR" 2>/dev/null || true
-        die "Unable to secure deployment lock owner: $DEPLOYMENT_LOCK_DIR/owner"
-      fi
-      LOCK_HELD="1"
-      return 0
+  if mkdir -m 0700 -- "$DEPLOYMENT_LOCK_DIR" 2>/dev/null; then
+    if ! (umask 077; printf '%s\n' "$lock_pid" >"$DEPLOYMENT_LOCK_DIR/owner"); then
+      rm -f -- "$DEPLOYMENT_LOCK_DIR/owner"
+      rmdir -- "$DEPLOYMENT_LOCK_DIR" 2>/dev/null || true
+      die "Unable to record deployment lock owner: $DEPLOYMENT_LOCK_DIR"
     fi
+    if ! chmod 0600 "$DEPLOYMENT_LOCK_DIR/owner"; then
+      rm -f -- "$DEPLOYMENT_LOCK_DIR/owner"
+      rmdir -- "$DEPLOYMENT_LOCK_DIR" 2>/dev/null || true
+      die "Unable to secure deployment lock owner: $DEPLOYMENT_LOCK_DIR/owner"
+    fi
+    LOCK_HELD="1"
+    return 0
+  fi
 
-    lock_directory_is_safe "$DEPLOYMENT_LOCK_DIR" ||
-      die "Unsafe deployment lock exists; inspect manually: $DEPLOYMENT_LOCK_DIR"
-    lock_has_only_owner_file ||
-      die "Deployment lock has unexpected contents; inspect manually: $DEPLOYMENT_LOCK_DIR"
-    owner_mode="$(stat -c '%a' "$DEPLOYMENT_LOCK_DIR/owner" 2>/dev/null)" ||
-      die "Unable to inspect deployment lock owner: $DEPLOYMENT_LOCK_DIR/owner"
-    owner_uid="$(stat -c '%u' "$DEPLOYMENT_LOCK_DIR/owner" 2>/dev/null)" ||
-      die "Unable to inspect deployment lock owner: $DEPLOYMENT_LOCK_DIR/owner"
-    [[ "$owner_mode" == "600" && "$owner_uid" == "0" ]] ||
-      die "Unsafe deployment lock owner file; inspect manually: $DEPLOYMENT_LOCK_DIR/owner"
+  lock_directory_is_safe "$DEPLOYMENT_LOCK_DIR" ||
+    die "Unsafe deployment lock exists; inspect manually: $DEPLOYMENT_LOCK_DIR"
+  if lock_has_only_owner_file; then
+    owner_mode="$(stat -c '%a' "$DEPLOYMENT_LOCK_DIR/owner" 2>/dev/null)" || true
+    owner_uid="$(stat -c '%u' "$DEPLOYMENT_LOCK_DIR/owner" 2>/dev/null)" || true
     IFS= read -r owner <"$DEPLOYMENT_LOCK_DIR/owner" || true
-    [[ "$owner" =~ ^[1-9][0-9]*$ ]] ||
-      die "Invalid deployment lock owner; inspect manually: $DEPLOYMENT_LOCK_DIR/owner"
-    if kill -0 "$owner" 2>/dev/null; then
+    if [[ "$owner_mode" == "600" && "$owner_uid" == "0" && "$owner" =~ ^[1-9][0-9]*$ ]] &&
+      kill -0 "$owner" 2>/dev/null; then
       die "Another v2ray-onekey deployment is already running (PID $owner)"
     fi
-
-    stale_path="${DEPLOYMENT_LOCK_DIR}.stale.${BASHPID}.${attempt}"
-    if mv -- "$DEPLOYMENT_LOCK_DIR" "$stale_path" 2>/dev/null; then
-      rm -f -- "$stale_path/owner"
-      rmdir -- "$stale_path" || die "Unable to remove stale deployment lock: $stale_path"
-    fi
-  done
-  die "Unable to acquire deployment lock after concurrent attempts: $DEPLOYMENT_LOCK_DIR"
+  fi
+  die "Deployment lock owner is stale or invalid. Verify no installer is running, then manually remove this exact lock directory: $DEPLOYMENT_LOCK_DIR"
 }
 
 release_deployment_lock() {
@@ -923,13 +1034,12 @@ collect_owned_legacy_nginx_files() {
   local path
   : >"$BACKUP_DIR/legacy-files"
   chmod 0600 "$BACKUP_DIR/legacy-files"
-  for path in /etc/nginx/conf.d/v2ray-*.conf; do
-    [[ -e "$path" ]] || continue
+  while IFS= read -r path; do
     if legacy_nginx_config_is_project_owned "$path"; then
       backup_file "$path"
       printf '%s\n' "$path" >>"$BACKUP_DIR/legacy-files"
     fi
-  done
+  done < <(legacy_nginx_config_paths)
 }
 
 begin_transaction() {
@@ -964,9 +1074,7 @@ restore_service_states() {
 
   while IFS=$'\t' read -r service state enabled; do
     [[ -n "$service" ]] || continue
-    if [[ "$state" == "inactive" ]]; then
-      systemctl stop "$service" >/dev/null 2>&1 || true
-    fi
+    systemctl stop "$service" >/dev/null 2>&1 || true
   done <"$BACKUP_DIR/services"
 
   while IFS=$'\t' read -r service state enabled; do
@@ -1036,6 +1144,7 @@ listen = re.compile(
     rf"^\s*listen\s+(?:(?:\[[0-9A-Fa-f:]+\]|[0-9.]+):)?{port}(?=\s|;)",
     re.MULTILINE,
 )
+any_listen = re.compile(r"^\s*listen\s+[^;]+;", re.MULTILINE)
 server_name = re.compile(r"^\s*server_name\s+([^;]+);", re.MULTILINE)
 legacy_signatures = (
     "proxy_set_header Upgrade",
@@ -1130,7 +1239,9 @@ def block_is_owned(path, file_content, block):
 matching_blocks = []
 for path, file_content in file_sections(sys.stdin):
     for block in server_blocks(file_content):
-        if not listen.search(block):
+        explicit_listen = any_listen.search(block) is not None
+        listens_on_port = listen.search(block) is not None
+        if not listens_on_port and not (not explicit_listen and raw_port == "80"):
             continue
         names = {
             name.lower()
