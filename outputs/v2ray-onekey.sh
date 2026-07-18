@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-set -Eeuo pipefail
 
 # One-key V2Ray server installer.
 # Default mode: VMess over TCP, works without a domain name.
@@ -48,54 +47,58 @@ Notes:
 USAGE
 }
 
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --domain)
-      DOMAIN="${2:-}"
-      [[ -n "$DOMAIN" ]] || die "--domain requires a value"
-      shift 2
-      ;;
-    --email)
-      EMAIL="${2:-}"
-      [[ -n "$EMAIL" ]] || die "--email requires a value"
-      shift 2
-      ;;
-    --port)
-      PORT="${2:-}"
-      [[ "$PORT" =~ ^[0-9]+$ ]] || die "--port must be a number"
-      shift 2
-      ;;
-    --uuid)
-      UUID="${2:-}"
-      [[ "$UUID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] || die "--uuid must be a valid UUID"
-      shift 2
-      ;;
-    --ws-path)
-      WS_PATH="${2:-}"
-      [[ "$WS_PATH" == /* ]] || die "--ws-path must start with /"
-      shift 2
-      ;;
-    --tcp)
-      FORCE_TCP="1"
-      shift
-      ;;
-    -h|--help)
-      usage
-      exit 0
-      ;;
-    *)
-      die "Unknown option: $1"
-      ;;
-  esac
-done
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --domain)
+        DOMAIN="${2:-}"
+        [[ -n "$DOMAIN" ]] || die "--domain requires a value"
+        shift 2
+        ;;
+      --email)
+        EMAIL="${2:-}"
+        [[ -n "$EMAIL" ]] || die "--email requires a value"
+        shift 2
+        ;;
+      --port)
+        PORT="${2:-}"
+        [[ "$PORT" =~ ^[0-9]+$ ]] || die "--port must be a number"
+        shift 2
+        ;;
+      --uuid)
+        UUID="${2:-}"
+        [[ "$UUID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] || die "--uuid must be a valid UUID"
+        shift 2
+        ;;
+      --ws-path)
+        WS_PATH="${2:-}"
+        [[ "$WS_PATH" == /* ]] || die "--ws-path must start with /"
+        shift 2
+        ;;
+      --tcp)
+        FORCE_TCP="1"
+        shift
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        die "Unknown option: $1"
+        ;;
+    esac
+  done
+}
 
-[[ "$(id -u)" -eq 0 ]] || die "Please run as root: sudo bash v2ray-onekey.sh"
-[[ -z "$DOMAIN" || -n "$EMAIL" ]] || die "--email is required when --domain is used"
+validate_runtime() {
+  [[ "$(id -u)" -eq 0 ]] || die "Please run as root: sudo bash v2ray-onekey.sh"
+  [[ -z "$DOMAIN" || -n "$EMAIL" ]] || die "--email is required when --domain is used"
 
-if [[ -n "$DOMAIN" && "$FORCE_TCP" == "1" ]]; then
-  warn "--tcp was supplied with --domain; using TCP mode and ignoring domain settings."
-  DOMAIN=""
-fi
+  if [[ -n "$DOMAIN" && "$FORCE_TCP" == "1" ]]; then
+    warn "--tcp was supplied with --domain; using TCP mode and ignoring domain settings."
+    DOMAIN=""
+  fi
+}
 
 detect_pkg_manager() {
   if command -v apt-get >/dev/null 2>&1; then
@@ -391,6 +394,10 @@ EOF
 }
 
 main() {
+  set -Eeuo pipefail
+  parse_args "$@"
+  validate_runtime
+
   detect_pkg_manager
   install_packages curl ca-certificates python3 coreutils
 
