@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Test doubles are invoked indirectly by sourced installer functions.
+# shellcheck disable=SC2034,SC2120,SC2329
 set -Eeuo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -341,13 +343,8 @@ assert reality_settings["target"] == "www.microsoft.com:443"
 assert reality_settings["serverNames"] == ["www.microsoft.com"]
 assert reality_settings["privateKey"] == "private-key"
 assert reality_settings["shortIds"] == ["0123456789abcdef"]
-fallback_limit = {
-    "afterBytes": 1048576,
-    "bytesPerSec": 102400,
-    "burstBytesPerSec": 1048576,
-}
-assert reality_settings["limitFallbackUpload"] == fallback_limit
-assert reality_settings["limitFallbackDownload"] == fallback_limit
+assert "limitFallbackUpload" not in reality_settings
+assert "limitFallbackDownload" not in reality_settings
 
 assert cloudflare["tag"] == "cloudflare-ws-in"
 assert cloudflare["listen"] == "127.0.0.1"
@@ -793,11 +790,16 @@ test_cloudflare_preflight() (
   assert_fails "does not resolve to Cloudflare" validate_cloudflare_domain outside.example.com
 
   getent() { printf '%s\n' '104.16.1.1 STREAM www.microsoft.com'; }
-  xray() { printf '%s\n' 'tls ping'; }
+  local tls_ping_target=""
+  xray() {
+    [[ "$1 $2" == 'tls ping' ]] || return 1
+    tls_ping_target="$3"
+  }
   timeout() { shift; "$@"; }
   assert_fails "resolves to Cloudflare" validate_reality_target www.microsoft.com:443
   getent() { printf '%s\n' '203.0.113.2 STREAM example.net'; }
   validate_reality_target example.net:443
+  assert_eq "example.net:443" "$tls_ping_target" "REALITY TLS ping target includes port"
   xray() { return 1; }
   assert_fails "TLS ping failed" validate_reality_target example.net:443
 
@@ -892,12 +894,68 @@ NGINX
   legacy_nginx_config_for_port_is_project_owned 443 &&
     fail "mixed owned and unrelated Nginx listeners were accepted"
 
+  NGINX_SITE=/etc/nginx/conf.d/v2ray-onekey.conf
+  nginx() {
+    [[ "$1" == '-T' ]] || return 1
+    cat <<'NGINX'
+# configuration file /etc/nginx/conf.d/v2ray-onekey.conf:
+# Managed by v2ray-onekey
+server {
+  listen 8443 ssl;
+  location / { return 200 "ok\n"; }
+  proxy_set_header Upgrade $http_upgrade;
+  proxy_pass http://127.0.0.1:31001;
+}
+NGINX
+  }
+  legacy_nginx_config_for_port_is_project_owned 8443 ||
+    fail "current managed Nginx site was not recognized on rerun"
+
+  DOMAIN="vpn.example.com"
+  nginx() {
+    [[ "$1" == '-T' ]] || return 1
+    cat <<'NGINX'
+# configuration file /etc/nginx/conf.d/v2ray-onekey.conf:
+# Managed by v2ray-onekey
+server {
+  listen 8443 ssl;
+  server_name vpn.example.com;
+  location / { return 200 "ok\n"; }
+  proxy_set_header Upgrade $http_upgrade;
+  proxy_pass http://127.0.0.1:31001;
+}
+# configuration file /etc/nginx/conf.d/unrelated.conf:
+server {
+  listen 8443 ssl;
+  server_name other.example.com;
+}
+NGINX
+  }
+  ss() { printf '%s\n' 'LISTEN 0 4096 0.0.0.0:8443 0.0.0.0:* users:(("nginx",pid=1,fd=3))'; }
+  port_listener_conflicts cloudflare 8443 &&
+    fail "unrelated Nginx virtual host prevented Cloudflare port sharing"
+
+  nginx() {
+    [[ "$1" == '-T' ]] || return 1
+    cat <<'NGINX'
+# configuration file /etc/nginx/conf.d/unrelated.conf:
+server {
+  listen 8443 ssl;
+  server_name vpn.example.com;
+}
+NGINX
+  }
+  port_listener_conflicts cloudflare 8443 ||
+    fail "same-domain Cloudflare Nginx conflict was not rejected"
+
   ss() {
-    if [[ "$#" -eq 3 && "$1 $2 $3" == '-H -ltnp sport = :443' ]]; then
+    if [[ "$*" == '-H -lntp sport = :443' ]]; then
       printf '%s\n' 'LISTEN 0 4096 0.0.0.0:443 0.0.0.0:* users:(("nginx",pid=1,fd=3))'
-    elif [[ "$#" -eq 3 && "$1 $2 $3" == '-H -ltnp sport = :8443' ]]; then
+    elif [[ "$*" == '-H -lntp sport = :8443' ]]; then
       :
-    elif [[ "$#" -eq 1 && "$1" == '-lntp' ]]; then
+    elif [[ "$*" == '-H -lntp sport = :80' ]]; then
+      :
+    elif [[ "$*" == '-lntp' ]]; then
       printf '%s\n' 'State Recv-Q Send-Q Local Address:Port Peer Address:Port Process' \
         'LISTEN 0 4096 0.0.0.0:443 0.0.0.0:* users:(("nginx",pid=1,fd=3))'
     else
@@ -906,7 +964,8 @@ NGINX
   }
   REALITY_PORT="443"
   CLOUDFLARE_PORT="8443"
-  assert_fails "State Recv-Q Send-Q" check_public_port_listeners
+  stdin_is_tty() { return 1; }
+  assert_fails "--reality-port PORT" check_public_port_listeners
 
   nginx() {
     [[ "$1" == '-T' ]] || return 1
@@ -921,6 +980,27 @@ server {
 NGINX
   }
   check_public_port_listeners
+
+  INTERNAL_WS_PORT="31001"
+  ss() {
+    if [[ "$*" == '-H -lntp sport = :31001' ]]; then
+      printf '%s\n' 'LISTEN 0 128 127.0.0.1:31001 0.0.0.0:* users:(("other",pid=4,fd=3))'
+    elif [[ "$*" == '-H -lntp sport = :32002' ]]; then
+      :
+    elif [[ "$*" == '-lntp' ]]; then
+      printf '%s\n' 'State Recv-Q Send-Q Local Address:Port Peer Address:Port Process' \
+        'LISTEN 0 128 127.0.0.1:31001 0.0.0.0:* users:(("other",pid=4,fd=3))'
+    else
+      return 1
+    fi
+  }
+  random_internal_ws_port() { printf '32002\n'; }
+  check_internal_ws_port_listener
+  assert_eq "32002" "$INTERNAL_WS_PORT" "occupied internal WebSocket port was reselected"
+
+  INTERNAL_WS_PORT="31001"
+  ss() { printf '%s\n' 'LISTEN 0 128 127.0.0.1:31001 0.0.0.0:* users:(("xray",pid=4,fd=3))'; }
+  check_internal_ws_port_listener
 )
 
 test_environment_preflight
@@ -1036,23 +1116,439 @@ test_nginx_and_acme() (
 
 test_nginx_and_acme
 
-execution_output=""
-if execution_output="$(
+test_transaction_backup_and_rollback() (
+  local temp_dir original_mode legacy disabled service_log
+  temp_dir="$(mktemp -d)"
+  trap 'rm -rf "$temp_dir"' RETURN
+
+  XRAY_CONFIG="$temp_dir/xray/config.json"
+  MODE="cloudflare"
+  STATE_FILE="$temp_dir/state/state.env"
+  NGINX_SITE="$temp_dir/nginx/v2ray-onekey.conf"
+  RENEWAL_HOOK="$temp_dir/hooks/v2ray-onekey-nginx.sh"
+  LEGACY_V2RAY_CONFIG="$temp_dir/v2ray/config.json"
+  BACKUP_DIR="$temp_dir/backup"
+  install -d -m 700 "$(dirname "$XRAY_CONFIG")" "$BACKUP_DIR"
+  install -d "$(dirname "$NGINX_SITE")"
+  printf 'server { listen 8443 ssl; }\n' >"$NGINX_SITE"
+  assert_fails "Refusing to overwrite Nginx site" validate_managed_destination_ownership
+  cat >"$NGINX_SITE" <<'EOF'
+# Managed by v2ray-onekey
+proxy_set_header Upgrade $http_upgrade;
+proxy_pass http://127.0.0.1:31001;
+return 200 "ok\n";
+EOF
+  validate_managed_destination_ownership
+  rm -f "$NGINX_SITE"
+  printf 'old-config\n' >"$XRAY_CONFIG"
+  init_backup_metadata
+  backup_file "$XRAY_CONFIG"
+  backup_file "$STATE_FILE"
+  backup_file "$XRAY_CONFIG"
+
+  [[ -f "$BACKUP_DIR$XRAY_CONFIG" ]] || fail "backup path missing"
+  assert_eq "old-config" "$(cat "$BACKUP_DIR$XRAY_CONFIG")" "backup content"
+  grep -Fqx $'present\t'"$XRAY_CONFIG" "$BACKUP_DIR/manifest" || fail "present path not recorded"
+  grep -Fqx $'absent\t'"$STATE_FILE" "$BACKUP_DIR/manifest" || fail "absent path not recorded"
+  assert_eq "2" "$(wc -l <"$BACKUP_DIR/manifest" | tr -d ' ')" "duplicate manifest entries"
+  assert_eq "700" "$(stat -c '%a' "$BACKUP_DIR")" "backup directory mode"
+  assert_eq "600" "$(stat -c '%a' "$BACKUP_DIR/manifest")" "manifest mode"
+  ln -s "$XRAY_CONFIG" "$temp_dir/symlink"
+  original_mode="$XRAY_CONFIG"
+  XRAY_CONFIG="$temp_dir/symlink"
+  assert_fails "Refusing to back up symlink" backup_file "$XRAY_CONFIG"
+  XRAY_CONFIG="$original_mode"
+  assert_fails "unmanaged path" backup_file "$temp_dir/arbitrary"
+
+  printf 'new-config\n' >"$XRAY_CONFIG"
+  install -d "$(dirname "$STATE_FILE")"
+  printf 'new-state\n' >"$STATE_FILE"
+  service_log="$temp_dir/services.log"
+  cat >"$BACKUP_DIR/services" <<'EOF'
+v2ray	active	enabled
+xray	inactive	disabled
+nginx	active	enabled
+EOF
+  systemctl() { printf '%s\n' "$*" >>"$service_log"; }
+  rollback_current_run
+  assert_eq "old-config" "$(cat "$XRAY_CONFIG")" "rollback restored config"
+  [[ ! -e "$STATE_FILE" ]] || fail "rollback did not remove newly created state"
+  grep -Fq 'start v2ray' "$service_log" || fail "rollback did not restore active V2Ray"
+  grep -Fq 'stop xray' "$service_log" || fail "rollback did not stop previously inactive Xray"
+
+  legacy="$temp_dir/v2ray-owned.conf"
+  NGINX_SITE="$temp_dir/current-site.conf"
+  legacy_nginx_config_path() { [[ "$1" == "$legacy" ]]; }
+  cat >"$legacy" <<'EOF'
+proxy_set_header Upgrade $http_upgrade;
+proxy_pass http://127.0.0.1:31001;
+return 200 "ok\n";
+EOF
+  BACKUP_DIR="$temp_dir/legacy-backup"
+  RUN_TIMESTAMP="20260718T000000Z"
+  init_backup_metadata
+  backup_file "$legacy"
+  printf '%s\n' "$legacy" >"$BACKUP_DIR/legacy-files"
+  disable_owned_legacy_nginx_files
+  disabled="${legacy}.v2ray-onekey-disabled-${RUN_TIMESTAMP}"
+  [[ -f "$disabled" && ! -e "$legacy" ]] || fail "legacy Nginx file was not disabled by rename"
+  : >"$BACKUP_DIR/services"
+  rollback_current_run
+  [[ -f "$legacy" && ! -e "$disabled" ]] || fail "legacy Nginx rename was not reversed"
+  [[ -f "$BACKUP_DIR$legacy" ]] || fail "legacy backup was not preserved"
+)
+
+test_transaction_backup_and_rollback
+printf 'PASS: transactional backup and rollback tests\n'
+
+test_reality_mode_removes_owned_cloudflare_files_transactionally() (
+  local temp_dir service_log
+  temp_dir="$(mktemp -d)"
+  trap 'rm -rf "$temp_dir"' RETURN
+  MODE="reality"
+  NGINX_SITE="$temp_dir/nginx/v2ray-onekey.conf"
+  RENEWAL_HOOK="$temp_dir/hooks/v2ray-onekey-nginx.sh"
+  XRAY_CONFIG="$temp_dir/xray/config.json"
+  STATE_FILE="$temp_dir/state/state.env"
+  LEGACY_V2RAY_CONFIG="$temp_dir/v2ray/config.json"
+  BACKUP_DIR="$temp_dir/backup"
+  RUN_TIMESTAMP="test"
+  install -d "$(dirname "$NGINX_SITE")" "$(dirname "$RENEWAL_HOOK")"
+  cat >"$NGINX_SITE" <<'EOF'
+# Managed by v2ray-onekey
+proxy_set_header Upgrade $http_upgrade;
+proxy_pass http://127.0.0.1:31001;
+return 200 "ok\n";
+EOF
+  cat >"$RENEWAL_HOOK" <<'EOF'
+#!/usr/bin/env bash
+set -e
+nginx -t
+systemctl reload nginx
+EOF
+  init_backup_metadata
+  backup_file "$NGINX_SITE"
+  backup_file "$RENEWAL_HOOK"
+  : >"$BACKUP_DIR/services"
+  service_log="$temp_dir/service.log"
+  systemctl() {
+    if [[ "$*" == 'is-active --quiet nginx' ]]; then return 0; fi
+    printf 'systemctl %s\n' "$*" >>"$service_log"
+  }
+  nginx() { printf 'nginx %s\n' "$*" >>"$service_log"; }
+  release_legacy_nginx_listeners
+  [[ ! -e "$NGINX_SITE" && ! -e "$RENEWAL_HOOK" ]] || fail "owned Cloudflare files remained in reality mode"
+  grep -Fq 'nginx -t' "$service_log" || fail "Nginx was not validated after reality-mode cleanup"
+  grep -Fq 'systemctl reload nginx' "$service_log" || fail "Nginx was not reloaded after reality-mode cleanup"
+  rollback_current_run
+  [[ -f "$NGINX_SITE" && -f "$RENEWAL_HOOK" ]] || fail "rollback did not restore Cloudflare files"
+
+  printf 'echo unrelated\n' >>"$RENEWAL_HOOK"
+  release_legacy_nginx_listeners >/dev/null
+  grep -Fqx 'echo unrelated' "$RENEWAL_HOOK" || fail "extra-command renewal hook was modified"
+)
+
+test_reality_mode_removes_owned_cloudflare_files_transactionally
+printf 'PASS: reality mode Cloudflare-file transition tests\n'
+
+test_prepare_configuration_reuse_and_rotate() (
+  local temp_dir
+  temp_dir="$(mktemp -d)"
+  trap 'rm -rf "$temp_dir"' RETURN
+  STATE_FILE="$temp_dir/state/state.env"
+  reset_options
+  MODE="dual"
+  DOMAIN="vpn.example.com"
+  EMAIL="admin@example.com"
+  REALITY_PORT="443"
+  CLOUDFLARE_PORT="8443"
+  INTERNAL_WS_PORT="31001"
+  REALITY_UUID="11111111-1111-4111-8111-111111111111"
+  CLOUDFLARE_UUID="22222222-2222-4222-8222-222222222222"
+  REALITY_PRIVATE_KEY="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+  REALITY_PUBLIC_KEY="BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+  REALITY_SHORT_ID="0123456789abcdef"
+  REALITY_TARGET="www.microsoft.com:443"
+  WS_PATH="/saved-path"
+  save_state
+
+  reset_options
+  parse_args
+  prepare_configuration
+  assert_eq "dual" "$MODE" "existing state mode reused without prompt"
+  assert_eq "/saved-path" "$WS_PATH" "existing credentials reused"
+
+  reset_options
+  parse_args --rotate
+  prepare_configuration
+  assert_eq "dual" "$MODE" "rotate retained saved mode"
+  assert_eq "vpn.example.com" "$DOMAIN" "rotate retained saved domain"
+  assert_eq "443" "$REALITY_PORT" "rotate retained saved public port"
+  assert_eq "" "$REALITY_UUID" "rotate cleared REALITY UUID"
+  assert_eq "" "$CLOUDFLARE_UUID" "rotate cleared Cloudflare UUID"
+  assert_eq "" "$WS_PATH" "rotate cleared WebSocket path"
+)
+
+test_prepare_configuration_reuse_and_rotate
+printf 'PASS: state reuse and rotation tests\n'
+
+test_port_resolution() (
+  reset_options
+  MODE="dual"
+  DOMAIN="vpn.example.com"
+  REALITY_PORT="443"
+  CLOUDFLARE_PORT="8443"
+  stdin_is_tty() { return 0; }
+  port_listener_conflicts() {
+    local role="$1" port="$2"
+    PORT_CONFLICT_DETAILS="mock conflict"
+    [[ "$role:$port" == "reality:443" || "$role:$port" == "cloudflare:8443" ]]
+  }
+  resolve_public_port_conflicts <<'EOF'
+8443
+4443
+2443
+2053
+EOF
+  assert_eq "4443" "$REALITY_PORT" "interactive REALITY replacement"
+  assert_eq "2053" "$CLOUDFLARE_PORT" "Cloudflare allowlisted replacement"
+  validate_unique_public_ports
+
+  reset_options
+  MODE="reality"
+  REALITY_PORT="443"
+  stdin_is_tty() { return 1; }
+  port_listener_conflicts() { PORT_CONFLICT_DETAILS="occupied by other"; return 0; }
+  assert_fails "--reality-port PORT" resolve_public_port_conflicts
+)
+
+test_port_resolution
+printf 'PASS: port resolution tests\n'
+
+test_packages_permissions_and_firewall() (
+  local temp_dir package_log firewall_log current_user current_group installer_log
+  temp_dir="$(mktemp -d)"
+  trap 'rm -rf "$temp_dir"' RETURN
+  package_log="$temp_dir/packages.log"
+  install_packages() {
+    printf '%s\n' "$*" >>"$package_log"
+    [[ "$*" != "python3-certbot-nginx" ]]
+  }
+  reset_options
+  MODE="reality"
+  install_required_packages
+  grep -Fq 'curl ca-certificates openssl python3 coreutils iproute2' "$package_log" ||
+    fail "base package set is incomplete"
+  grep -Eq 'nginx|certbot' "$package_log" && fail "reality-only installed Cloudflare packages"
+  : >"$package_log"
+  MODE="cloudflare"
+  install_required_packages
+  grep -Fq 'nginx certbot' "$package_log" || fail "Cloudflare packages missing"
+  grep -Fq 'python3-certbot-nginx' "$package_log" || fail "optional Certbot Nginx package not attempted"
+
+  XRAY_CONFIG="$temp_dir/xray/config.json"
+  printf '{}\n' >"$temp_dir/staged.json"
+  current_user="$(id -un)"
+  current_group="$(id -gn)"
+  xray_service_identity() { printf '%s:%s\n' "$current_user" "$current_group"; }
+  install_validated_xray_config "$temp_dir/staged.json"
+  assert_eq "400" "$(stat -c '%a' "$XRAY_CONFIG")" "Xray private config mode"
+  assert_eq "$(id -u)" "$(stat -c '%u' "$XRAY_CONFIG")" "Xray config owner"
+
+  firewall_log="$temp_dir/firewall.log"
+  ufw_state="inactive"
+  firewalld_state="inactive"
+  ufw() {
+    if [[ "$1" == "status" ]]; then printf 'Status: %s\n' "$ufw_state"; else printf 'ufw %s\n' "$*" >>"$firewall_log"; fi
+  }
+  firewall-cmd() { printf 'firewall %s\n' "$*" >>"$firewall_log"; }
+  systemctl() { [[ "$1 $2 $3" == 'is-active --quiet firewalld' && "$firewalld_state" == "active" ]]; }
+  open_firewall_port 443 tcp
+  [[ ! -s "$firewall_log" ]] || fail "inactive firewall was modified"
+  ufw_state="active"
+  firewalld_state="active"
+  open_firewall_port 8443 tcp
+  grep -Fq 'ufw allow 8443/tcp' "$firewall_log" || fail "active UFW was not updated"
+  grep -Fq 'firewall --permanent --add-port=8443/tcp' "$firewall_log" || fail "active firewalld was not updated"
+  grep -Eq '(apt-get|dnf|yum).*(remove|erase)' "$SCRIPT" &&
+    fail "installer contains package-removal behavior"
+
+  installer_log="$temp_dir/installer.log"
+  curl() {
+    [[ "$*" == *'-LfsS'* && "$*" == *'--connect-timeout 10'* && "$*" == *'--max-time 120'* ]] ||
+      fail "Xray installer download lacks finite timeout flags"
+    printf 'official-installer-body'
+  }
+  bash() { printf '%s\n' "$*" >"$installer_log"; }
+  install_xray_core >/dev/null
+  assert_eq "-c official-installer-body @ install" "$(cat "$installer_log")" "official Xray installer invocation"
+)
+
+test_packages_permissions_and_firewall
+printf 'PASS: package, permission, and firewall tests\n'
+
+test_deployment_order_and_failure_trap() (
+  local temp_dir order_log status
+  temp_dir="$(mktemp -d)"
+  trap 'rm -rf "$temp_dir"' RETURN
+  order_log="$temp_dir/order.log"
+  event() { printf '%s\n' "$1" >>"$order_log"; }
+  reset_options
+  MODE="reality"
+  REALITY_PORT="443"
+  REALITY_TARGET="example.net:443"
+  RUNTIME_DIR="$temp_dir/run"
+  ACME_WEBROOT="$temp_dir/acme"
+  begin_transaction() { RUN_TIMESTAMP="test"; BACKUP_DIR="$temp_dir/backup"; install -d "$BACKUP_DIR"; event backup; }
+  validate_managed_destination_ownership() { event ownership; }
+  install_required_packages() { event packages; }
+  install_xray_core() { event xray-install; }
+  generate_runtime_values() { event generate; }
+  validate_loaded_runtime_values() { event runtime-validate; }
+  download_cloudflare_ranges() { event cf-download; }
+  write_builtin_cloudflare_ranges() { event cf-builtin; }
+  validate_reality_target() { event target; }
+  public_ip() { printf '1.1.1.1'; }
+  valid_public_ip() { [[ "$1" == "1.1.1.1" ]]; }
+  format_uri_host() { printf '%s\n' "$1"; }
+  check_public_port_listeners() { event public-ports; }
+  check_internal_ws_port_listener() { event internal-port; }
+  render_xray_config() { printf '{}\n' >"$1"; event render; }
+  xray() { event xray-test; }
+  stop_legacy_service_for_cutover() { event v2ray-stop; }
+  release_legacy_nginx_listeners() { event nginx-release; }
+  install_validated_xray_config() { event config-install; }
+  systemctl() { event "systemctl:$*"; }
+  verify_started_services() { event listeners-ok; }
+  disable_legacy_v2ray_after_success() { event v2ray-disable; }
+  save_state() { event state-save; }
+  configure_firewall() { event firewall; }
+  print_deployment_summary() { event output; }
+  set +e
+  ( set -Eeuo pipefail; deploy_services )
+  status=$?
+  set -e
+  [[ "$status" -eq 0 ]] || fail "mock deployment failed unexpectedly: $(tr '\n' ',' <"$order_log")"
+  grep -Fq 'cf-download' "$order_log" && fail "reality-only downloaded Cloudflare ranges"
+  [[ "$(grep -n '^xray-test$' "$order_log" | cut -d: -f1)" -lt "$(grep -n '^config-install$' "$order_log" | cut -d: -f1)" ]] ||
+    fail "Xray test did not precede config installation"
+  [[ "$(grep -n '^listeners-ok$' "$order_log" | cut -d: -f1)" -lt "$(grep -n '^v2ray-disable$' "$order_log" | cut -d: -f1)" ]] ||
+    fail "V2Ray was disabled before listener validation"
+
+  : >"$order_log"
+  verify_started_services() { event listeners-failed; return 1; }
+  rollback_current_run() { event rollback; }
+  set +e
   (
-    id() {
-      [[ "${1:-}" == "-u" ]] || return 1
-      printf '0\n'
-    }
-    main --mode reality
-  ) 2>&1
-)"; then
-  fail "feature-branch execution must fail closed"
-fi
-[[ "$execution_output" == *"Deployment backend is being migrated; do not deploy from this feature branch yet."* ]] ||
-  fail "execution did not reach the fail-closed migration guard: $execution_output"
-for removed_reference in validate_runtime PORT UUID; do
-  [[ "$execution_output" != *"$removed_reference"* ]] ||
-    fail "execution referenced removed legacy state $removed_reference: $execution_output"
-done
+    set -Eeuo pipefail
+    activate_transaction_traps
+    deploy_services
+  ) >/dev/null 2>&1
+  status=$?
+  set -e
+  [[ "$status" -ne 0 ]] || fail "failed deployment unexpectedly succeeded"
+  grep -Fq 'rollback' "$order_log" || fail "ERR trap did not roll back"
+  grep -Fq 'v2ray-disable' "$order_log" && fail "failed deployment disabled V2Ray"
+  :
+)
+
+test_deployment_order_and_failure_trap
+printf 'PASS: deployment ordering tests\n'
+
+test_transaction_exit_trap() (
+  local temp_dir managed rollback_log status
+  temp_dir="$(mktemp -d)"
+  trap 'rm -rf "$temp_dir"' RETURN
+  managed="$temp_dir/managed.conf"
+  rollback_log="$temp_dir/rollback.log"
+  printf 'old\n' >"$managed"
+  rollback_current_run() {
+    printf 'old\n' >"$managed"
+    printf 'rollback\n' >>"$rollback_log"
+  }
+
+  set +e
+  (
+    set -Eeuo pipefail
+    activate_transaction_traps
+    printf 'changed\n' >"$managed"
+    die "forced explicit exit"
+  ) >/dev/null 2>&1
+  status=$?
+  set -e
+  assert_eq "1" "$status" "explicit die exit status"
+  assert_eq "old" "$(cat "$managed")" "explicit die rollback"
+  assert_eq "1" "$(wc -l <"$rollback_log" | tr -d ' ')" "explicit die rollback count"
+
+  : >"$rollback_log"
+  set +e
+  (
+    set -Eeuo pipefail
+    activate_transaction_traps
+    false
+  ) >/dev/null 2>&1
+  status=$?
+  set -e
+  assert_eq "1" "$status" "ordinary failure exit status"
+  assert_eq "1" "$(wc -l <"$rollback_log" | tr -d ' ')" "ordinary failure rollback count"
+
+  : >"$rollback_log"
+  (
+    set -Eeuo pipefail
+    activate_transaction_traps
+    true
+    complete_transaction
+  )
+  [[ ! -s "$rollback_log" ]] || fail "successful transaction rolled back"
+
+  : >"$rollback_log"
+  set +e
+  (
+    set -Eeuo pipefail
+    activate_transaction_traps
+    kill -TERM "$BASHPID"
+  ) >/dev/null 2>&1
+  status=$?
+  set -e
+  assert_eq "143" "$status" "TERM transaction exit status"
+  assert_eq "1" "$(wc -l <"$rollback_log" | tr -d ' ')" "TERM rollback count"
+)
+
+test_transaction_exit_trap
+printf 'PASS: transaction EXIT trap tests\n'
+
+test_mode_specific_output() (
+  valid_public_ip "1.1.1.1" || fail "public IP validator rejected a global address"
+  valid_public_ip "203.0.113.10" && fail "documentation-only address was accepted as public"
+  valid_public_ip "10.0.0.1" && fail "private address was accepted as public"
+  reset_options
+  MODE="dual"
+  DOMAIN="vpn.example.com"
+  REALITY_PORT="4443"
+  CLOUDFLARE_PORT="2053"
+  REALITY_TARGET="www.microsoft.com:443"
+  REALITY_UUID="11111111-1111-4111-8111-111111111111"
+  CLOUDFLARE_UUID="22222222-2222-4222-8222-222222222222"
+  REALITY_PUBLIC_KEY="BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+  REALITY_SHORT_ID="0123456789abcdef"
+  WS_PATH="/saved-path"
+  PUBLIC_ADDRESS="1.1.1.1"
+  STATE_FILE="/etc/v2ray-onekey/state.env"
+  BACKUP_DIR="/var/backups/v2ray-onekey/test"
+  local output
+  output="$(print_deployment_summary)"
+  [[ "$output" == *'Primary direct entry: VLESS + REALITY + XTLS Vision'* ]] || fail "dual output lacks direct label"
+  [[ "$output" == *'Fallback entry: VLESS + WebSocket + TLS + Cloudflare'* ]] || fail "dual output lacks CF label"
+  [[ "$output" == *'@1.1.1.1:4443'* && "$output" == *'@vpn.example.com:2053'* ]] || fail "final selected ports not printed"
+  MODE="reality"
+  output="$(print_deployment_summary)"
+  [[ "$output" == *'Primary direct entry:'* && "$output" != *'Fallback entry:'* ]] || fail "reality output labels are wrong"
+  MODE="cloudflare"
+  output="$(print_deployment_summary)"
+  [[ "$output" != *'Primary direct entry:'* && "$output" == *'Fallback entry:'* ]] || fail "Cloudflare output labels are wrong"
+)
+
+test_mode_specific_output
+printf 'PASS: mode-specific output tests\n'
 
 printf 'PASS: mode and validation tests\n'

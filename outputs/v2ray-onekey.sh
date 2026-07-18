@@ -4,10 +4,14 @@ APP_NAME="v2ray-onekey"
 XRAY_CONFIG="${XRAY_CONFIG:-/usr/local/etc/xray/config.json}"
 STATE_FILE="${STATE_FILE:-/etc/v2ray-onekey/state.env}"
 BACKUP_ROOT="${BACKUP_ROOT:-/var/backups/v2ray-onekey}"
+NGINX_SITE="${NGINX_SITE:-/etc/nginx/conf.d/v2ray-onekey.conf}"
+RENEWAL_HOOK="${RENEWAL_HOOK:-/etc/letsencrypt/renewal-hooks/deploy/v2ray-onekey-nginx.sh}"
+LEGACY_V2RAY_CONFIG="${LEGACY_V2RAY_CONFIG:-/usr/local/etc/v2ray/config.json}"
 XRAY_INSTALL_URL="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
 DEFAULT_REALITY_TARGET="www.microsoft.com:443"
 CLOUDFLARE_CONNECT_TIMEOUT="${CLOUDFLARE_CONNECT_TIMEOUT:-10}"
 CLOUDFLARE_MAX_TIME="${CLOUDFLARE_MAX_TIME:-30}"
+TRANSACTION_ACTIVE="0"
 
 log() { printf '\033[1;32m[%s]\033[0m %s\n' "$APP_NAME" "$*"; }
 warn() { printf '\033[1;33m[%s]\033[0m %s\n' "$APP_NAME" "$*"; }
@@ -29,6 +33,16 @@ reset_options() {
   WS_PATH=""
   ROTATE="0"
   ALLOW_BITTORRENT="0"
+  CLI_MODE_SET="0"
+  CLI_DOMAIN_SET="0"
+  CLI_EMAIL_SET="0"
+  CLI_REALITY_PORT_SET="0"
+  CLI_CLOUDFLARE_PORT_SET="0"
+  CLI_REALITY_TARGET_SET="0"
+  CLI_REALITY_UUID_SET="0"
+  CLI_CLOUDFLARE_UUID_SET="0"
+  CLI_WS_PATH_SET="0"
+  CLI_ALLOW_BITTORRENT_SET="0"
 }
 
 valid_domain() {
@@ -159,6 +173,7 @@ parse_args() {
       --mode)
         [[ $# -ge 2 && -n "$2" ]] || die "--mode requires a value"
         MODE="$2"
+        CLI_MODE_SET="1"
         [[ "$MODE" == "reality" || "$MODE" == "cloudflare" || "$MODE" == "dual" ]] ||
           die "--mode must be reality, cloudflare, or dual"
         shift 2
@@ -166,41 +181,49 @@ parse_args() {
       --domain)
         [[ $# -ge 2 && -n "$2" ]] || die "--domain requires a value"
         DOMAIN="$2"
+        CLI_DOMAIN_SET="1"
         shift 2
         ;;
       --email)
         [[ $# -ge 2 && -n "$2" ]] || die "--email requires a value"
         EMAIL="$2"
+        CLI_EMAIL_SET="1"
         shift 2
         ;;
       --reality-port)
         [[ $# -ge 2 && -n "$2" ]] || die "--reality-port requires a value"
         REALITY_PORT="$2"
+        CLI_REALITY_PORT_SET="1"
         shift 2
         ;;
       --cloudflare-port)
         [[ $# -ge 2 && -n "$2" ]] || die "--cloudflare-port requires a value"
         CLOUDFLARE_PORT="$2"
+        CLI_CLOUDFLARE_PORT_SET="1"
         shift 2
         ;;
       --reality-target)
         [[ $# -ge 2 && -n "$2" ]] || die "--reality-target requires a value"
         REALITY_TARGET="$2"
+        CLI_REALITY_TARGET_SET="1"
         shift 2
         ;;
       --reality-uuid)
         [[ $# -ge 2 && -n "$2" ]] || die "--reality-uuid requires a value"
         REALITY_UUID="$2"
+        CLI_REALITY_UUID_SET="1"
         shift 2
         ;;
       --cloudflare-uuid)
         [[ $# -ge 2 && -n "$2" ]] || die "--cloudflare-uuid requires a value"
         CLOUDFLARE_UUID="$2"
+        CLI_CLOUDFLARE_UUID_SET="1"
         shift 2
         ;;
       --ws-path)
         [[ $# -ge 2 && -n "$2" ]] || die "--ws-path requires a value"
         WS_PATH="$2"
+        CLI_WS_PATH_SET="1"
         shift 2
         ;;
       --rotate)
@@ -209,6 +232,7 @@ parse_args() {
         ;;
       --allow-bittorrent)
         ALLOW_BITTORRENT="1"
+        CLI_ALLOW_BITTORRENT_SET="1"
         shift
         ;;
       -h|--help)
@@ -448,6 +472,43 @@ rotate_runtime_values() {
   WS_PATH=""
 }
 
+prepare_configuration() {
+  local cli_mode="$MODE" cli_domain="$DOMAIN" cli_email="$EMAIL"
+  local cli_reality_port="$REALITY_PORT" cli_cloudflare_port="$CLOUDFLARE_PORT"
+  local cli_reality_target="$REALITY_TARGET" cli_reality_uuid="$REALITY_UUID"
+  local cli_cloudflare_uuid="$CLOUDFLARE_UUID" cli_ws_path="$WS_PATH"
+  local cli_rotate="$ROTATE" cli_allow_bittorrent="$ALLOW_BITTORRENT"
+  local saved_mode=""
+
+  if [[ -f "$STATE_FILE" ]]; then
+    load_state
+    saved_mode="$MODE"
+    if [[ "$CLI_MODE_SET" == "1" ]]; then MODE="$cli_mode"; fi
+    if [[ "$CLI_DOMAIN_SET" == "1" ]]; then DOMAIN="$cli_domain"; fi
+    if [[ "$CLI_EMAIL_SET" == "1" ]]; then EMAIL="$cli_email"; fi
+    if [[ "$CLI_REALITY_PORT_SET" == "1" ]]; then REALITY_PORT="$cli_reality_port"; fi
+    if [[ "$CLI_CLOUDFLARE_PORT_SET" == "1" ]]; then CLOUDFLARE_PORT="$cli_cloudflare_port"; fi
+    if [[ "$CLI_REALITY_TARGET_SET" == "1" ]]; then REALITY_TARGET="$cli_reality_target"; fi
+    if [[ "$CLI_REALITY_UUID_SET" == "1" ]]; then REALITY_UUID="$cli_reality_uuid"; fi
+    if [[ "$CLI_CLOUDFLARE_UUID_SET" == "1" ]]; then CLOUDFLARE_UUID="$cli_cloudflare_uuid"; fi
+    if [[ "$CLI_WS_PATH_SET" == "1" ]]; then WS_PATH="$cli_ws_path"; fi
+    if [[ "$CLI_ALLOW_BITTORRENT_SET" == "1" ]]; then ALLOW_BITTORRENT="$cli_allow_bittorrent"; fi
+    ROTATE="$cli_rotate"
+    if [[ "$MODE" != "$saved_mode" && "$ROTATE" != "1" ]]; then
+      die "Changing an existing deployment mode requires --rotate"
+    fi
+  else
+    select_mode
+  fi
+
+  validate_options
+  if [[ "$ROTATE" == "1" ]]; then
+    rotate_runtime_values
+  elif [[ -f "$STATE_FILE" ]]; then
+    validate_loaded_runtime_values
+  fi
+}
+
 cloudflare_ipv4_file() { printf '%s\n' "${CLOUDFLARE_IPV4_FILE:-${RUNTIME_DIR:-/run/v2ray-onekey}/ips-v4}"; }
 cloudflare_ipv6_file() { printf '%s\n' "${CLOUDFLARE_IPV6_FILE:-${RUNTIME_DIR:-/run/v2ray-onekey}/ips-v6}"; }
 
@@ -561,6 +622,43 @@ download_cloudflare_ranges() (
   mv -f -- "$temp_v6" "$v6"
 )
 
+write_builtin_cloudflare_ranges() (
+  local run_dir v4 v6
+  run_dir="${RUNTIME_DIR:-/run/v2ray-onekey}"
+  v4="${CLOUDFLARE_IPV4_FILE:-$run_dir/ips-v4}"
+  v6="${CLOUDFLARE_IPV6_FILE:-$run_dir/ips-v6}"
+  install -d -m 700 "$run_dir"
+  cat >"$v4" <<'EOF'
+173.245.48.0/20
+103.21.244.0/22
+103.22.200.0/22
+103.31.4.0/22
+141.101.64.0/18
+108.162.192.0/18
+190.93.240.0/20
+188.114.96.0/20
+197.234.240.0/22
+198.41.128.0/17
+162.158.0.0/15
+104.16.0.0/13
+104.24.0.0/14
+172.64.0.0/13
+131.0.72.0/22
+EOF
+  cat >"$v6" <<'EOF'
+2400:cb00::/32
+2606:4700::/32
+2803:f800::/32
+2405:b500::/32
+2405:8100::/32
+2a06:98c0::/29
+2c0f:f248::/32
+EOF
+  chmod 0600 "$v4" "$v6"
+  validate_cloudflare_range_file "$v4" 4 || die "Invalid built-in Cloudflare IPv4 range data"
+  validate_cloudflare_range_file "$v6" 6 || die "Invalid built-in Cloudflare IPv6 range data"
+)
+
 valid_cloudflare_timeout() {
   [[ "$1" =~ ^[0-9]{1,3}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 300 ))
 }
@@ -570,7 +668,7 @@ validate_reality_target() {
   valid_reality_target "$target" || die "Invalid REALITY target: $target (expected HOST:PORT)"
   hostname="${target%:*}"
   host_resolves_to_cloudflare "$hostname" && die "REALITY target resolves to Cloudflare: $hostname"
-  timeout 15 xray tls ping "$hostname" >/dev/null || die "REALITY target TLS ping failed: $hostname"
+  timeout 15 xray tls ping "$target" >/dev/null || die "REALITY target TLS ping failed: $target"
 }
 
 validate_unique_public_ports() {
@@ -582,15 +680,54 @@ validate_unique_public_ports() {
 }
 
 legacy_nginx_config_path() {
-  [[ "$1" =~ ^/etc/nginx/conf\.d/v2ray-[A-Za-z0-9.-]+\.conf$ ]]
+  [[ "$1" != "$NGINX_SITE" && "$1" =~ ^/etc/nginx/conf\.d/v2ray-[A-Za-z0-9.-]+\.conf$ ]]
 }
 
 legacy_nginx_config_is_project_owned() {
   local path="$1"
   legacy_nginx_config_path "$path" || return 1
+  [[ -f "$path" && ! -L "$path" ]] || return 1
   grep -Fq 'proxy_set_header Upgrade' "$path" &&
     grep -Fq 'proxy_pass http://127.0.0.1:' "$path" &&
     grep -Fq 'return 200 "ok' "$path"
+}
+
+current_nginx_config_is_project_owned() {
+  local path="$1"
+  [[ "$path" == "$NGINX_SITE" && -f "$path" && ! -L "$path" ]] || return 1
+  # The literal Nginx runtime variable is an ownership signature.
+  # shellcheck disable=SC2016
+  grep -Fq '# Managed by v2ray-onekey' "$path" &&
+    grep -Fq 'proxy_set_header Upgrade $http_upgrade;' "$path" &&
+    grep -Fq 'proxy_pass http://127.0.0.1:' "$path" &&
+    grep -Fq 'return 200 "ok' "$path"
+}
+
+validate_managed_destination_ownership() {
+  if mode_has_cloudflare && [[ -e "$NGINX_SITE" ]] &&
+    ! current_nginx_config_is_project_owned "$NGINX_SITE"; then
+    die "Refusing to overwrite Nginx site without v2ray-onekey ownership signatures: $NGINX_SITE"
+  fi
+}
+
+current_renewal_hook_is_project_owned() {
+  local path="$1"
+  [[ "$path" == "$RENEWAL_HOOK" && -f "$path" && ! -L "$path" ]] || return 1
+  python3 - "$path" <<'PY'
+import pathlib
+import sys
+
+expected = """#!/usr/bin/env bash
+set -e
+nginx -t
+systemctl reload nginx
+"""
+try:
+    actual = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+except (OSError, UnicodeError):
+    raise SystemExit(1)
+raise SystemExit(0 if actual == expected else 1)
+PY
 }
 
 legacy_project_nginx_exists() {
@@ -602,6 +739,166 @@ legacy_project_nginx_exists() {
   return 1
 }
 
+managed_path_allowed() {
+  local path="$1"
+  [[ "$path" == "$LEGACY_V2RAY_CONFIG" ||
+    "$path" == "$XRAY_CONFIG" ||
+    "$path" == "$STATE_FILE" ||
+    "$path" == "$NGINX_SITE" ||
+    "$path" == "$RENEWAL_HOOK" ]] && return 0
+  current_nginx_config_is_project_owned "$path" && return 0
+  legacy_nginx_config_is_project_owned "$path" && return 0
+  [[ -n "${BACKUP_DIR:-}" && -f "$BACKUP_DIR/legacy-files" ]] &&
+    grep -Fqx -- "$path" "$BACKUP_DIR/legacy-files"
+}
+
+init_backup_metadata() {
+  [[ -n "${BACKUP_DIR:-}" && "$BACKUP_DIR" == /* ]] || die "Invalid backup directory"
+  install -d -m 700 "$BACKUP_DIR"
+  : >"$BACKUP_DIR/manifest"
+  : >"$BACKUP_DIR/services"
+  : >"$BACKUP_DIR/legacy-renames"
+  chmod 0600 "$BACKUP_DIR/manifest" "$BACKUP_DIR/services" "$BACKUP_DIR/legacy-renames"
+}
+
+manifest_has_path() {
+  local path="$1"
+  awk -F '\t' -v wanted="$path" '$2 == wanted { found = 1 } END { exit !found }' \
+    "$BACKUP_DIR/manifest"
+}
+
+backup_file() {
+  local path="$1" destination
+  [[ "$path" == /* && "$path" != *$'\n'* ]] || die "Backup path must be an absolute path"
+  managed_path_allowed "$path" || die "Refusing to back up unmanaged path: $path"
+  manifest_has_path "$path" && return 0
+  [[ ! -L "$path" ]] || die "Refusing to back up symlink: $path"
+  if [[ -e "$path" ]]; then
+    [[ -f "$path" ]] || die "Managed backup path is not a regular file: $path"
+    destination="$BACKUP_DIR$path"
+    install -d -m 700 "$(dirname "$destination")"
+    cp -a -- "$path" "$destination"
+    printf 'present\t%s\n' "$path" >>"$BACKUP_DIR/manifest"
+  else
+    printf 'absent\t%s\n' "$path" >>"$BACKUP_DIR/manifest"
+  fi
+}
+
+service_active_state() {
+  if systemctl is-active --quiet "$1" 2>/dev/null; then
+    printf 'active\n'
+  else
+    printf 'inactive\n'
+  fi
+}
+
+record_service_states() {
+  local service active enabled
+  : >"$BACKUP_DIR/services"
+  for service in v2ray xray nginx; do
+    active="$(service_active_state "$service")"
+    if systemctl is-enabled --quiet "$service" 2>/dev/null; then
+      enabled="enabled"
+    else
+      enabled="disabled"
+    fi
+    printf '%s\t%s\t%s\n' "$service" "$active" "$enabled" >>"$BACKUP_DIR/services"
+  done
+  chmod 0600 "$BACKUP_DIR/services"
+}
+
+collect_owned_legacy_nginx_files() {
+  local path
+  : >"$BACKUP_DIR/legacy-files"
+  chmod 0600 "$BACKUP_DIR/legacy-files"
+  for path in /etc/nginx/conf.d/v2ray-*.conf; do
+    [[ -e "$path" ]] || continue
+    if legacy_nginx_config_is_project_owned "$path"; then
+      backup_file "$path"
+      printf '%s\n' "$path" >>"$BACKUP_DIR/legacy-files"
+    fi
+  done
+}
+
+begin_transaction() {
+  local managed_path
+  RUN_TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+  BACKUP_DIR="$BACKUP_ROOT/$RUN_TIMESTAMP"
+  [[ ! -e "$BACKUP_DIR" ]] || BACKUP_DIR="${BACKUP_DIR}-$$"
+  init_backup_metadata
+  record_service_states
+  for managed_path in \
+    "$LEGACY_V2RAY_CONFIG" "$XRAY_CONFIG" "$STATE_FILE" "$NGINX_SITE" "$RENEWAL_HOOK"; do
+    backup_file "$managed_path"
+  done
+  collect_owned_legacy_nginx_files
+}
+
+disable_owned_legacy_nginx_files() {
+  local path disabled
+  [[ -f "$BACKUP_DIR/legacy-files" ]] || return 0
+  while IFS= read -r path; do
+    [[ -n "$path" && -f "$path" && ! -L "$path" ]] || continue
+    legacy_nginx_config_is_project_owned "$path" || die "Legacy Nginx ownership changed during deployment: $path"
+    disabled="${path}.v2ray-onekey-disabled-${RUN_TIMESTAMP}"
+    [[ ! -e "$disabled" ]] || die "Legacy Nginx disabled path already exists: $disabled"
+    mv -- "$path" "$disabled"
+    printf '%s\t%s\n' "$path" "$disabled" >>"$BACKUP_DIR/legacy-renames"
+  done <"$BACKUP_DIR/legacy-files"
+}
+
+restore_service_states() {
+  local service state enabled
+  [[ -f "$BACKUP_DIR/services" ]] || return 0
+  while IFS=$'\t' read -r service state enabled; do
+    [[ -n "$service" ]] || continue
+    if [[ "$state" == "active" ]]; then
+      systemctl start "$service" >/dev/null 2>&1 || warn "Could not restart $service during rollback"
+    else
+      systemctl stop "$service" >/dev/null 2>&1 || true
+    fi
+    if [[ "$enabled" == "enabled" ]]; then
+      systemctl enable "$service" >/dev/null 2>&1 || warn "Could not re-enable $service during rollback"
+    else
+      systemctl disable "$service" >/dev/null 2>&1 || true
+    fi
+  done <"$BACKUP_DIR/services"
+}
+
+rollback_current_run() {
+  local kind path backup_path original disabled
+  [[ -n "${BACKUP_DIR:-}" && -f "$BACKUP_DIR/manifest" ]] || return 0
+  while IFS=$'\t' read -r kind path; do
+    [[ -n "$path" ]] || continue
+    managed_path_allowed "$path" || {
+      warn "Skipping unmanaged rollback path: $path"
+      continue
+    }
+    if [[ "$kind" == "present" ]]; then
+      backup_path="$BACKUP_DIR$path"
+      [[ -f "$backup_path" && ! -L "$backup_path" ]] || {
+        warn "Missing backup payload: $path"
+        continue
+      }
+      mkdir -p "$(dirname "$path")"
+      rm -f -- "$path"
+      cp -a -- "$backup_path" "$path"
+    elif [[ "$kind" == "absent" ]]; then
+      rm -f -- "$path"
+    fi
+  done <"$BACKUP_DIR/manifest"
+
+  if [[ -f "$BACKUP_DIR/legacy-renames" ]]; then
+    while IFS=$'\t' read -r original disabled; do
+      [[ -n "$original" && -f "$disabled" && ! -L "$disabled" ]] || continue
+      rm -f -- "$original"
+      mv -- "$disabled" "$original"
+    done <"$BACKUP_DIR/legacy-renames"
+  fi
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  restore_service_states
+}
+
 legacy_nginx_config_for_port_is_project_owned() {
   local port="$1" nginx_output
   nginx_output="$(nginx -T 2>&1)" || return 1
@@ -611,6 +908,7 @@ import sys
 
 port = re.escape(sys.argv[1])
 path_pattern = re.compile(r"/etc/nginx/conf\.d/v2ray-[A-Za-z0-9.-]+\.conf")
+current_path = sys.argv[2]
 listen_pattern = re.compile(
     rf"^\s*listen\s+(?:(?:\[[0-9A-Fa-f:]+\]|[0-9.]+):)?{port}(?=\s|;)",
     re.MULTILINE,
@@ -621,13 +919,21 @@ required_signatures = (
     "proxy_pass http://127.0.0.1:",
     "return 200 \"ok",
 )
+current_signatures = required_signatures + ("# Managed by v2ray-onekey",)
 
 
 def classify_section(path, content):
     listens_on_port = listen_pattern.search(content) is not None
     project_owned = (
-        path_pattern.fullmatch(path) is not None
-        and all(signature in content for signature in required_signatures)
+        (
+            path != current_path
+            and path_pattern.fullmatch(path) is not None
+            and all(signature in content for signature in required_signatures)
+        )
+        or (
+            path == current_path
+            and all(signature in content for signature in current_signatures)
+        )
     )
     return listens_on_port, project_owned
 
@@ -658,30 +964,181 @@ if path is not None:
 if found_listener and not found_unowned_listener:
     raise SystemExit(0)
 raise SystemExit(1)
-' "$port"
+' "$port" "$NGINX_SITE"
 }
 
-listener_is_managed() {
-  local listener="$1" port="$2"
-  [[ "$listener" == *xray* || "$listener" == *v2ray* ]] && return 0
-  [[ "$listener" == *nginx* ]] && legacy_nginx_config_for_port_is_project_owned "$port"
+nginx_has_unmanaged_domain_conflict() {
+  local port="$1" domain="$2" nginx_output
+  nginx_output="$(nginx -T 2>&1)" || return 0
+  printf '%s\n' "$nginx_output" | python3 -c '
+import re
+import sys
+
+port = re.escape(sys.argv[1])
+domain = sys.argv[2].lower()
+current_path = sys.argv[3]
+legacy_path = re.compile(r"/etc/nginx/conf\.d/v2ray-[A-Za-z0-9.-]+\.conf")
+listen = re.compile(
+    rf"^\s*listen\s+(?:(?:\[[0-9A-Fa-f:]+\]|[0-9.]+):)?{port}(?=\s|;)",
+    re.MULTILINE,
+)
+server_name = re.compile(r"^\s*server_name\s+([^;]+);", re.MULTILINE)
+header = re.compile(r"^# configuration file (.+):$")
+legacy_signatures = (
+    "proxy_set_header Upgrade",
+    "proxy_pass http://127.0.0.1:",
+    "return 200 \"ok",
+)
+current_signatures = legacy_signatures + ("# Managed by v2ray-onekey",)
+
+
+def conflicts(path, content):
+    if not listen.search(content):
+        return False
+    names = {
+        name.lower()
+        for match in server_name.finditer(content)
+        for name in match.group(1).split()
+    }
+    if domain not in names:
+        return False
+    managed = (
+        path == current_path
+        and all(signature in content for signature in current_signatures)
+    ) or (
+        path != current_path
+        and legacy_path.fullmatch(path) is not None
+        and all(signature in content for signature in legacy_signatures)
+    )
+    return not managed
+
+
+path = None
+content = []
+for line in sys.stdin:
+    match = header.match(line.rstrip("\n"))
+    if match:
+        if path is not None and conflicts(path, "".join(content)):
+            raise SystemExit(0)
+        path = match.group(1)
+        content = []
+    elif path is not None:
+        content.append(line)
+if path is not None and conflicts(path, "".join(content)):
+    raise SystemExit(0)
+raise SystemExit(1)
+' "$port" "$domain" "$NGINX_SITE"
+}
+
+port_listener_conflicts() {
+  local role="$1" port="$2" listener
+  PORT_CONFLICT_DETAILS="$(ss -H -lntp "sport = :$port" 2>&1)" ||
+    die "Unable to inspect TCP port $port: $PORT_CONFLICT_DETAILS"
+  if [[ -z "$PORT_CONFLICT_DETAILS" ]]; then
+    if [[ "$role" == "cloudflare" ]] && nginx_has_unmanaged_domain_conflict "$port" "$DOMAIN"; then
+      PORT_CONFLICT_DETAILS="Nginx already defines server_name $DOMAIN on TCP $port"
+      return 0
+    fi
+    return 1
+  fi
+  while IFS= read -r listener; do
+    [[ -n "$listener" ]] || continue
+    if [[ "$listener" == *xray* || "$listener" == *v2ray* ]]; then
+      continue
+    fi
+    if [[ "$listener" == *nginx* ]]; then
+      if [[ "$role" == "reality" ]] &&
+        ! legacy_nginx_config_for_port_is_project_owned "$port"; then
+        return 0
+      fi
+      continue
+    fi
+    return 0
+  done <<<"$PORT_CONFLICT_DETAILS"
+  if [[ "$role" == "cloudflare" ]] && nginx_has_unmanaged_domain_conflict "$port" "$DOMAIN"; then
+    PORT_CONFLICT_DETAILS="Nginx already defines server_name $DOMAIN on TCP $port"
+    return 0
+  fi
+  return 1
+}
+
+stdin_is_tty() { [[ -t 0 ]]; }
+
+resolve_one_public_port() {
+  local role="$1" option_name="$2" attempt replacement current_port
+  for attempt in 1 2 3 4 5; do
+    if [[ "$role" == "reality" ]]; then current_port="$REALITY_PORT"; else current_port="$CLOUDFLARE_PORT"; fi
+    port_listener_conflicts "$role" "$current_port" || return 0
+    if ! stdin_is_tty; then
+      die "TCP port $current_port is occupied. Rerun using $option_name PORT. Conflict: $PORT_CONFLICT_DETAILS"
+    fi
+    warn "TCP port $current_port is unavailable: $PORT_CONFLICT_DETAILS"
+    read -r -p "Enter a replacement port for $role (or q to cancel): " replacement ||
+      die "Port selection cancelled"
+    [[ "$replacement" != "q" && "$replacement" != "Q" ]] || die "Port selection cancelled"
+    if [[ "$role" == "cloudflare" ]]; then
+      valid_cloudflare_port "$replacement" || {
+        warn "Cloudflare HTTPS ports: 443, 2053, 2083, 2087, 2096, 8443"
+        continue
+      }
+    else
+      valid_port "$replacement" || {
+        warn "Enter a valid TCP port from 1 to 65535"
+        continue
+      }
+    fi
+    replacement="$(normalize_port "$replacement")"
+    if [[ "$MODE" == "dual" &&
+      ( ( "$role" == "reality" && "$replacement" == "$CLOUDFLARE_PORT" ) ||
+        ( "$role" == "cloudflare" && "$replacement" == "$REALITY_PORT" ) ) ]]; then
+      warn "REALITY and Cloudflare public ports must be different"
+      continue
+    fi
+    if [[ "$role" == "reality" ]]; then REALITY_PORT="$replacement"; else CLOUDFLARE_PORT="$replacement"; fi
+    port_listener_conflicts "$role" "$replacement" || return 0
+  done
+  die "Unable to select an available $role port after 5 attempts"
+}
+
+resolve_public_port_conflicts() {
+  mode_has_reality && resolve_one_public_port reality "--reality-port"
+  mode_has_cloudflare && resolve_one_public_port cloudflare "--cloudflare-port"
+  validate_unique_public_ports
+  if mode_has_cloudflare && port_listener_conflicts acme 80; then
+    die "TCP port 80 is occupied by a non-Nginx process; free it for the ACME HTTP-01 challenge. Conflict: $PORT_CONFLICT_DETAILS"
+  fi
 }
 
 check_public_port_listeners() {
-  local port listeners listener full_listeners
-  for port in "${REALITY_PORT:-}" "${CLOUDFLARE_PORT:-}"; do
-    [[ -n "$port" ]] || continue
-    listeners="$(ss -H -ltnp "sport = :$port" 2>&1)" || die "Unable to inspect listeners with ss: $listeners"
-    [[ -z "$listeners" ]] && continue
+  resolve_public_port_conflicts
+}
+
+ensure_internal_ws_port_available() {
+  local attempt listeners listener full_listeners unrelated
+  mode_has_cloudflare || return 0
+  for ((attempt = 0; attempt <= 32; attempt += 1)); do
+    listeners="$(ss -H -lntp "sport = :$INTERNAL_WS_PORT" 2>&1)" ||
+      die "Unable to inspect internal WebSocket port $INTERNAL_WS_PORT: $listeners"
+    [[ -n "$listeners" ]] || return 0
+    unrelated="0"
     while IFS= read -r listener; do
-      [[ -z "$listener" ]] && continue
-      listener_is_managed "$listener" "$port" && continue
-      full_listeners="$(ss -lntp 2>&1)" || full_listeners="ss -lntp failed: $full_listeners"
-      die "Public port $port listener conflict: $listener
+      [[ -z "$listener" || "$listener" == *xray* || "$listener" == *v2ray* ]] || unrelated="1"
+    done <<<"$listeners"
+    if [[ "$unrelated" == "0" ]]; then
+      return 0
+    fi
+    (( attempt < 32 )) || break
+    warn "Internal WebSocket port $INTERNAL_WS_PORT is occupied; selecting another localhost port."
+    INTERNAL_WS_PORT="$(random_internal_ws_port)"
+  done
+  full_listeners="$(ss -lntp 2>&1)" || full_listeners="ss -lntp failed: $full_listeners"
+  die "Unable to find an available internal WebSocket port after 32 attempts.
 ss -lntp output:
 $full_listeners"
-    done <<<"$listeners"
-  done
+}
+
+check_internal_ws_port_listener() {
+  ensure_internal_ws_port_available
 }
 
 preflight_environment() {
@@ -690,7 +1147,6 @@ preflight_environment() {
   command -v systemctl >/dev/null 2>&1 || die "systemd is required"
   detect_pkg_manager
   validate_unique_public_ports
-  check_public_port_listeners
 }
 
 detect_pkg_manager() {
@@ -722,29 +1178,83 @@ install_packages() {
   esac
 }
 
-random_port() {
-  shuf -i 20000-60000 -n 1
+install_required_packages() {
+  local -a base_packages=(curl ca-certificates openssl python3 coreutils iproute2)
+  install_packages "${base_packages[@]}"
+  if mode_has_cloudflare; then
+    install_packages nginx certbot
+    if ! install_packages python3-certbot-nginx; then
+      warn "The optional certbot Nginx plugin is unavailable; webroot issuance will still be used."
+    fi
+  fi
 }
 
-generate_uuid() {
-  if command -v uuidgen >/dev/null 2>&1; then
-    uuidgen
-  elif [[ -r /proc/sys/kernel/random/uuid ]]; then
-    cat /proc/sys/kernel/random/uuid
-  else
-    python3 - <<'PY'
-import uuid
-print(uuid.uuid4())
-PY
+install_xray_core() {
+  local installer
+  log "Installing or updating Xray from the official XTLS installer..."
+  installer="$(curl -LfsS --connect-timeout 10 --max-time 120 "$XRAY_INSTALL_URL")"
+  [[ -n "$installer" ]] || die "The official Xray installer download was empty"
+  bash -c "$installer" @ install
+}
+
+xray_service_identity() {
+  local user group
+  user="$(systemctl show -p User --value xray 2>/dev/null || true)"
+  user="${user:-root}"
+  id "$user" >/dev/null 2>&1 || die "Xray service user does not exist: $user"
+  group="$(id -gn "$user")" || die "Unable to determine group for Xray service user: $user"
+  printf '%s:%s\n' "$user" "$group"
+}
+
+install_validated_xray_config() {
+  local staged="$1" identity user group config_dir temp
+  [[ -f "$staged" && ! -L "$staged" ]] || die "Validated Xray staging file is missing"
+  identity="$(xray_service_identity)"
+  user="${identity%%:*}"
+  group="${identity#*:}"
+  config_dir="$(dirname "$XRAY_CONFIG")"
+  install -d -o root -g root -m 0755 "$config_dir"
+  temp="$(mktemp "$config_dir/.config.json.XXXXXX")"
+  if ! install -o "$user" -g "$group" -m 0400 "$staged" "$temp"; then
+    rm -f -- "$temp"
+    return 1
   fi
+  mv -f -- "$temp" "$XRAY_CONFIG"
+}
+
+install_nginx_config_atomically() {
+  local staged="$1" site_dir temp
+  [[ -f "$staged" && ! -L "$staged" ]] || die "Nginx staging file is missing"
+  site_dir="$(dirname "$NGINX_SITE")"
+  install -d -m 0755 "$site_dir"
+  temp="$(mktemp "$site_dir/.v2ray-onekey.conf.XXXXXX")"
+  if ! install -o root -g root -m 0644 "$staged" "$temp"; then
+    rm -f -- "$temp"
+    return 1
+  fi
+  mv -f -- "$temp" "$NGINX_SITE"
 }
 
 public_ip() {
   local ip=""
-  ip="$(curl -4fsS --max-time 6 https://api.ipify.org || true)"
-  [[ -n "$ip" ]] || ip="$(curl -4fsS --max-time 6 https://ifconfig.me || true)"
-  [[ -n "$ip" ]] || ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  ip="$(curl -4fsS --connect-timeout 3 --max-time 6 https://api.ipify.org || true)"
+  valid_public_ip "$ip" || ip="$(curl -4fsS --connect-timeout 3 --max-time 6 https://ifconfig.me || true)"
+  valid_public_ip "$ip" || return 1
   printf '%s' "$ip"
+}
+
+valid_public_ip() {
+  python3 - "$1" <<'PY'
+import ipaddress
+import sys
+
+try:
+    address = ipaddress.ip_address(sys.argv[1])
+except ValueError:
+    raise SystemExit(1)
+if not address.is_global:
+    raise SystemExit(1)
+PY
 }
 
 render_xray_config() {
@@ -793,11 +1303,6 @@ sniffing = {
 inbounds = []
 
 if mode in ("reality", "dual"):
-    fallback_limit = {
-        "afterBytes": 1048576,
-        "bytesPerSec": 102400,
-        "burstBytesPerSec": 1048576,
-    }
     inbounds.append(
         {
             "tag": "reality-in",
@@ -823,8 +1328,6 @@ if mode in ("reality", "dual"):
                     "serverNames": [reality_target.rsplit(":", 1)[0]],
                     "privateKey": reality_private_key,
                     "shortIds": [reality_short_id],
-                    "limitFallbackUpload": fallback_limit,
-                    "limitFallbackDownload": fallback_limit,
                 },
             },
             "sniffing": sniffing,
@@ -930,11 +1433,6 @@ open_firewall_port() {
   fi
 }
 
-install_v2ray() {
-  log "Installing or updating V2Ray from the official V2Fly installer..."
-  bash <(curl -fsSL "$INSTALL_SCRIPT_URL")
-}
-
 valid_nginx_webroot() {
   [[ "$1" =~ ^/[A-Za-z0-9._/-]+$ ]]
 }
@@ -963,6 +1461,7 @@ render_nginx_site() (
   trap 'rm -f -- "$temp_path"' EXIT
 
   cat >"$temp_path" <<EOF
+# Managed by v2ray-onekey
 server {
     listen 80;
     listen [::]:80;
@@ -1076,14 +1575,225 @@ check_cloudflare_edge() {
   return 0
 }
 
-restart_v2ray() {
+service_was_active() {
+  local service="$1"
+  awk -F '\t' -v wanted="$service" '$1 == wanted && $2 == "active" { found = 1 } END { exit !found }' \
+    "$BACKUP_DIR/services"
+}
+
+service_unit_exists() {
+  systemctl cat "$1" >/dev/null 2>&1
+}
+
+stop_legacy_service_for_cutover() {
+  if service_was_active xray; then
+    log "Temporarily stopping the existing Xray service for cutover..."
+    systemctl stop xray
+  fi
+  if service_was_active v2ray; then
+    log "Temporarily stopping V2Ray for the validated cutover..."
+    systemctl stop v2ray
+  fi
+}
+
+activate_nginx_config() {
+  nginx -t
+  if systemctl is-active --quiet nginx; then
+    systemctl reload nginx
+  else
+    systemctl enable --now nginx
+  fi
+}
+
+release_legacy_nginx_listeners() {
+  disable_owned_legacy_nginx_files
+  if ! mode_has_cloudflare && current_nginx_config_is_project_owned "$NGINX_SITE"; then
+    rm -f -- "$NGINX_SITE"
+  fi
+  if ! mode_has_cloudflare && [[ -e "$RENEWAL_HOOK" ]]; then
+    if current_renewal_hook_is_project_owned "$RENEWAL_HOOK"; then
+      rm -f -- "$RENEWAL_HOOK"
+    else
+      warn "Leaving unrecognized renewal hook unchanged: $RENEWAL_HOOK"
+    fi
+  fi
+  if ! mode_has_cloudflare && systemctl is-active --quiet nginx; then
+    nginx -t
+    systemctl reload nginx
+  fi
+}
+
+listener_output() {
+  ss -H -lntp "sport = :$1" 2>&1
+}
+
+require_listener_owner() {
+  local port="$1" owner="$2" binding="${3:-}" output
+  output="$(listener_output "$port")" || die "Unable to inspect listener on TCP $port: $output"
+  [[ -n "$output" ]] || die "Expected $owner listener on TCP $port, but no listener was found"
+  [[ "$output" == *"$owner"* ]] || die "TCP $port is not owned by $owner:
+$output"
+  if [[ -n "$binding" && "$output" != *"$binding:$port"* ]]; then
+    die "TCP $port is not bound to $binding as required:
+$output"
+  fi
+}
+
+verify_started_services() {
+  systemctl is-active --quiet xray || die "Xray is not active after restart"
+  if mode_has_reality; then
+    require_listener_owner "$REALITY_PORT" xray
+  fi
+  if mode_has_cloudflare; then
+    systemctl is-active --quiet nginx || die "Nginx is not active after reload"
+    require_listener_owner "$INTERNAL_WS_PORT" xray 127.0.0.1
+    require_listener_owner "$CLOUDFLARE_PORT" nginx
+    require_listener_owner 80 nginx
+  fi
+}
+
+disable_legacy_v2ray_after_success() {
+  if service_unit_exists v2ray; then
+    systemctl disable --now v2ray
+  fi
+}
+
+configure_firewall() {
+  if mode_has_cloudflare; then
+    open_firewall_port 80 tcp
+    open_firewall_port "$CLOUDFLARE_PORT" tcp
+  fi
+  if mode_has_reality; then
+    open_firewall_port "$REALITY_PORT" tcp
+  fi
+}
+
+required_public_ports() {
+  local -a ports=()
+  mode_has_cloudflare && ports+=(80 "$CLOUDFLARE_PORT")
+  mode_has_reality && ports+=("$REALITY_PORT")
+  printf '%s\n' "${ports[@]}"
+}
+
+print_deployment_summary() {
+  local port_list=""
+  port_list="$(required_public_ports | paste -sd, -)"
+  printf '\n'
+  if mode_has_reality; then
+    printf 'Primary direct entry: VLESS + REALITY + XTLS Vision\n'
+    make_reality_link "$PUBLIC_ADDRESS"
+  fi
+  if mode_has_cloudflare; then
+    printf 'Fallback entry: VLESS + WebSocket + TLS + Cloudflare\n'
+    make_cloudflare_link
+  fi
+  printf 'State file: %s\n' "$STATE_FILE"
+  printf 'Backup: %s\n' "$BACKUP_DIR"
+  printf 'Open these TCP ports in the cloud security group: %s\n' "$port_list"
+  if mode_has_cloudflare; then
+    printf 'Diagnostics: systemctl status xray; journalctl -u xray -e; nginx -t\n'
+  else
+    printf 'Diagnostics: systemctl status xray; journalctl -u xray -e\n'
+  fi
+}
+
+prepare_runtime_directory() {
+  RUNTIME_DIR="${RUNTIME_DIR:-/run/v2ray-onekey/$RUN_TIMESTAMP}"
+  install -d -m 700 "$RUNTIME_DIR"
+}
+
+deploy_services() {
+  local staged_xray staged_nginx_initial staged_nginx_final formatted_address
+
+  begin_transaction
+  validate_managed_destination_ownership
+  install_required_packages
+  install_xray_core
+  prepare_runtime_directory
+  generate_runtime_values
+  validate_loaded_runtime_values
+
+  if mode_has_cloudflare; then
+    download_cloudflare_ranges
+    validate_cloudflare_domain
+  else
+    write_builtin_cloudflare_ranges
+  fi
+  if mode_has_reality; then
+    validate_reality_target "$REALITY_TARGET"
+    PUBLIC_ADDRESS="$(public_ip)"
+    [[ -n "$PUBLIC_ADDRESS" ]] || die "Unable to determine the public IP for the REALITY link"
+    valid_public_ip "$PUBLIC_ADDRESS" || die "Detected address is not a public IP: $PUBLIC_ADDRESS"
+    formatted_address="$(format_uri_host "$PUBLIC_ADDRESS")" || die "Invalid public IP detected: $PUBLIC_ADDRESS"
+    [[ -n "$formatted_address" ]] || die "Unable to format the public IP for the REALITY link"
+  else
+    PUBLIC_ADDRESS=""
+  fi
+
+  check_public_port_listeners
+  check_internal_ws_port_listener
+  staged_xray="$RUNTIME_DIR/xray-config.json"
+  render_xray_config "$staged_xray"
+  xray run -test -config "$staged_xray"
+
+  stop_legacy_service_for_cutover
+  release_legacy_nginx_listeners
+
+  if mode_has_cloudflare; then
+    staged_nginx_initial="$RUNTIME_DIR/nginx-initial.conf"
+    staged_nginx_final="$RUNTIME_DIR/nginx-final.conf"
+    install -d -m 755 "${ACME_WEBROOT:-/var/www/v2ray-onekey}"
+    render_nginx_site "$staged_nginx_initial" initial
+    install_nginx_config_atomically "$staged_nginx_initial"
+    activate_nginx_config
+    request_certificate
+    render_nginx_site "$staged_nginx_final" final
+    install_nginx_config_atomically "$staged_nginx_final"
+    nginx -t
+    create_renewal_hook "$RENEWAL_HOOK"
+  fi
+
+  install_validated_xray_config "$staged_xray"
   systemctl daemon-reload
-  systemctl enable --now v2ray
-  systemctl restart v2ray
-  systemctl --no-pager --full status v2ray >/tmp/v2ray-status.txt || {
-    cat /tmp/v2ray-status.txt >&2 || true
-    die "V2Ray failed to start. Check: journalctl -u v2ray -e --no-pager"
-  }
+  systemctl enable --now xray
+  systemctl restart xray
+  if mode_has_cloudflare; then
+    systemctl reload nginx
+  fi
+  verify_started_services
+
+  disable_legacy_v2ray_after_success
+  save_state
+  configure_firewall
+  if mode_has_cloudflare; then
+    check_cloudflare_edge
+  fi
+  print_deployment_summary
+}
+
+transaction_exit_handler() {
+  local status=$?
+  trap - EXIT ERR INT TERM
+  if [[ "${TRANSACTION_ACTIVE:-0}" != "1" || "$status" -eq 0 ]]; then
+    exit "$status"
+  fi
+  TRANSACTION_ACTIVE="0"
+  set +e
+  warn "Deployment failed; restoring files from ${BACKUP_DIR:-the current backup}"
+  rollback_current_run || warn "Automatic rollback was incomplete"
+  exit "$status"
+}
+
+activate_transaction_traps() {
+  TRANSACTION_ACTIVE="1"
+  trap transaction_exit_handler EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+}
+
+complete_transaction() {
+  TRANSACTION_ACTIVE="0"
+  trap - EXIT ERR INT TERM
 }
 
 make_reality_link() {
@@ -1108,10 +1818,12 @@ main() {
   set -Eeuo pipefail
   reset_options
   parse_args "$@"
-  select_mode
-  validate_options
   [[ "$(id -u)" -eq 0 ]] || die "Please run as root: sudo bash v2ray-onekey.sh"
-  die "Deployment backend is being migrated; do not deploy from this feature branch yet."
+  prepare_configuration
+  preflight_environment
+  activate_transaction_traps
+  deploy_services
+  complete_transaction
 }
 
 if [[ "${V2RAY_ONEKEY_SOURCE_ONLY:-0}" != "1" ]]; then
