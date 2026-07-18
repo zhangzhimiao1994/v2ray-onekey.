@@ -303,16 +303,138 @@ public_ip() {
   printf '%s' "$ip"
 }
 
-json_escape() {
-  python3 -c 'import json,sys; print(json.dumps(sys.argv[1])[1:-1])' "$1"
+render_xray_config() {
+  local output_path="$1"
+  install -d -m 755 "$(dirname "$output_path")"
+  python3 - \
+    "$output_path" \
+    "$MODE" \
+    "$REALITY_PORT" \
+    "$INTERNAL_WS_PORT" \
+    "$REALITY_UUID" \
+    "$CLOUDFLARE_UUID" \
+    "$REALITY_PRIVATE_KEY" \
+    "$REALITY_SHORT_ID" \
+    "$REALITY_TARGET" \
+    "$WS_PATH" \
+    "$ALLOW_BITTORRENT" <<'PY'
+import json
+import sys
+
+
+(
+    output_path,
+    mode,
+    reality_port,
+    internal_ws_port,
+    reality_uuid,
+    cloudflare_uuid,
+    reality_private_key,
+    reality_short_id,
+    reality_target,
+    ws_path,
+    allow_bittorrent,
+) = sys.argv[1:]
+
+sniffing = {
+    "enabled": True,
+    "destOverride": ["http", "tls", "quic"],
+    "routeOnly": True,
+}
+inbounds = []
+
+if mode in ("reality", "dual"):
+    fallback_limit = {
+        "afterBytes": 1048576,
+        "bytesPerSec": 102400,
+        "burstBytesPerSec": 1048576,
+    }
+    inbounds.append(
+        {
+            "tag": "reality-in",
+            "listen": "0.0.0.0",
+            "port": int(reality_port),
+            "protocol": "vless",
+            "settings": {
+                "clients": [
+                    {
+                        "id": reality_uuid,
+                        "flow": "xtls-rprx-vision",
+                        "email": "reality",
+                    }
+                ],
+                "decryption": "none",
+            },
+            "streamSettings": {
+                "network": "raw",
+                "security": "reality",
+                "realitySettings": {
+                    "show": False,
+                    "target": reality_target,
+                    "serverNames": [reality_target.rsplit(":", 1)[0]],
+                    "privateKey": reality_private_key,
+                    "shortIds": [reality_short_id],
+                    "limitFallbackUpload": fallback_limit,
+                    "limitFallbackDownload": fallback_limit,
+                },
+            },
+            "sniffing": sniffing,
+        }
+    )
+
+if mode in ("cloudflare", "dual"):
+    inbounds.append(
+        {
+            "tag": "cloudflare-ws-in",
+            "listen": "127.0.0.1",
+            "port": int(internal_ws_port),
+            "protocol": "vless",
+            "settings": {
+                "clients": [{"id": cloudflare_uuid, "email": "cloudflare"}],
+                "decryption": "none",
+            },
+            "streamSettings": {
+                "network": "ws",
+                "security": "none",
+                "wsSettings": {"path": ws_path},
+            },
+            "sniffing": sniffing,
+        }
+    )
+
+routing_rules = [
+    {"type": "field", "ip": ["geoip:private"], "outboundTag": "block"}
+]
+if allow_bittorrent != "1":
+    routing_rules.append(
+        {
+            "type": "field",
+            "protocol": ["bittorrent"],
+            "outboundTag": "block",
+        }
+    )
+
+config = {
+    "log": {"loglevel": "warning"},
+    "inbounds": inbounds,
+    "outbounds": [
+        {"tag": "direct", "protocol": "freedom"},
+        {"tag": "block", "protocol": "blackhole"},
+    ],
+    "routing": {
+        "domainStrategy": "IPIfNonMatch",
+        "rules": routing_rules,
+    },
 }
 
-b64_one_line() {
-  if base64 --help 2>&1 | grep -q -- '-w'; then
-    base64 -w 0
-  else
-    base64 | tr -d '\n'
-  fi
+with open(output_path, "w", encoding="utf-8") as handle:
+    json.dump(config, handle, indent=2)
+    handle.write("\n")
+PY
+}
+
+urlencode() {
+  python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1"
 }
 
 open_firewall_port() {
@@ -332,81 +454,6 @@ open_firewall_port() {
 install_v2ray() {
   log "Installing or updating V2Ray from the official V2Fly installer..."
   bash <(curl -fsSL "$INSTALL_SCRIPT_URL")
-}
-
-write_tcp_config() {
-  install -d -m 755 "$(dirname "$V2RAY_CONFIG")"
-  cat > "$V2RAY_CONFIG" <<EOF
-{
-  "log": {
-    "access": "/var/log/v2ray/access.log",
-    "error": "/var/log/v2ray/error.log",
-    "loglevel": "warning"
-  },
-  "inbounds": [
-    {
-      "port": $PORT,
-      "listen": "0.0.0.0",
-      "protocol": "vmess",
-      "settings": {
-        "clients": [
-          {
-            "id": "$UUID",
-            "alterId": 0
-          }
-        ]
-      },
-      "streamSettings": {
-        "network": "tcp"
-      }
-    }
-  ],
-  "outbounds": [
-    {
-      "protocol": "freedom"
-    }
-  ]
-}
-EOF
-}
-
-write_ws_config() {
-  install -d -m 755 "$(dirname "$V2RAY_CONFIG")"
-  cat > "$V2RAY_CONFIG" <<EOF
-{
-  "log": {
-    "access": "/var/log/v2ray/access.log",
-    "error": "/var/log/v2ray/error.log",
-    "loglevel": "warning"
-  },
-  "inbounds": [
-    {
-      "port": $PORT,
-      "listen": "127.0.0.1",
-      "protocol": "vmess",
-      "settings": {
-        "clients": [
-          {
-            "id": "$UUID",
-            "alterId": 0
-          }
-        ]
-      },
-      "streamSettings": {
-        "network": "ws",
-        "wsSettings": {
-          "path": "$WS_PATH"
-        }
-      }
-    }
-  ],
-  "outbounds": [
-    {
-      "protocol": "freedom"
-    }
-  ]
-}
-EOF
 }
 
 configure_nginx_tls() {
@@ -462,84 +509,20 @@ restart_v2ray() {
   }
 }
 
-make_vmess_link() {
-  local add host net tls path ps json
-  if [[ -n "$DOMAIN" ]]; then
-    add="$DOMAIN"
-    host="$DOMAIN"
-    net="ws"
-    tls="tls"
-    path="$WS_PATH"
-    ps="v2ray-${DOMAIN}-tls"
-    json=$(cat <<EOF
-{"v":"2","ps":"$(json_escape "$ps")","add":"$(json_escape "$add")","port":"443","id":"$UUID","aid":"0","scy":"auto","net":"$net","type":"none","host":"$(json_escape "$host")","path":"$(json_escape "$path")","tls":"$tls","sni":"$(json_escape "$DOMAIN")"}
-EOF
-)
-  else
-    add="$(public_ip)"
-    host=""
-    net="tcp"
-    tls=""
-    path=""
-    ps="v2ray-${add:-server}-tcp"
-    json=$(cat <<EOF
-{"v":"2","ps":"$(json_escape "$ps")","add":"$(json_escape "$add")","port":"$PORT","id":"$UUID","aid":"0","scy":"auto","net":"$net","type":"none","host":"$host","path":"$path","tls":"$tls"}
-EOF
-)
-  fi
-
-  printf 'vmess://%s\n' "$(printf '%s' "$json" | b64_one_line)"
+make_reality_link() {
+  local address="$1"
+  local server_name="${REALITY_TARGET%:*}"
+  printf 'vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp&headerType=none#%s\n' \
+    "$REALITY_UUID" "$address" "$REALITY_PORT" \
+    "$(urlencode "$server_name")" "$(urlencode "$REALITY_PUBLIC_KEY")" \
+    "$(urlencode "$REALITY_SHORT_ID")" "$(urlencode "VLESS-REALITY-direct")"
 }
 
-print_result() {
-  local server_addr mode link
-  link="$(make_vmess_link)"
-
-  if [[ -n "$DOMAIN" ]]; then
-    mode="VMess + WebSocket + TLS"
-    server_addr="$DOMAIN"
-    cat <<EOF
-
-================ V2Ray deployed ================
-Mode:     $mode
-Address:  $server_addr
-Port:     443
-UUID:     $UUID
-Network:  ws
-Path:     $WS_PATH
-TLS:      enabled
-
-Client import link:
-$link
-
-Useful commands:
-  systemctl status v2ray --no-pager
-  journalctl -u v2ray -e --no-pager
-  nginx -t
-=================================================
-EOF
-  else
-    mode="VMess TCP"
-    server_addr="$(public_ip)"
-    cat <<EOF
-
-================ V2Ray deployed ================
-Mode:     $mode
-Address:  $server_addr
-Port:     $PORT
-UUID:     $UUID
-Network:  tcp
-TLS:      none
-
-Client import link:
-$link
-
-Useful commands:
-  systemctl status v2ray --no-pager
-  journalctl -u v2ray -e --no-pager
-=================================================
-EOF
-  fi
+make_cloudflare_link() {
+  printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=chrome&type=ws&host=%s&path=%s#%s\n' \
+    "$CLOUDFLARE_UUID" "$DOMAIN" "$CLOUDFLARE_PORT" \
+    "$(urlencode "$DOMAIN")" "$(urlencode "$DOMAIN")" \
+    "$(urlencode "$WS_PATH")" "$(urlencode "VLESS-Cloudflare-fallback")"
 }
 
 main() {

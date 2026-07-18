@@ -223,6 +223,189 @@ assert_fails "Invalid REALITY UUID" validate_values reality "" "" "" "" bad-uuid
 assert_fails "Invalid Cloudflare UUID" validate_values cloudflare vpn.example.com admin@example.com "" "" "" bad-uuid
 assert_fails "WebSocket path must start with /" validate_values cloudflare vpn.example.com admin@example.com "" "" "" "" private
 
+test_renderers() {
+  local temp_dir
+  temp_dir="$(mktemp -d)"
+  trap 'rm -rf "$temp_dir"' RETURN
+
+  reset_options
+  MODE="dual"
+  DOMAIN="vpn.example.com"
+  REALITY_PORT="443"
+  CLOUDFLARE_PORT="8443"
+  INTERNAL_WS_PORT="31001"
+  REALITY_UUID="11111111-1111-4111-8111-111111111111"
+  CLOUDFLARE_UUID="22222222-2222-4222-8222-222222222222"
+  REALITY_PRIVATE_KEY="private-key"
+  REALITY_PUBLIC_KEY="public-key"
+  REALITY_SHORT_ID="0123456789abcdef"
+  REALITY_TARGET="www.microsoft.com:443"
+  WS_PATH="/6f4f5304d2e84dc8"
+  ALLOW_BITTORRENT="0"
+
+  render_xray_config "$temp_dir/config.json"
+  MODE="reality"
+  render_xray_config "$temp_dir/reality.json"
+  MODE="cloudflare"
+  render_xray_config "$temp_dir/cloudflare.json"
+  MODE="dual"
+  ALLOW_BITTORRENT="1"
+  render_xray_config "$temp_dir/allow-bittorrent.json"
+
+  python3 - \
+    "$temp_dir/config.json" \
+    "$temp_dir/reality.json" \
+    "$temp_dir/cloudflare.json" \
+    "$temp_dir/allow-bittorrent.json" <<'PY'
+import json
+import sys
+
+
+def load(path):
+    with open(path, encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+dual, reality_only, cloudflare_only, allow_bittorrent = map(load, sys.argv[1:])
+assert dual["log"] == {"loglevel": "warning"}
+assert [item["tag"] for item in dual["inbounds"]] == [
+    "reality-in",
+    "cloudflare-ws-in",
+]
+
+reality, cloudflare = dual["inbounds"]
+assert reality["tag"] == "reality-in"
+assert reality["listen"] == "0.0.0.0"
+assert reality["port"] == 443
+assert reality["protocol"] == "vless"
+assert reality["settings"] == {
+    "clients": [
+        {
+            "id": "11111111-1111-4111-8111-111111111111",
+            "flow": "xtls-rprx-vision",
+            "email": "reality",
+        }
+    ],
+    "decryption": "none",
+}
+assert reality["streamSettings"]["network"] == "raw"
+assert reality["streamSettings"]["security"] == "reality"
+reality_settings = reality["streamSettings"]["realitySettings"]
+assert reality_settings["show"] is False
+assert reality_settings["target"] == "www.microsoft.com:443"
+assert reality_settings["serverNames"] == ["www.microsoft.com"]
+assert reality_settings["privateKey"] == "private-key"
+assert reality_settings["shortIds"] == ["0123456789abcdef"]
+fallback_limit = {
+    "afterBytes": 1048576,
+    "bytesPerSec": 102400,
+    "burstBytesPerSec": 1048576,
+}
+assert reality_settings["limitFallbackUpload"] == fallback_limit
+assert reality_settings["limitFallbackDownload"] == fallback_limit
+
+assert cloudflare["tag"] == "cloudflare-ws-in"
+assert cloudflare["listen"] == "127.0.0.1"
+assert cloudflare["port"] == 31001
+assert cloudflare["protocol"] == "vless"
+assert cloudflare["settings"] == {
+    "clients": [
+        {
+            "id": "22222222-2222-4222-8222-222222222222",
+            "email": "cloudflare",
+        }
+    ],
+    "decryption": "none",
+}
+assert cloudflare["streamSettings"] == {
+    "network": "ws",
+    "security": "none",
+    "wsSettings": {"path": "/6f4f5304d2e84dc8"},
+}
+sniffing = {
+    "enabled": True,
+    "destOverride": ["http", "tls", "quic"],
+    "routeOnly": True,
+}
+assert reality["sniffing"] == sniffing
+assert cloudflare["sniffing"] == sniffing
+assert dual["outbounds"] == [
+    {"tag": "direct", "protocol": "freedom"},
+    {"tag": "block", "protocol": "blackhole"},
+]
+private_rule = {
+    "type": "field",
+    "ip": ["geoip:private"],
+    "outboundTag": "block",
+}
+bittorrent_rule = {
+    "type": "field",
+    "protocol": ["bittorrent"],
+    "outboundTag": "block",
+}
+assert dual["routing"] == {
+    "domainStrategy": "IPIfNonMatch",
+    "rules": [private_rule, bittorrent_rule],
+}
+assert all(item["protocol"] != "vmess" for item in dual["inbounds"])
+assert [item["tag"] for item in reality_only["inbounds"]] == ["reality-in"]
+assert [item["tag"] for item in cloudflare_only["inbounds"]] == [
+    "cloudflare-ws-in"
+]
+assert allow_bittorrent["routing"]["rules"] == [private_rule]
+PY
+
+  local reality_link cloudflare_link
+  ALLOW_BITTORRENT="0"
+  reality_link="$(make_reality_link "203.0.113.10")"
+  cloudflare_link="$(make_cloudflare_link)"
+  python3 - "$reality_link" "$cloudflare_link" <<'PY'
+import sys
+import urllib.parse
+
+
+def parse_link(link):
+    assert link.startswith("vless://")
+    parsed = urllib.parse.urlsplit(link)
+    query = urllib.parse.parse_qs(parsed.query, strict_parsing=True)
+    assert urllib.parse.quote(
+        urllib.parse.unquote(parsed.fragment), safe=""
+    ) == parsed.fragment
+    return parsed, {key: values[0] for key, values in query.items()}
+
+
+reality, reality_query = parse_link(sys.argv[1])
+assert reality.username == "11111111-1111-4111-8111-111111111111"
+assert reality.hostname == "203.0.113.10"
+assert reality.port == 443
+assert reality_query["encryption"] == "none"
+assert reality_query["flow"] == "xtls-rprx-vision"
+assert reality_query["security"] == "reality"
+assert reality_query["sni"] == "www.microsoft.com"
+assert reality_query["fp"] == "chrome"
+assert reality_query["pbk"] == "public-key"
+assert reality_query["sid"] == "0123456789abcdef"
+assert reality_query["type"] == "tcp"
+assert urllib.parse.unquote(reality.fragment) == "VLESS-REALITY-direct"
+
+cloudflare, cloudflare_query = parse_link(sys.argv[2])
+assert cloudflare.username == "22222222-2222-4222-8222-222222222222"
+assert cloudflare.hostname == "vpn.example.com"
+assert cloudflare.port == 8443
+assert cloudflare_query["encryption"] == "none"
+assert cloudflare_query["security"] == "tls"
+assert cloudflare_query["sni"] == "vpn.example.com"
+assert cloudflare_query["host"] == "vpn.example.com"
+assert cloudflare_query["fp"] == "chrome"
+assert cloudflare_query["type"] == "ws"
+assert cloudflare_query["path"] == "/6f4f5304d2e84dc8"
+assert "path=%2F6f4f5304d2e84dc8" in cloudflare.query
+assert urllib.parse.unquote(cloudflare.fragment) == "VLESS-Cloudflare-fallback"
+PY
+}
+
+test_renderers
+
 execution_output=""
 if execution_output="$(
   (
