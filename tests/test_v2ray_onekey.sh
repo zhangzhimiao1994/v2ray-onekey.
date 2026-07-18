@@ -917,6 +917,95 @@ NGINX
 
 test_environment_preflight
 
+test_nginx_and_acme() (
+  local temp_dir old_inode certbot_log hook_path output
+  temp_dir="$(mktemp -d)"
+  trap 'rm -rf "$temp_dir"' RETURN
+
+  reset_options
+  MODE="cloudflare"
+  DOMAIN="vpn.example.com"
+  EMAIL="admin@example.com"
+  CLOUDFLARE_PORT="8443"
+  INTERNAL_WS_PORT="31001"
+  WS_PATH="/6f4f5304d2e84dc8"
+  ACME_WEBROOT="$temp_dir/acme-webroot"
+  REALITY_PRIVATE_KEY="private-proxy-secret"
+  CLOUDFLARE_UUID="22222222-2222-4222-8222-222222222222"
+
+  printf 'old site\n' >"$temp_dir/site.conf"
+  old_inode="$(stat -c '%i' "$temp_dir/site.conf")"
+  render_nginx_site "$temp_dir/site.conf" initial
+  [[ "$(stat -c '%i' "$temp_dir/site.conf")" != "$old_inode" ]] ||
+    fail "initial Nginx site was not atomically replaced"
+  grep -Fq 'listen 80;' "$temp_dir/site.conf" || fail "initial HTTP IPv4 listener missing"
+  grep -Fq 'listen [::]:80;' "$temp_dir/site.conf" || fail "initial HTTP IPv6 listener missing"
+  grep -Fq 'server_name vpn.example.com;' "$temp_dir/site.conf" || fail "initial server name missing"
+  grep -Fq "root $ACME_WEBROOT;" "$temp_dir/site.conf" || fail "ACME webroot missing"
+  grep -Fq 'location / {' "$temp_dir/site.conf" || fail "initial ordinary location missing"
+  grep -Fq 'return 200 "ok\n";' "$temp_dir/site.conf" || fail "initial ordinary response missing"
+  grep -Fq 'ssl_certificate ' "$temp_dir/site.conf" && fail "initial site unexpectedly contains TLS"
+
+  render_nginx_site "$temp_dir/site.conf" final
+  assert_eq "644" "$(stat -c '%a' "$temp_dir/site.conf")" "Nginx site permissions"
+  grep -Fq 'listen 8443 ssl;' "$temp_dir/site.conf" || fail "Nginx TLS IPv4 listener missing"
+  grep -Fq 'listen [::]:8443 ssl;' "$temp_dir/site.conf" || fail "Nginx TLS IPv6 listener missing"
+  grep -Fq 'ssl_certificate /etc/letsencrypt/live/vpn.example.com/fullchain.pem;' "$temp_dir/site.conf" || fail "certificate path missing"
+  grep -Fq 'ssl_certificate_key /etc/letsencrypt/live/vpn.example.com/privkey.pem;' "$temp_dir/site.conf" || fail "certificate key path missing"
+  grep -Fq 'ssl_protocols TLSv1.2 TLSv1.3;' "$temp_dir/site.conf" || fail "TLS versions missing"
+  grep -Fq 'location = /6f4f5304d2e84dc8 {' "$temp_dir/site.conf" || fail "exact WebSocket location missing"
+  grep -Fq 'proxy_pass http://127.0.0.1:31001;' "$temp_dir/site.conf" || fail "Xray upstream missing"
+  grep -Fq 'proxy_http_version 1.1;' "$temp_dir/site.conf" || fail "WebSocket HTTP version missing"
+  grep -Fq 'proxy_set_header Upgrade $http_upgrade;' "$temp_dir/site.conf" || fail "literal upgrade variable missing"
+  grep -Fq 'proxy_set_header Connection "upgrade";' "$temp_dir/site.conf" || fail "upgrade connection header missing"
+  grep -Fq 'proxy_set_header Host $host;' "$temp_dir/site.conf" || fail "literal host variable missing"
+  grep -Fq 'proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;' "$temp_dir/site.conf" || fail "literal XFF variable missing"
+  grep -Fq 'proxy_read_timeout 3600s;' "$temp_dir/site.conf" || fail "WebSocket read timeout missing"
+  grep -Fq 'proxy_send_timeout 3600s;' "$temp_dir/site.conf" || fail "WebSocket send timeout missing"
+  grep -Fq 'proxy_buffering off;' "$temp_dir/site.conf" || fail "WebSocket buffering not disabled"
+  grep -Fq 'return 200 "ok\n";' "$temp_dir/site.conf" || fail "final ordinary response missing"
+  grep -Fq "$REALITY_PRIVATE_KEY" "$temp_dir/site.conf" && fail "Nginx config contains proxy credentials"
+  grep -Fq "$CLOUDFLARE_UUID" "$temp_dir/site.conf" && fail "Nginx config contains proxy credentials"
+  assert_fails "Invalid Nginx render mode" render_nginx_site "$temp_dir/site.conf" unsupported
+  WS_PATH='invalid path'
+  assert_fails "WebSocket path" render_nginx_site "$temp_dir/site.conf" final
+  WS_PATH="/6f4f5304d2e84dc8"
+
+  certbot_log="$temp_dir/certbot.log"
+  certbot() { printf '<%s>\n' "$*" >"$certbot_log"; }
+  request_certificate
+  assert_eq '<certonly --webroot -w /tmp/placeholder --non-interactive --agree-tos --email admin@example.com --keep-until-expiring -d vpn.example.com>' \
+    "$(sed "s#${temp_dir}/acme-webroot#/tmp/placeholder#" "$certbot_log")" "Certbot webroot arguments"
+
+  hook_path="$temp_dir/renewal-hooks/deploy/v2ray-onekey-nginx.sh"
+  create_renewal_hook "$hook_path"
+  assert_eq "755" "$(stat -c '%a' "$hook_path")" "renewal hook permissions"
+  assert_eq $'#!/usr/bin/env bash\nset -e\nnginx -t\nsystemctl reload nginx' "$(cat "$hook_path")" "renewal hook content"
+
+  CLOUDFLARE_IPV4_FILE="$temp_dir/ips-v4"
+  CLOUDFLARE_IPV6_FILE="$temp_dir/ips-v6"
+  printf '%s\n' '104.16.0.0/13' >"$CLOUDFLARE_IPV4_FILE"
+  printf '%s\n' '2606:4700::/32' >"$CLOUDFLARE_IPV6_FILE"
+  curl() {
+    [[ "$*" == *'--connect-timeout 10'* && "$*" == *'--max-time 30'* ]] ||
+      fail "edge check did not use finite curl timeouts"
+    printf '%s\n' 'HTTP/2 200' 'cf-ray: test-edge'
+  }
+  check_cloudflare_edge || fail "CF-Ray edge response was rejected"
+
+  curl() { printf '%s\n' 'HTTP/2 200' '' '104.16.1.1'; }
+  check_cloudflare_edge || fail "Cloudflare edge address was rejected"
+
+  curl() { printf '%s\n' 'HTTP/2 200' '' '203.0.113.1'; }
+  if output="$(check_cloudflare_edge 2>&1)"; then
+    fail "non-Cloudflare edge response unexpectedly passed"
+  fi
+  [[ "$output" == *"Cloudflare edge check could not be confirmed"* ]] ||
+    fail "failed edge check did not warn: $output"
+)
+
+test_nginx_and_acme
+
 execution_output=""
 if execution_output="$(
   (

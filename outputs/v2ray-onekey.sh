@@ -921,47 +921,136 @@ install_v2ray() {
   bash <(curl -fsSL "$INSTALL_SCRIPT_URL")
 }
 
-configure_nginx_tls() {
-  local nginx_site="/etc/nginx/conf.d/v2ray-${DOMAIN}.conf"
+valid_nginx_webroot() {
+  [[ "$1" =~ ^/[A-Za-z0-9._/-]+$ ]]
+}
 
-  log "Installing Nginx and Certbot..."
-  if [[ "$PKG_MANAGER" == "apt" ]]; then
-    install_packages nginx certbot python3-certbot-nginx
-  else
-    install_packages nginx certbot python3-certbot-nginx || install_packages nginx certbot
+render_nginx_site() (
+  local output_path="$1" phase="$2" output_dir output_name temp_path
+  local acme_webroot="${ACME_WEBROOT:-/var/www/v2ray-onekey}"
+
+  [[ "$phase" == "initial" || "$phase" == "final" ]] ||
+    die "Invalid Nginx render mode: $phase"
+  valid_domain "$DOMAIN" || die "Invalid domain: $DOMAIN"
+  valid_nginx_webroot "$acme_webroot" || die "Invalid ACME webroot: $acme_webroot"
+  [[ -n "$output_path" && "$output_path" != *$'\n'* ]] || die "Invalid Nginx output path"
+  if [[ "$phase" == "final" ]]; then
+    valid_port "$CLOUDFLARE_PORT" || die "Invalid Cloudflare port: $CLOUDFLARE_PORT"
+    valid_port "$INTERNAL_WS_PORT" || die "Invalid internal WebSocket port: $INTERNAL_WS_PORT"
+    valid_ws_path "$WS_PATH" || die "WebSocket path must start with / and contain no whitespace"
   fi
 
-  systemctl enable --now nginx
+  output_dir="$(dirname "$output_path")"
+  output_name="$(basename "$output_path")"
+  [[ -d "$output_dir" ]] || die "Nginx output directory does not exist: $output_dir"
+  temp_path="$(mktemp "$output_dir/.${output_name}.XXXXXX")"
+  trap 'rm -f -- "$temp_path"' EXIT
 
-  cat > "$nginx_site" <<EOF
+  cat >"$temp_path" <<EOF
 server {
     listen 80;
+    listen [::]:80;
     server_name $DOMAIN;
 
-    location / {
-        return 200 "ok\n";
-        add_header Content-Type text/plain;
+    location ^~ /.well-known/acme-challenge/ {
+        root $acme_webroot;
     }
 
-    location $WS_PATH {
-        proxy_redirect off;
-        proxy_pass http://127.0.0.1:$PORT;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    location / {
+        default_type text/plain;
+        return 200 "ok\n";
     }
 }
 EOF
 
-  nginx -t
-  systemctl reload nginx
+  if [[ "$phase" == "final" ]]; then
+    cat >>"$temp_path" <<EOF
 
-  log "Requesting a Let's Encrypt certificate for $DOMAIN..."
-  certbot --nginx --non-interactive --agree-tos --redirect --email "$EMAIL" -d "$DOMAIN"
-  systemctl reload nginx
+server {
+    listen $CLOUDFLARE_PORT ssl;
+    listen [::]:$CLOUDFLARE_PORT ssl;
+    server_name $DOMAIN;
+
+    ssl_certificate /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    location = $WS_PATH {
+        proxy_pass http://127.0.0.1:$INTERNAL_WS_PORT;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_buffering off;
+    }
+
+    location / {
+        default_type text/plain;
+        return 200 "ok\n";
+    }
+}
+EOF
+  fi
+
+  chmod 0644 "$temp_path"
+  mv -f -- "$temp_path" "$output_path"
+)
+
+request_certificate() {
+  local acme_webroot="${ACME_WEBROOT:-/var/www/v2ray-onekey}"
+  valid_domain "$DOMAIN" || die "Invalid domain: $DOMAIN"
+  [[ -n "$EMAIL" ]] || die "Email is required for certificate issuance"
+  valid_nginx_webroot "$acme_webroot" || die "Invalid ACME webroot: $acme_webroot"
+  certbot certonly --webroot -w "$acme_webroot" --non-interactive --agree-tos \
+    --email "$EMAIL" --keep-until-expiring -d "$DOMAIN"
+}
+
+create_renewal_hook() (
+  local hook_path="${1:-/etc/letsencrypt/renewal-hooks/deploy/v2ray-onekey-nginx.sh}"
+  local hook_dir hook_name temp_path
+  [[ -n "$hook_path" && "$hook_path" == /* && "$hook_path" != *$'\n'* ]] ||
+    die "Invalid renewal hook path"
+  hook_dir="$(dirname "$hook_path")"
+  hook_name="$(basename "$hook_path")"
+  install -d -m 755 "$hook_dir"
+  temp_path="$(mktemp "$hook_dir/.${hook_name}.XXXXXX")"
+  trap 'rm -f -- "$temp_path"' EXIT
+  cat >"$temp_path" <<'EOF'
+#!/usr/bin/env bash
+set -e
+nginx -t
+systemctl reload nginx
+EOF
+  chmod 0755 "$temp_path"
+  mv -f -- "$temp_path" "$hook_path"
+)
+
+check_cloudflare_edge() {
+  local url output remote_address=""
+  valid_domain "$DOMAIN" || die "Invalid domain: $DOMAIN"
+  valid_port "$CLOUDFLARE_PORT" || die "Invalid Cloudflare port: $CLOUDFLARE_PORT"
+  valid_cloudflare_timeout "$CLOUDFLARE_CONNECT_TIMEOUT" ||
+    die "Invalid Cloudflare connect timeout: $CLOUDFLARE_CONNECT_TIMEOUT"
+  valid_cloudflare_timeout "$CLOUDFLARE_MAX_TIME" ||
+    die "Invalid Cloudflare max timeout: $CLOUDFLARE_MAX_TIME"
+  url="https://${DOMAIN}:${CLOUDFLARE_PORT}/"
+  if ! output="$(curl -fsS -D - -o /dev/null --write-out $'\n%{remote_ip}\n' \
+    --connect-timeout "$CLOUDFLARE_CONNECT_TIMEOUT" --max-time "$CLOUDFLARE_MAX_TIME" "$url" 2>&1)"; then
+    warn "Cloudflare edge check could not be confirmed for $url; the origin configuration remains active."
+    return 1
+  fi
+  if grep -Eiq '^cf-ray:' <<<"$output"; then
+    return 0
+  fi
+  remote_address="$(tail -n 1 <<<"$output" | tr -d '\r')"
+  if [[ -n "$remote_address" ]] && address_in_cloudflare_ranges "$remote_address"; then
+    return 0
+  fi
+  warn "Cloudflare edge check could not be confirmed for $url; the origin configuration remains active."
+  return 1
 }
 
 restart_v2ray() {
