@@ -127,7 +127,11 @@ valid_domain "vpn.example.com" || fail "valid domain rejected"
 valid_domain "bad_domain" && fail "invalid domain accepted"
 valid_port "65535" || fail "valid port rejected"
 valid_port "65536" && fail "invalid port accepted"
+valid_port "18446744073709551617" && fail "overflowing port accepted"
 valid_port "00008" || fail "leading-zero decimal port rejected"
+valid_reality_target "example.net:443" || fail "valid REALITY target rejected"
+valid_reality_target "example.net" && fail "REALITY target without a port accepted"
+valid_reality_target "example.net:65536" && fail "REALITY target with an invalid port accepted"
 
 reset_options
 parse_args \
@@ -174,6 +178,13 @@ validate_values() {
   validate_options
 }
 
+validate_reality_target_value() {
+  reset_options
+  MODE="reality"
+  REALITY_TARGET="$1"
+  validate_options
+}
+
 validate_values reality "" "" "" ""
 assert_eq "443" "$REALITY_PORT" "validated default REALITY port"
 assert_eq "" "$CLOUDFLARE_PORT" "validated inactive Cloudflare port"
@@ -183,18 +194,31 @@ assert_eq "1443" "$REALITY_PORT" "custom REALITY port"
 assert_eq "2443" "$CLOUDFLARE_PORT" "custom Cloudflare port"
 
 reset_options
-assert_fails "--mode is required" select_mode
+assert_fails "--mode is required" select_mode </dev/null
+assert_fails "--mode requires a value" parse_args --mode
+assert_fails "--domain requires a value" parse_args --domain
 assert_fails "--domain is required" validate_values cloudflare "" admin@example.com "" ""
 assert_fails "--email is required" validate_values cloudflare vpn.example.com "" "" ""
 assert_fails "Invalid domain" validate_values cloudflare bad_domain admin@example.com "" ""
 assert_fails "Invalid REALITY port" validate_values reality "" "" 65536 ""
 assert_fails "must be different" validate_values dual vpn.example.com admin@example.com 443 443
+validate_reality_target_value example.net:443
+assert_fails "Invalid REALITY target" validate_reality_target_value example.net
+assert_fails "Invalid REALITY target" validate_reality_target_value example.net:65536
 assert_fails "Invalid REALITY UUID" validate_values reality "" "" "" "" bad-uuid
 assert_fails "Invalid Cloudflare UUID" validate_values cloudflare vpn.example.com admin@example.com "" "" "" bad-uuid
 assert_fails "WebSocket path must start with /" validate_values cloudflare vpn.example.com admin@example.com "" "" "" "" private
 
 execution_output=""
-if execution_output="$(env -u V2RAY_ONEKEY_SOURCE_ONLY bash "$SCRIPT" --mode reality 2>&1)"; then
+if execution_output="$(
+  (
+    id() {
+      [[ "${1:-}" == "-u" ]] || return 1
+      printf '0\n'
+    }
+    main --mode reality
+  ) 2>&1
+)"; then
   fail "feature-branch execution must fail closed"
 fi
 [[ "$execution_output" == *"Deployment backend is being migrated; do not deploy from this feature branch yet."* ]] ||

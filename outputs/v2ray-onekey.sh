@@ -34,7 +34,24 @@ valid_domain() {
 }
 
 valid_port() {
-  [[ "$1" =~ ^[0-9]+$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 ))
+  local port="${1:-}"
+  [[ "$port" =~ ^[0-9]+$ ]] || return 1
+  while [[ "$port" == 0* ]]; do
+    port="${port#0}"
+  done
+  [[ -n "$port" && ${#port} -le 5 ]] || return 1
+  (( 10#$port >= 1 && 10#$port <= 65535 ))
+}
+
+valid_reality_target() {
+  local target="${1:-}"
+  local hostname=""
+  local port=""
+  [[ "$target" == *:* ]] || return 1
+  hostname="${target%:*}"
+  port="${target##*:}"
+  [[ "$hostname" =~ ^[^[:space:]:]+$ ]] || return 1
+  valid_port "$port"
 }
 
 mode_needs_domain() {
@@ -197,6 +214,7 @@ validate_options() {
 
   if mode_has_reality; then
     valid_port "$REALITY_PORT" || die "Invalid REALITY port: $REALITY_PORT"
+    valid_reality_target "$REALITY_TARGET" || die "Invalid REALITY target: $REALITY_TARGET (expected HOST:PORT)"
   fi
   if mode_has_cloudflare; then
     valid_port "$CLOUDFLARE_PORT" || die "Invalid Cloudflare port: $CLOUDFLARE_PORT"
