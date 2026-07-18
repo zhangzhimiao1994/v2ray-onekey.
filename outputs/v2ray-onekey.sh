@@ -569,26 +569,39 @@ required_signatures = (
 )
 
 
-def project_owned(path, content):
-    return (
+def classify_section(path, content):
+    listens_on_port = listen_pattern.search(content) is not None
+    project_owned = (
         path_pattern.fullmatch(path) is not None
-        and listen_pattern.search(content) is not None
         and all(signature in content for signature in required_signatures)
     )
+    return listens_on_port, project_owned
 
 
 path = None
 content = []
+found_listener = False
+found_unowned_listener = False
 for line in sys.stdin:
     header = header_pattern.match(line.rstrip("\n"))
     if header:
-        if path is not None and project_owned(path, "".join(content)):
-            raise SystemExit(0)
+        if path is not None:
+            listens_on_port, project_owned = classify_section(path, "".join(content))
+            found_listener = found_listener or listens_on_port
+            found_unowned_listener = found_unowned_listener or (
+                listens_on_port and not project_owned
+            )
         path = header.group(1)
         content = []
     elif path is not None:
         content.append(line)
-if path is not None and project_owned(path, "".join(content)):
+if path is not None:
+    listens_on_port, project_owned = classify_section(path, "".join(content))
+    found_listener = found_listener or listens_on_port
+    found_unowned_listener = found_unowned_listener or (
+        listens_on_port and not project_owned
+    )
+if found_listener and not found_unowned_listener:
     raise SystemExit(0)
 raise SystemExit(1)
 ' "$port"

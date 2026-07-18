@@ -771,6 +771,25 @@ NGINX
   legacy_nginx_config_for_port_is_project_owned 443 &&
     fail "legacy Nginx config was accepted for an unrelated port"
 
+  nginx() {
+    [[ "$1" == '-T' ]] || return 1
+    cat <<'NGINX'
+# configuration file /etc/nginx/conf.d/v2ray-vpn.example.com.conf:
+server {
+  listen 443 ssl;
+  location / { return 200 "ok\n"; }
+  proxy_set_header Upgrade $http_upgrade;
+  proxy_pass http://127.0.0.1:31001;
+}
+# configuration file /etc/nginx/conf.d/unrelated.conf:
+server {
+  listen 443 ssl;
+}
+NGINX
+  }
+  legacy_nginx_config_for_port_is_project_owned 443 &&
+    fail "mixed owned and unrelated Nginx listeners were accepted"
+
   ss() {
     if [[ "$#" -eq 3 && "$1 $2 $3" == '-H -ltnp sport = :443' ]]; then
       printf '%s\n' 'LISTEN 0 4096 0.0.0.0:443 0.0.0.0:* users:(("nginx",pid=1,fd=3))'
