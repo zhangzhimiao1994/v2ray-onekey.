@@ -479,11 +479,11 @@ test_state_round_trip() (
   INTERNAL_WS_PORT="31001"
   REALITY_UUID="11111111-1111-4111-8111-111111111111"
   CLOUDFLARE_UUID="22222222-2222-4222-8222-222222222222"
-  REALITY_PRIVATE_KEY="private key value"
-  REALITY_PUBLIC_KEY="public key value"
+  REALITY_PRIVATE_KEY="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+  REALITY_PUBLIC_KEY="BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
   REALITY_SHORT_ID="0123456789abcdef"
   REALITY_TARGET="www.microsoft.com:443"
-  WS_PATH="/state path; still data"
+  WS_PATH="/state-path"
   ALLOW_BITTORRENT="1"
   save_state
   assert_eq "700" "$(stat -c '%a' "$temp_dir/private")" "state directory permissions"
@@ -502,11 +502,11 @@ test_state_round_trip() (
   assert_eq "31001" "$INTERNAL_WS_PORT" "loaded internal WS port"
   assert_eq "11111111-1111-4111-8111-111111111111" "$REALITY_UUID" "loaded REALITY UUID"
   assert_eq "22222222-2222-4222-8222-222222222222" "$CLOUDFLARE_UUID" "loaded Cloudflare UUID"
-  assert_eq "private key value" "$REALITY_PRIVATE_KEY" "loaded private key"
-  assert_eq "public key value" "$REALITY_PUBLIC_KEY" "loaded public key"
+  assert_eq "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" "$REALITY_PRIVATE_KEY" "loaded private key"
+  assert_eq "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB" "$REALITY_PUBLIC_KEY" "loaded public key"
   assert_eq "0123456789abcdef" "$REALITY_SHORT_ID" "loaded short ID"
   assert_eq "www.microsoft.com:443" "$REALITY_TARGET" "loaded target"
-  assert_eq "/state path; still data" "$WS_PATH" "loaded WS path"
+  assert_eq "/state-path" "$WS_PATH" "loaded WS path"
   assert_eq "1" "$ALLOW_BITTORRENT" "loaded BitTorrent setting"
   assert_eq "0" "$ROTATE" "rotate is not persisted"
 
@@ -533,11 +533,11 @@ EMAIL=''
 REALITY_PORT=443
 CLOUDFLARE_PORT=''
 INTERNAL_WS_PORT=''
-REALITY_UUID=''
+REALITY_UUID=11111111-1111-4111-8111-111111111111
 CLOUDFLARE_UUID=''
-REALITY_PRIVATE_KEY=''
-REALITY_PUBLIC_KEY=''
-REALITY_SHORT_ID=''
+REALITY_PRIVATE_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+REALITY_PUBLIC_KEY=BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB
+REALITY_SHORT_ID=0123456789abcdef
 REALITY_TARGET=www.microsoft.com:443
 WS_PATH=''
 ALLOW_BITTORRENT=0
@@ -553,6 +553,45 @@ EOF
     chown 0 "$STATE_FILE"
     load_state_as_source_only
   fi
+  sed -i "s/^REALITY_UUID=.*/REALITY_UUID=''/" "$STATE_FILE"
+  assert_fails "Invalid REALITY UUID" load_state
+  sed -i 's/^REALITY_UUID=.*/REALITY_UUID=11111111-1111-4111-8111-111111111111/' "$STATE_FILE"
+  sed -i 's/^REALITY_PRIVATE_KEY=.*/REALITY_PRIVATE_KEY=not-a-key/' "$STATE_FILE"
+  assert_fails "Invalid REALITY private key" load_state
+  sed -i 's/^REALITY_PRIVATE_KEY=.*/REALITY_PRIVATE_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/' "$STATE_FILE"
+  sed -i 's/^REALITY_SHORT_ID=.*/REALITY_SHORT_ID=not-hex/' "$STATE_FILE"
+  assert_fails "Invalid REALITY short ID" load_state
+  sed -i 's/^REALITY_SHORT_ID=.*/REALITY_SHORT_ID=0123456789abcdef/' "$STATE_FILE"
+  sed -i 's/^CLOUDFLARE_UUID=.*/CLOUDFLARE_UUID=22222222-2222-4222-8222-222222222222/' "$STATE_FILE"
+  assert_fails "Inactive Cloudflare state" load_state
+
+  cat >"$STATE_FILE" <<'EOF'
+MODE=cloudflare
+DOMAIN=vpn.example.com
+EMAIL=admin@example.com
+REALITY_PORT=''
+CLOUDFLARE_PORT=443
+INTERNAL_WS_PORT=31001
+REALITY_UUID=''
+CLOUDFLARE_UUID=22222222-2222-4222-8222-222222222222
+REALITY_PRIVATE_KEY=''
+REALITY_PUBLIC_KEY=''
+REALITY_SHORT_ID=''
+REALITY_TARGET=www.microsoft.com:443
+WS_PATH=/ws
+ALLOW_BITTORRENT=0
+EOF
+  chmod 0600 "$STATE_FILE"
+  load_state
+  sed -i "s/^CLOUDFLARE_UUID=.*/CLOUDFLARE_UUID=''/" "$STATE_FILE"
+  assert_fails "Invalid Cloudflare UUID" load_state
+  sed -i 's/^CLOUDFLARE_UUID=.*/CLOUDFLARE_UUID=22222222-2222-4222-8222-222222222222/' "$STATE_FILE"
+  sed -i 's|^WS_PATH=.*|WS_PATH=invalid|' "$STATE_FILE"
+  assert_fails "WebSocket path" load_state
+  sed -i 's|^WS_PATH=.*|WS_PATH=/ws|' "$STATE_FILE"
+  sed -i 's/^REALITY_UUID=.*/REALITY_UUID=11111111-1111-4111-8111-111111111111/' "$STATE_FILE"
+  assert_fails "Inactive REALITY state" load_state
+
   cat >"$STATE_FILE" <<'EOF'
 MODE=cloudflare
 DOMAIN=bad_domain
@@ -709,8 +748,12 @@ test_cloudflare_preflight() (
     fail "non-strict Cloudflare range accepted"
 
   getent() {
-    [[ "$1 $2" == 'ahosts vpn.example.com' ]] || return 1
-    printf '%s\n' '104.16.1.1 STREAM vpn.example.com' '104.16.1.1 DGRAM vpn.example.com' '2606:4700:0:0:0:0:0:1 STREAM vpn.example.com'
+    case "$1 $2" in
+      'ahostsv4 vpn.example.com') printf '%s\n' '104.16.1.1 STREAM vpn.example.com' ;;
+      'ahostsv6 vpn.example.com') printf '%s\n' '2606:4700:0:0:0:0:0:1 STREAM vpn.example.com' ;;
+      'ahosts vpn.example.com') printf '%s\n' '104.16.1.1 DGRAM vpn.example.com' ;;
+      *) return 1 ;;
+    esac
   }
   local resolved
   resolved="$(resolve_host_addresses vpn.example.com)"
@@ -718,6 +761,15 @@ test_cloudflare_preflight() (
   host_resolves_to_cloudflare vpn.example.com || fail "Cloudflare hostname was not recognized"
   DOMAIN="vpn.example.com"
   validate_cloudflare_domain
+  getent() {
+    case "$1 $2" in
+      'ahostsv4 ipv6-only.example.com') return 2 ;;
+      'ahostsv6 ipv6-only.example.com') printf '%s\n' '2606:4700:0:0:0:0:0:2 STREAM ipv6-only.example.com' ;;
+      'ahosts ipv6-only.example.com') return 2 ;;
+      *) return 1 ;;
+    esac
+  }
+  validate_cloudflare_domain ipv6-only.example.com
   getent() { printf '%s\n' '203.0.113.1 STREAM outside.example.com'; }
   host_resolves_to_cloudflare outside.example.com && fail "outside hostname accepted as Cloudflare"
   assert_fails "does not resolve to Cloudflare" validate_cloudflare_domain outside.example.com
@@ -733,11 +785,35 @@ test_cloudflare_preflight() (
 
   unset CLOUDFLARE_IPV4_FILE CLOUDFLARE_IPV6_FILE
   RUNTIME_DIR="$temp_dir/run"
+  curl_log="$temp_dir/curl.log"
   curl() {
-    [[ "$1" == '-fsS' ]] || return 1
-    if [[ "$2" == 'https://www.cloudflare.com/ips-v4' ]]; then printf '%s\n' '104.16.0.0/13' >"$4"; else printf '%s\n' '2606:4700::/32' >"$4"; fi
+    local url="" output="" connect_timeout="" max_time=""
+    while [[ "$#" -gt 0 ]]; do
+      case "$1" in
+        -fsS) ;;
+        --connect-timeout) connect_timeout="$2"; shift ;;
+        --max-time) max_time="$2"; shift ;;
+        -o) output="$2"; shift ;;
+        https://www.cloudflare.com/ips-v4|https://www.cloudflare.com/ips-v6) url="$1" ;;
+        *) return 1 ;;
+      esac
+      shift
+    done
+    [[ -n "$output" && "$connect_timeout" -gt 0 && "$max_time" -gt 0 ]] ||
+      fail "Cloudflare range download did not set finite timeouts"
+    printf '%s %s %s\n' "$url" "$connect_timeout" "$max_time" >>"$curl_log"
+    if [[ "$url" == 'https://www.cloudflare.com/ips-v4' ]]; then
+      printf '%s\n' '104.16.0.0/13' >"$output"
+    else
+      printf '%s\n' '2606:4700::/32' >"$output"
+    fi
   }
   download_cloudflare_ranges
+  assert_eq "2" "$(wc -l <"$curl_log")" "Cloudflare range download count"
+  grep -Fq 'https://www.cloudflare.com/ips-v4 10 30' "$curl_log" ||
+    fail "IPv4 range download did not receive timeout flags"
+  grep -Fq 'https://www.cloudflare.com/ips-v6 10 30' "$curl_log" ||
+    fail "IPv6 range download did not receive timeout flags"
   [[ -f "$RUNTIME_DIR/ips-v4" && -f "$RUNTIME_DIR/ips-v6" ]] || fail "range files were not downloaded"
 )
 

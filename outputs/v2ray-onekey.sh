@@ -6,6 +6,8 @@ STATE_FILE="${STATE_FILE:-/etc/v2ray-onekey/state.env}"
 BACKUP_ROOT="${BACKUP_ROOT:-/var/backups/v2ray-onekey}"
 XRAY_INSTALL_URL="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
 DEFAULT_REALITY_TARGET="www.microsoft.com:443"
+CLOUDFLARE_CONNECT_TIMEOUT="${CLOUDFLARE_CONNECT_TIMEOUT:-10}"
+CLOUDFLARE_MAX_TIME="${CLOUDFLARE_MAX_TIME:-30}"
 
 log() { printf '\033[1;32m[%s]\033[0m %s\n' "$APP_NAME" "$*"; }
 warn() { printf '\033[1;33m[%s]\033[0m %s\n' "$APP_NAME" "$*"; }
@@ -299,15 +301,38 @@ PY
 }
 
 validate_loaded_runtime_values() {
+  if mode_has_reality; then
+    valid_uuid "$REALITY_UUID" || die "Invalid REALITY UUID in state"
+    valid_x25519_key "$REALITY_PRIVATE_KEY" || die "Invalid REALITY private key in state"
+    valid_x25519_key "$REALITY_PUBLIC_KEY" || die "Invalid REALITY public key in state"
+    valid_reality_short_id "$REALITY_SHORT_ID" || die "Invalid REALITY short ID in state"
+  else
+    [[ -z "$REALITY_UUID" && -z "$REALITY_PRIVATE_KEY" && -z "$REALITY_PUBLIC_KEY" && -z "$REALITY_SHORT_ID" ]] ||
+      die "Inactive REALITY state must not contain credentials"
+  fi
+
   if mode_has_cloudflare; then
+    valid_uuid "$CLOUDFLARE_UUID" || die "Invalid Cloudflare UUID in state"
     valid_port "$INTERNAL_WS_PORT" || die "Invalid internal WebSocket port: $INTERNAL_WS_PORT"
     [[ "$INTERNAL_WS_PORT" != "$REALITY_PORT" && "$INTERNAL_WS_PORT" != "$CLOUDFLARE_PORT" ]] ||
       die "Internal WebSocket port must not match a public port"
-    [[ "$WS_PATH" == /* && -n "$WS_PATH" ]] || die "WebSocket path must start with /"
+    valid_ws_path "$WS_PATH" || die "WebSocket path must start with / and contain no whitespace"
   else
-    [[ -z "$INTERNAL_WS_PORT" && -z "$WS_PATH" ]] ||
-      die "Inactive Cloudflare state must not contain WebSocket values"
+    [[ -z "$CLOUDFLARE_UUID" && -z "$INTERNAL_WS_PORT" && -z "$WS_PATH" ]] ||
+      die "Inactive Cloudflare state must not contain credentials"
   fi
+}
+
+valid_x25519_key() {
+  [[ "$1" =~ ^[A-Za-z0-9_-]{43}$ ]]
+}
+
+valid_reality_short_id() {
+  [[ "$1" =~ ^[A-Fa-f0-9]{1,16}$ ]]
+}
+
+valid_ws_path() {
+  [[ "$1" =~ ^/[^[:space:]]+$ ]]
 }
 
 save_state() (
@@ -436,9 +461,11 @@ PY
 }
 
 resolve_host_addresses() {
-  local hostname="$1" output
-  output="$(getent ahosts "$hostname")" || return 1
-  printf '%s\n' "$output" | python3 -c '
+  local hostname="$1" ipv4_output="" ipv6_output="" fallback_output="" addresses=""
+  ipv4_output="$(getent ahostsv4 "$hostname" 2>/dev/null || true)"
+  ipv6_output="$(getent ahostsv6 "$hostname" 2>/dev/null || true)"
+  fallback_output="$(getent ahosts "$hostname" 2>/dev/null || true)"
+  addresses="$(printf '%s\n%s\n%s\n' "$ipv4_output" "$ipv6_output" "$fallback_output" | python3 -c '
 import ipaddress
 import sys
 
@@ -454,7 +481,9 @@ for line in sys.stdin:
     if address not in seen:
         seen.add(address)
         print(address)
-'
+')"
+  [[ -n "$addresses" ]] || return 1
+  printf '%s\n' "$addresses"
 }
 
 host_resolves_to_cloudflare() {
@@ -503,8 +532,10 @@ download_cloudflare_ranges() (
   temp_v4="$(mktemp "$run_dir/.ips-v4.XXXXXX")"
   temp_v6="$(mktemp "$run_dir/.ips-v6.XXXXXX")"
   trap 'rm -f -- "$temp_v4" "$temp_v6"' EXIT
-  curl -fsS https://www.cloudflare.com/ips-v4 -o "$temp_v4"
-  curl -fsS https://www.cloudflare.com/ips-v6 -o "$temp_v6"
+  curl -fsS --connect-timeout "$CLOUDFLARE_CONNECT_TIMEOUT" --max-time "$CLOUDFLARE_MAX_TIME" \
+    https://www.cloudflare.com/ips-v4 -o "$temp_v4"
+  curl -fsS --connect-timeout "$CLOUDFLARE_CONNECT_TIMEOUT" --max-time "$CLOUDFLARE_MAX_TIME" \
+    https://www.cloudflare.com/ips-v6 -o "$temp_v6"
   validate_cloudflare_range_file "$temp_v4" 4 || die "Invalid Cloudflare IPv4 range data"
   validate_cloudflare_range_file "$temp_v6" 6 || die "Invalid Cloudflare IPv6 range data"
   mv -f -- "$temp_v4" "$v4"
