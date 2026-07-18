@@ -1,82 +1,163 @@
 #!/usr/bin/env bash
 
-# One-key V2Ray server installer.
-# Default mode: VMess over TCP, works without a domain name.
-# Optional mode: VMess over WebSocket + TLS behind Nginx, requires a domain.
-
 APP_NAME="v2ray-onekey"
-V2RAY_CONFIG="/usr/local/etc/v2ray/config.json"
-INSTALL_SCRIPT_URL="https://raw.githubusercontent.com/v2fly/fhs-install-v2ray/master/install-release.sh"
-DEFAULT_WS_PATH="/ray"
-DOMAIN=""
-EMAIL=""
-PORT=""
-UUID=""
-WS_PATH="$DEFAULT_WS_PATH"
-FORCE_TCP="0"
+XRAY_CONFIG="${XRAY_CONFIG:-/usr/local/etc/xray/config.json}"
+STATE_FILE="${STATE_FILE:-/etc/v2ray-onekey/state.env}"
+BACKUP_ROOT="${BACKUP_ROOT:-/var/backups/v2ray-onekey}"
+XRAY_INSTALL_URL="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
+DEFAULT_REALITY_TARGET="www.microsoft.com:443"
 
 log() { printf '\033[1;32m[%s]\033[0m %s\n' "$APP_NAME" "$*"; }
 warn() { printf '\033[1;33m[%s]\033[0m %s\n' "$APP_NAME" "$*"; }
 die() { printf '\033[1;31m[%s]\033[0m %s\n' "$APP_NAME" "$*" >&2; exit 1; }
+
+reset_options() {
+  MODE=""
+  DOMAIN=""
+  EMAIL=""
+  REALITY_PORT=""
+  CLOUDFLARE_PORT=""
+  INTERNAL_WS_PORT=""
+  REALITY_UUID=""
+  CLOUDFLARE_UUID=""
+  REALITY_PRIVATE_KEY=""
+  REALITY_PUBLIC_KEY=""
+  REALITY_SHORT_ID=""
+  REALITY_TARGET="$DEFAULT_REALITY_TARGET"
+  WS_PATH=""
+  ROTATE="0"
+  ALLOW_BITTORRENT="0"
+}
+
+valid_domain() {
+  [[ "$1" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ ]]
+}
+
+valid_port() {
+  [[ "$1" =~ ^[0-9]+$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 ))
+}
+
+mode_needs_domain() {
+  [[ "$MODE" == "cloudflare" || "$MODE" == "dual" ]]
+}
+
+mode_has_reality() {
+  [[ "$MODE" == "reality" || "$MODE" == "dual" ]]
+}
+
+mode_has_cloudflare() {
+  [[ "$MODE" == "cloudflare" || "$MODE" == "dual" ]]
+}
+
+resolve_default_ports() {
+  case "$MODE" in
+    reality)
+      REALITY_PORT="${REALITY_PORT:-443}"
+      CLOUDFLARE_PORT=""
+      ;;
+    cloudflare)
+      REALITY_PORT=""
+      CLOUDFLARE_PORT="${CLOUDFLARE_PORT:-443}"
+      ;;
+    dual)
+      REALITY_PORT="${REALITY_PORT:-443}"
+      CLOUDFLARE_PORT="${CLOUDFLARE_PORT:-8443}"
+      ;;
+    *) die "Mode must be reality, cloudflare, or dual" ;;
+  esac
+}
+
+choose_mode() {
+  local choice=""
+  printf '%s\n' "1) Direct only: VLESS + REALITY + XTLS Vision"
+  printf '%s\n' "2) Cloudflare only: VLESS + WebSocket + TLS"
+  printf '%s\n' "3) Dual entry (recommended)"
+  read -r -p "Select mode [3]: " choice
+  case "${choice:-3}" in
+    1) MODE="reality" ;;
+    2) MODE="cloudflare" ;;
+    3) MODE="dual" ;;
+    *) die "Invalid menu choice: $choice" ;;
+  esac
+}
 
 usage() {
   cat <<'USAGE'
 Usage:
   sudo bash v2ray-onekey.sh [options]
 
-Default, no-domain mode:
-  sudo bash v2ray-onekey.sh
-  sudo bash v2ray-onekey.sh --port 23456
-
-Optional domain mode:
-  sudo bash v2ray-onekey.sh --domain vpn.example.com --email you@example.com
-  sudo bash v2ray-onekey.sh --domain vpn.example.com --email you@example.com --ws-path /ray
-
 Options:
-  --domain DOMAIN       Enable WebSocket + TLS mode. Domain must already point to this server.
-  --email EMAIL         Email used by Let's Encrypt. Required with --domain.
-  --port PORT           V2Ray listening port. In TLS mode this is internal localhost port.
-  --uuid UUID           Use a fixed VMess UUID instead of generating one.
-  --ws-path PATH        WebSocket path for domain mode. Default: /ray
-  --tcp                 Force plain VMess TCP mode even if --domain is omitted.
-  -h, --help            Show this help.
-
-Notes:
-  - TCP mode exposes the selected V2Ray port directly.
-  - Domain mode exposes HTTPS 443 through Nginx and proxies WebSocket traffic to V2Ray.
+  --mode reality|cloudflare|dual
+  --domain DOMAIN
+  --email EMAIL
+  --reality-port PORT
+  --cloudflare-port PORT
+  --reality-target HOST:PORT
+  --reality-uuid UUID
+  --cloudflare-uuid UUID
+  --ws-path /PATH
+  --rotate
+  --allow-bittorrent
+  -h, --help
 USAGE
 }
 
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
+      --mode)
+        [[ $# -ge 2 && -n "$2" ]] || die "--mode requires a value"
+        MODE="$2"
+        [[ "$MODE" == "reality" || "$MODE" == "cloudflare" || "$MODE" == "dual" ]] ||
+          die "--mode must be reality, cloudflare, or dual"
+        shift 2
+        ;;
       --domain)
-        DOMAIN="${2:-}"
-        [[ -n "$DOMAIN" ]] || die "--domain requires a value"
+        [[ $# -ge 2 && -n "$2" ]] || die "--domain requires a value"
+        DOMAIN="$2"
         shift 2
         ;;
       --email)
-        EMAIL="${2:-}"
-        [[ -n "$EMAIL" ]] || die "--email requires a value"
+        [[ $# -ge 2 && -n "$2" ]] || die "--email requires a value"
+        EMAIL="$2"
         shift 2
         ;;
-      --port)
-        PORT="${2:-}"
-        [[ "$PORT" =~ ^[0-9]+$ ]] || die "--port must be a number"
+      --reality-port)
+        [[ $# -ge 2 && -n "$2" ]] || die "--reality-port requires a value"
+        REALITY_PORT="$2"
         shift 2
         ;;
-      --uuid)
-        UUID="${2:-}"
-        [[ "$UUID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] || die "--uuid must be a valid UUID"
+      --cloudflare-port)
+        [[ $# -ge 2 && -n "$2" ]] || die "--cloudflare-port requires a value"
+        CLOUDFLARE_PORT="$2"
+        shift 2
+        ;;
+      --reality-target)
+        [[ $# -ge 2 && -n "$2" ]] || die "--reality-target requires a value"
+        REALITY_TARGET="$2"
+        shift 2
+        ;;
+      --reality-uuid)
+        [[ $# -ge 2 && -n "$2" ]] || die "--reality-uuid requires a value"
+        REALITY_UUID="$2"
+        shift 2
+        ;;
+      --cloudflare-uuid)
+        [[ $# -ge 2 && -n "$2" ]] || die "--cloudflare-uuid requires a value"
+        CLOUDFLARE_UUID="$2"
         shift 2
         ;;
       --ws-path)
-        WS_PATH="${2:-}"
-        [[ "$WS_PATH" == /* ]] || die "--ws-path must start with /"
+        [[ $# -ge 2 && -n "$2" ]] || die "--ws-path requires a value"
+        WS_PATH="$2"
         shift 2
         ;;
-      --tcp)
-        FORCE_TCP="1"
+      --rotate)
+        ROTATE="1"
+        shift
+        ;;
+      --allow-bittorrent)
+        ALLOW_BITTORRENT="1"
         shift
         ;;
       -h|--help)
@@ -90,14 +171,43 @@ parse_args() {
   done
 }
 
-validate_runtime() {
-  [[ "$(id -u)" -eq 0 ]] || die "Please run as root: sudo bash v2ray-onekey.sh"
-  [[ -z "$DOMAIN" || -n "$EMAIL" ]] || die "--email is required when --domain is used"
+select_mode() {
+  [[ -n "$MODE" ]] && return 0
 
-  if [[ -n "$DOMAIN" && "$FORCE_TCP" == "1" ]]; then
-    warn "--tcp was supplied with --domain; using TCP mode and ignoring domain settings."
-    DOMAIN=""
+  if [[ -t 0 ]]; then
+    choose_mode
+  else
+    die "--mode is required for non-interactive use. Example: sudo bash v2ray-onekey.sh --mode dual --domain vpn.example.com --email admin@example.com"
   fi
+}
+
+valid_uuid() {
+  [[ "$1" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]
+}
+
+validate_options() {
+  resolve_default_ports
+
+  if mode_needs_domain; then
+    [[ -n "$DOMAIN" ]] || die "--domain is required for $MODE mode"
+    [[ -n "$EMAIL" ]] || die "--email is required for $MODE mode"
+  fi
+
+  [[ -z "$DOMAIN" ]] || valid_domain "$DOMAIN" || die "Invalid domain: $DOMAIN"
+
+  if mode_has_reality; then
+    valid_port "$REALITY_PORT" || die "Invalid REALITY port: $REALITY_PORT"
+  fi
+  if mode_has_cloudflare; then
+    valid_port "$CLOUDFLARE_PORT" || die "Invalid Cloudflare port: $CLOUDFLARE_PORT"
+  fi
+  if [[ "$MODE" == "dual" && "$REALITY_PORT" == "$CLOUDFLARE_PORT" ]]; then
+    die "REALITY and Cloudflare public ports must be different in dual mode"
+  fi
+
+  [[ -z "$REALITY_UUID" ]] || valid_uuid "$REALITY_UUID" || die "Invalid REALITY UUID: $REALITY_UUID"
+  [[ -z "$CLOUDFLARE_UUID" ]] || valid_uuid "$CLOUDFLARE_UUID" || die "Invalid Cloudflare UUID: $CLOUDFLARE_UUID"
+  [[ -z "$WS_PATH" || "$WS_PATH" == /* ]] || die "WebSocket path must start with /"
 }
 
 detect_pkg_manager() {
@@ -395,30 +505,12 @@ EOF
 
 main() {
   set -Eeuo pipefail
+  reset_options
   parse_args "$@"
-  validate_runtime
-
-  detect_pkg_manager
-  install_packages curl ca-certificates python3 coreutils
-
-  [[ -n "$PORT" ]] || PORT="$(random_port)"
-  (( PORT >= 1 && PORT <= 65535 )) || die "Port must be between 1 and 65535"
-  [[ -n "$UUID" ]] || UUID="$(generate_uuid)"
-
-  install_v2ray
-
-  if [[ -n "$DOMAIN" ]]; then
-    write_ws_config
-    configure_nginx_tls
-    open_firewall_port 80 tcp
-    open_firewall_port 443 tcp
-  else
-    write_tcp_config
-    open_firewall_port "$PORT" tcp
-  fi
-
-  restart_v2ray
-  print_result
+  select_mode
+  validate_options
+  [[ "$(id -u)" -eq 0 ]] || die "Please run as root: sudo bash v2ray-onekey.sh"
+  die "Deployment backend is being migrated; do not deploy from this feature branch yet."
 }
 
 if [[ "${V2RAY_ONEKEY_SOURCE_ONLY:-0}" != "1" ]]; then
