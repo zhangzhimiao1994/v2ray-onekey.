@@ -51,6 +51,19 @@ valid_port() {
   (( 10#$port >= 1 && 10#$port <= 65535 ))
 }
 
+valid_cloudflare_port() {
+  local port=""
+  port="$(normalize_port "${1:-}")" || return 1
+  case "$port" in
+    443|2053|2083|2087|2096|8443) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+normalize_domain() {
+  printf '%s\n' "${1,,}"
+}
+
 valid_ipv4() {
   local address="${1:-}"
   local octet=""
@@ -232,6 +245,7 @@ validate_options() {
   fi
 
   [[ -z "$DOMAIN" ]] || valid_domain "$DOMAIN" || die "Invalid domain: $DOMAIN"
+  [[ -z "$DOMAIN" ]] || DOMAIN="$(normalize_domain "$DOMAIN")"
 
   if mode_has_reality; then
     valid_port "$REALITY_PORT" || die "Invalid REALITY port: $REALITY_PORT"
@@ -239,7 +253,7 @@ validate_options() {
     valid_reality_target "$REALITY_TARGET" || die "Invalid REALITY target: $REALITY_TARGET (expected HOST:PORT)"
   fi
   if mode_has_cloudflare; then
-    valid_port "$CLOUDFLARE_PORT" || die "Invalid Cloudflare port: $CLOUDFLARE_PORT"
+    valid_cloudflare_port "$CLOUDFLARE_PORT" || die "Unsupported Cloudflare port: $CLOUDFLARE_PORT"
     CLOUDFLARE_PORT="$(normalize_port "$CLOUDFLARE_PORT")"
   fi
   if [[ "$MODE" == "dual" && "$REALITY_PORT" == "$CLOUDFLARE_PORT" ]]; then
@@ -932,10 +946,12 @@ render_nginx_site() (
   [[ "$phase" == "initial" || "$phase" == "final" ]] ||
     die "Invalid Nginx render mode: $phase"
   valid_domain "$DOMAIN" || die "Invalid domain: $DOMAIN"
+  DOMAIN="$(normalize_domain "$DOMAIN")"
   valid_nginx_webroot "$acme_webroot" || die "Invalid ACME webroot: $acme_webroot"
   [[ -n "$output_path" && "$output_path" != *$'\n'* ]] || die "Invalid Nginx output path"
   if [[ "$phase" == "final" ]]; then
-    valid_port "$CLOUDFLARE_PORT" || die "Invalid Cloudflare port: $CLOUDFLARE_PORT"
+    valid_cloudflare_port "$CLOUDFLARE_PORT" || die "Unsupported Cloudflare port: $CLOUDFLARE_PORT"
+    CLOUDFLARE_PORT="$(normalize_port "$CLOUDFLARE_PORT")"
     valid_port "$INTERNAL_WS_PORT" || die "Invalid internal WebSocket port: $INTERNAL_WS_PORT"
     valid_ws_path "$WS_PATH" || die "WebSocket path must start with / and contain no whitespace"
   fi
@@ -1002,6 +1018,7 @@ EOF
 request_certificate() {
   local acme_webroot="${ACME_WEBROOT:-/var/www/v2ray-onekey}"
   valid_domain "$DOMAIN" || die "Invalid domain: $DOMAIN"
+  DOMAIN="$(normalize_domain "$DOMAIN")"
   [[ -n "$EMAIL" ]] || die "Email is required for certificate issuance"
   valid_nginx_webroot "$acme_webroot" || die "Invalid ACME webroot: $acme_webroot"
   certbot certonly --webroot -w "$acme_webroot" --non-interactive --agree-tos \
@@ -1028,18 +1045,17 @@ EOF
   mv -f -- "$temp_path" "$hook_path"
 )
 
-check_cloudflare_edge() {
+probe_cloudflare_edge() {
   local url output remote_address=""
-  valid_domain "$DOMAIN" || die "Invalid domain: $DOMAIN"
-  valid_port "$CLOUDFLARE_PORT" || die "Invalid Cloudflare port: $CLOUDFLARE_PORT"
-  valid_cloudflare_timeout "$CLOUDFLARE_CONNECT_TIMEOUT" ||
-    die "Invalid Cloudflare connect timeout: $CLOUDFLARE_CONNECT_TIMEOUT"
-  valid_cloudflare_timeout "$CLOUDFLARE_MAX_TIME" ||
-    die "Invalid Cloudflare max timeout: $CLOUDFLARE_MAX_TIME"
+  valid_domain "$DOMAIN" || return 1
+  valid_cloudflare_port "$CLOUDFLARE_PORT" || return 1
+  valid_cloudflare_timeout "$CLOUDFLARE_CONNECT_TIMEOUT" || return 1
+  valid_cloudflare_timeout "$CLOUDFLARE_MAX_TIME" || return 1
+  DOMAIN="$(normalize_domain "$DOMAIN")"
+  CLOUDFLARE_PORT="$(normalize_port "$CLOUDFLARE_PORT")"
   url="https://${DOMAIN}:${CLOUDFLARE_PORT}/"
   if ! output="$(curl -fsS -D - -o /dev/null --write-out $'\n%{remote_ip}\n' \
     --connect-timeout "$CLOUDFLARE_CONNECT_TIMEOUT" --max-time "$CLOUDFLARE_MAX_TIME" "$url" 2>&1)"; then
-    warn "Cloudflare edge check could not be confirmed for $url; the origin configuration remains active."
     return 1
   fi
   if grep -Eiq '^cf-ray:' <<<"$output"; then
@@ -1049,8 +1065,15 @@ check_cloudflare_edge() {
   if [[ -n "$remote_address" ]] && address_in_cloudflare_ranges "$remote_address"; then
     return 0
   fi
-  warn "Cloudflare edge check could not be confirmed for $url; the origin configuration remains active."
   return 1
+}
+
+check_cloudflare_edge() {
+  if probe_cloudflare_edge; then
+    return 0
+  fi
+  warn "Cloudflare edge check could not be confirmed; the origin configuration remains active."
+  return 0
 }
 
 restart_v2ray() {

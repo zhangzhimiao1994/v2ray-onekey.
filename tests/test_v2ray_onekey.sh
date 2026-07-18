@@ -141,6 +141,10 @@ valid_domain "vpn.example.com" || fail "valid domain rejected"
 valid_domain "bad_domain" && fail "invalid domain accepted"
 valid_port "65535" || fail "valid port rejected"
 valid_port "65536" && fail "invalid port accepted"
+for cloudflare_port in 443 2053 2083 2087 2096 8443; do
+  valid_cloudflare_port "$cloudflare_port" || fail "official Cloudflare port rejected: $cloudflare_port"
+done
+valid_cloudflare_port 2443 && fail "unsupported Cloudflare port accepted"
 valid_port "18446744073709551617" && fail "overflowing port accepted"
 valid_port "00008" || fail "leading-zero decimal port rejected"
 assert_eq "8" "$(normalize_port 00008)" "normalized decimal port"
@@ -161,7 +165,7 @@ parse_args \
   --domain vpn.example.com \
   --email admin@example.com \
   --reality-port 1443 \
-  --cloudflare-port 2443 \
+  --cloudflare-port 2053 \
   --reality-target example.net:443 \
   --reality-uuid 11111111-1111-4111-8111-111111111111 \
   --cloudflare-uuid 22222222-2222-4222-8222-222222222222 \
@@ -172,7 +176,7 @@ assert_eq "dual" "$MODE" "parsed mode"
 assert_eq "vpn.example.com" "$DOMAIN" "parsed domain"
 assert_eq "admin@example.com" "$EMAIL" "parsed email"
 assert_eq "1443" "$REALITY_PORT" "parsed REALITY port"
-assert_eq "2443" "$CLOUDFLARE_PORT" "parsed Cloudflare port"
+assert_eq "2053" "$CLOUDFLARE_PORT" "parsed Cloudflare port"
 assert_eq "example.net:443" "$REALITY_TARGET" "parsed REALITY target"
 assert_eq "11111111-1111-4111-8111-111111111111" "$REALITY_UUID" "parsed REALITY UUID"
 assert_eq "22222222-2222-4222-8222-222222222222" "$CLOUDFLARE_UUID" "parsed Cloudflare UUID"
@@ -211,13 +215,13 @@ validate_values reality "" "" "" ""
 assert_eq "443" "$REALITY_PORT" "validated default REALITY port"
 assert_eq "" "$CLOUDFLARE_PORT" "validated inactive Cloudflare port"
 
-validate_values dual vpn.example.com admin@example.com 1443 2443
+validate_values dual vpn.example.com admin@example.com 1443 2053
 assert_eq "1443" "$REALITY_PORT" "custom REALITY port"
-assert_eq "2443" "$CLOUDFLARE_PORT" "custom Cloudflare port"
+assert_eq "2053" "$CLOUDFLARE_PORT" "custom Cloudflare port"
 
-validate_values dual vpn.example.com admin@example.com 01443 02443
+validate_values dual vpn.example.com admin@example.com 01443 02053
 assert_eq "1443" "$REALITY_PORT" "canonical REALITY port"
-assert_eq "2443" "$CLOUDFLARE_PORT" "canonical Cloudflare port"
+assert_eq "2053" "$CLOUDFLARE_PORT" "canonical Cloudflare port"
 
 validate_values cloudflare vpn.example.com admin@example.com "" "" "" "" "/valid._~-"
 
@@ -230,10 +234,14 @@ assert_fails "--domain is required" validate_values cloudflare "" admin@example.
 assert_fails "--email is required" validate_values cloudflare vpn.example.com "" "" ""
 assert_fails "Invalid domain" validate_values cloudflare bad_domain admin@example.com "" ""
 assert_fails "Invalid REALITY port" validate_values reality "" "" 65536 ""
+assert_fails "Unsupported Cloudflare port" validate_values dual vpn.example.com admin@example.com 1443 2443
 assert_fails "must be different" validate_values dual vpn.example.com admin@example.com 443 443
 assert_fails "must be different" validate_values dual vpn.example.com admin@example.com 0443 443
 validate_reality_target_value example.net:443
 assert_fails "Invalid REALITY target" validate_reality_target_value example.net
+
+validate_values cloudflare VPN.Example.COM admin@example.com "" 8443
+assert_eq "vpn.example.com" "$DOMAIN" "Cloudflare domain is normalized to lowercase"
 assert_fails "Invalid REALITY target" validate_reality_target_value example.net:65536
 assert_fails "Invalid REALITY UUID" validate_values reality "" "" "" "" bad-uuid
 assert_fails "Invalid Cloudflare UUID" validate_values cloudflare vpn.example.com admin@example.com "" "" "" bad-uuid
@@ -478,7 +486,7 @@ test_state_round_trip() (
   DOMAIN="vpn.example.com"
   EMAIL="$malicious_value"
   REALITY_PORT="1443"
-  CLOUDFLARE_PORT="2443"
+  CLOUDFLARE_PORT="2053"
   INTERNAL_WS_PORT="31001"
   REALITY_UUID="11111111-1111-4111-8111-111111111111"
   CLOUDFLARE_UUID="22222222-2222-4222-8222-222222222222"
@@ -501,7 +509,7 @@ test_state_round_trip() (
   assert_eq "vpn.example.com" "$DOMAIN" "loaded domain"
   assert_eq "$malicious_value" "$EMAIL" "loaded shell-metacharacter value"
   assert_eq "1443" "$REALITY_PORT" "loaded REALITY port"
-  assert_eq "2443" "$CLOUDFLARE_PORT" "loaded Cloudflare port"
+  assert_eq "2053" "$CLOUDFLARE_PORT" "loaded Cloudflare port"
   assert_eq "31001" "$INTERNAL_WS_PORT" "loaded internal WS port"
   assert_eq "11111111-1111-4111-8111-111111111111" "$REALITY_UUID" "loaded REALITY UUID"
   assert_eq "22222222-2222-4222-8222-222222222222" "$CLOUDFLARE_UUID" "loaded Cloudflare UUID"
@@ -918,13 +926,13 @@ NGINX
 test_environment_preflight
 
 test_nginx_and_acme() (
-  local temp_dir old_inode certbot_log hook_path output
+  local temp_dir old_inode certbot_log hook_path output strict_output
   temp_dir="$(mktemp -d)"
   trap 'rm -rf "$temp_dir"' RETURN
 
   reset_options
   MODE="cloudflare"
-  DOMAIN="vpn.example.com"
+  DOMAIN="VPN.Example.COM"
   EMAIL="admin@example.com"
   CLOUDFLARE_PORT="8443"
   INTERNAL_WS_PORT="31001"
@@ -967,6 +975,9 @@ test_nginx_and_acme() (
   grep -Fq "$REALITY_PRIVATE_KEY" "$temp_dir/site.conf" && fail "Nginx config contains proxy credentials"
   grep -Fq "$CLOUDFLARE_UUID" "$temp_dir/site.conf" && fail "Nginx config contains proxy credentials"
   assert_fails "Invalid Nginx render mode" render_nginx_site "$temp_dir/site.conf" unsupported
+  CLOUDFLARE_PORT="2443"
+  assert_fails "Unsupported Cloudflare port" render_nginx_site "$temp_dir/site.conf" final
+  CLOUDFLARE_PORT="8443"
   WS_PATH='invalid path'
   assert_fails "WebSocket path" render_nginx_site "$temp_dir/site.conf" final
   WS_PATH="/6f4f5304d2e84dc8"
@@ -974,6 +985,7 @@ test_nginx_and_acme() (
   certbot_log="$temp_dir/certbot.log"
   certbot() { printf '<%s>\n' "$*" >"$certbot_log"; }
   request_certificate
+  assert_eq "vpn.example.com" "$DOMAIN" "certificate domain is normalized to lowercase"
   assert_eq '<certonly --webroot -w /tmp/placeholder --non-interactive --agree-tos --email admin@example.com --keep-until-expiring -d vpn.example.com>' \
     "$(sed "s#${temp_dir}/acme-webroot#/tmp/placeholder#" "$certbot_log")" "Certbot webroot arguments"
 
@@ -993,15 +1005,33 @@ test_nginx_and_acme() (
   }
   check_cloudflare_edge || fail "CF-Ray edge response was rejected"
 
+  CLOUDFLARE_PORT="2443"
+  if output="$(probe_cloudflare_edge 2>&1)"; then
+    fail "unsupported Cloudflare edge port unexpectedly passed"
+  fi
+  CLOUDFLARE_PORT="8443"
+
   curl() { printf '%s\n' 'HTTP/2 200' '' '104.16.1.1'; }
   check_cloudflare_edge || fail "Cloudflare edge address was rejected"
 
   curl() { printf '%s\n' 'HTTP/2 200' '' '203.0.113.1'; }
-  if output="$(check_cloudflare_edge 2>&1)"; then
+  if output="$(probe_cloudflare_edge 2>&1)"; then
     fail "non-Cloudflare edge response unexpectedly passed"
   fi
-  [[ "$output" == *"Cloudflare edge check could not be confirmed"* ]] ||
-    fail "failed edge check did not warn: $output"
+  strict_output="$(
+    (
+      set -eE
+      trap 'printf "ERR trap fired\\n" >&2' ERR
+      check_cloudflare_edge
+      printf 'strict mode continued\\n'
+    ) 2>&1
+  )"
+  [[ "$strict_output" == *"Cloudflare edge check could not be confirmed"* ]] ||
+    fail "failed edge check did not warn: $strict_output"
+  [[ "$strict_output" == *"strict mode continued"* ]] ||
+    fail "failed edge check interrupted strict mode: $strict_output"
+  [[ "$strict_output" != *"ERR trap fired"* ]] ||
+    fail "failed edge check triggered ERR: $strict_output"
 )
 
 test_nginx_and_acme
