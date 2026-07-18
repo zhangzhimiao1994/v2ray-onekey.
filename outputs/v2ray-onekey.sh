@@ -850,13 +850,23 @@ disable_owned_legacy_nginx_files() {
 restore_service_states() {
   local service state enabled
   [[ -f "$BACKUP_DIR/services" ]] || return 0
+
+  while IFS=$'\t' read -r service state enabled; do
+    [[ -n "$service" ]] || continue
+    if [[ "$state" == "inactive" ]]; then
+      systemctl stop "$service" >/dev/null 2>&1 || true
+    fi
+  done <"$BACKUP_DIR/services"
+
   while IFS=$'\t' read -r service state enabled; do
     [[ -n "$service" ]] || continue
     if [[ "$state" == "active" ]]; then
       systemctl start "$service" >/dev/null 2>&1 || warn "Could not restart $service during rollback"
-    else
-      systemctl stop "$service" >/dev/null 2>&1 || true
     fi
+  done <"$BACKUP_DIR/services"
+
+  while IFS=$'\t' read -r service state enabled; do
+    [[ -n "$service" ]] || continue
     if [[ "$enabled" == "enabled" ]]; then
       systemctl enable "$service" >/dev/null 2>&1 || warn "Could not re-enable $service during rollback"
     else
@@ -1035,7 +1045,8 @@ port_listener_conflicts() {
   PORT_CONFLICT_DETAILS="$(ss -H -lntp "sport = :$port" 2>&1)" ||
     die "Unable to inspect TCP port $port: $PORT_CONFLICT_DETAILS"
   if [[ -z "$PORT_CONFLICT_DETAILS" ]]; then
-    if [[ "$role" == "cloudflare" ]] && nginx_has_unmanaged_domain_conflict "$port" "$DOMAIN"; then
+    if [[ "$role" == "cloudflare" || "$role" == "acme" ]] &&
+      nginx_has_unmanaged_domain_conflict "$port" "$DOMAIN"; then
       PORT_CONFLICT_DETAILS="Nginx already defines server_name $DOMAIN on TCP $port"
       return 0
     fi
@@ -1055,7 +1066,8 @@ port_listener_conflicts() {
     fi
     return 0
   done <<<"$PORT_CONFLICT_DETAILS"
-  if [[ "$role" == "cloudflare" ]] && nginx_has_unmanaged_domain_conflict "$port" "$DOMAIN"; then
+  if [[ "$role" == "cloudflare" || "$role" == "acme" ]] &&
+    nginx_has_unmanaged_domain_conflict "$port" "$DOMAIN"; then
     PORT_CONFLICT_DETAILS="Nginx already defines server_name $DOMAIN on TCP $port"
     return 0
   fi
@@ -1064,13 +1076,22 @@ port_listener_conflicts() {
 
 stdin_is_tty() { [[ -t 0 ]]; }
 
+complete_listener_diagnostics() {
+  local output=""
+  output="$(ss -lntp 2>&1)" || output="ss -lntp failed: $output"
+  printf '%s\n' "$output"
+}
+
 resolve_one_public_port() {
-  local role="$1" option_name="$2" attempt replacement current_port
+  local role="$1" option_name="$2" attempt replacement current_port full_listeners
   for attempt in 1 2 3 4 5; do
     if [[ "$role" == "reality" ]]; then current_port="$REALITY_PORT"; else current_port="$CLOUDFLARE_PORT"; fi
     port_listener_conflicts "$role" "$current_port" || return 0
     if ! stdin_is_tty; then
-      die "TCP port $current_port is occupied. Rerun using $option_name PORT. Conflict: $PORT_CONFLICT_DETAILS"
+      full_listeners="$(complete_listener_diagnostics)"
+      die "TCP port $current_port is occupied. Rerun using $option_name PORT. Conflict: $PORT_CONFLICT_DETAILS
+ss -lntp output:
+$full_listeners"
     fi
     warn "TCP port $current_port is unavailable: $PORT_CONFLICT_DETAILS"
     read -r -p "Enter a replacement port for $role (or q to cancel): " replacement ||
@@ -1101,11 +1122,15 @@ resolve_one_public_port() {
 }
 
 resolve_public_port_conflicts() {
+  local full_listeners=""
   mode_has_reality && resolve_one_public_port reality "--reality-port"
   mode_has_cloudflare && resolve_one_public_port cloudflare "--cloudflare-port"
   validate_unique_public_ports
   if mode_has_cloudflare && port_listener_conflicts acme 80; then
-    die "TCP port 80 is occupied by a non-Nginx process; free it for the ACME HTTP-01 challenge. Conflict: $PORT_CONFLICT_DETAILS"
+    full_listeners="$(complete_listener_diagnostics)"
+    die "TCP port 80 is unavailable for the ACME HTTP-01 challenge. Conflict: $PORT_CONFLICT_DETAILS
+ss -lntp output:
+$full_listeners"
   fi
 }
 

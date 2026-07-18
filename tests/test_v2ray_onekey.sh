@@ -948,6 +948,33 @@ NGINX
   port_listener_conflicts cloudflare 8443 ||
     fail "same-domain Cloudflare Nginx conflict was not rejected"
 
+  nginx() {
+    [[ "$1" == '-T' ]] || return 1
+    cat <<'NGINX'
+# configuration file /etc/nginx/conf.d/unrelated.conf:
+server {
+  listen 80;
+  server_name other.example.com;
+}
+NGINX
+  }
+  ss() { printf '%s\n' 'LISTEN 0 4096 0.0.0.0:80 0.0.0.0:* users:(("nginx",pid=1,fd=3))'; }
+  port_listener_conflicts acme 80 &&
+    fail "different-domain Nginx HTTP site prevented port 80 sharing"
+
+  nginx() {
+    [[ "$1" == '-T' ]] || return 1
+    cat <<'NGINX'
+# configuration file /etc/nginx/conf.d/unrelated.conf:
+server {
+  listen 80;
+  server_name vpn.example.com;
+}
+NGINX
+  }
+  port_listener_conflicts acme 80 ||
+    fail "same-domain unmanaged Nginx HTTP site was not rejected"
+
   ss() {
     if [[ "$*" == '-H -lntp sport = :443' ]]; then
       printf '%s\n' 'LISTEN 0 4096 0.0.0.0:443 0.0.0.0:* users:(("nginx",pid=1,fd=3))'
@@ -965,7 +992,14 @@ NGINX
   REALITY_PORT="443"
   CLOUDFLARE_PORT="8443"
   stdin_is_tty() { return 1; }
-  assert_fails "--reality-port PORT" check_public_port_listeners
+  local conflict_output=""
+  if conflict_output="$(check_public_port_listeners 2>&1)"; then
+    fail "noninteractive REALITY conflict unexpectedly passed"
+  fi
+  [[ "$conflict_output" == *'--reality-port PORT'* ]] ||
+    fail "REALITY conflict lacks rerun advice: $conflict_output"
+  [[ "$conflict_output" == *'ss -lntp output:'* && "$conflict_output" == *'State Recv-Q Send-Q'* ]] ||
+    fail "REALITY conflict lacks complete ss output: $conflict_output"
 
   nginx() {
     [[ "$1" == '-T' ]] || return 1
@@ -980,6 +1014,40 @@ server {
 NGINX
   }
   check_public_port_listeners
+
+  MODE="cloudflare"
+  REALITY_PORT=""
+  CLOUDFLARE_PORT="8443"
+  nginx() {
+    [[ "$1" == '-T' ]] || return 1
+    cat <<'NGINX'
+# configuration file /etc/nginx/conf.d/unrelated.conf:
+server {
+  listen 8443 ssl;
+  server_name other.example.com;
+}
+NGINX
+  }
+  ss() {
+    if [[ "$*" == '-H -lntp sport = :8443' ]]; then
+      :
+    elif [[ "$*" == '-H -lntp sport = :80' ]]; then
+      printf '%s\n' 'LISTEN 0 4096 0.0.0.0:80 0.0.0.0:* users:(("caddy",pid=8,fd=3))'
+    elif [[ "$*" == '-lntp' ]]; then
+      printf '%s\n' 'State Recv-Q Send-Q Local Address:Port Peer Address:Port Process' \
+        'LISTEN 0 4096 0.0.0.0:80 0.0.0.0:* users:(("caddy",pid=8,fd=3))' \
+        'LISTEN 0 4096 0.0.0.0:9090 0.0.0.0:* users:(("unrelated",pid=9,fd=3))'
+    else
+      return 1
+    fi
+  }
+  if conflict_output="$(resolve_public_port_conflicts 2>&1)"; then
+    fail "noninteractive ACME conflict unexpectedly passed"
+  fi
+  [[ "$conflict_output" == *'TCP port 80'* && "$conflict_output" == *'ss -lntp output:'* ]] ||
+    fail "ACME conflict lacks full listener diagnostics: $conflict_output"
+  [[ "$conflict_output" == *'0.0.0.0:9090'* ]] ||
+    fail "ACME conflict omitted unrelated full-listener row: $conflict_output"
 
   INTERNAL_WS_PORT="31001"
   ss() {
@@ -1175,6 +1243,11 @@ EOF
   [[ ! -e "$STATE_FILE" ]] || fail "rollback did not remove newly created state"
   grep -Fq 'start v2ray' "$service_log" || fail "rollback did not restore active V2Ray"
   grep -Fq 'stop xray' "$service_log" || fail "rollback did not stop previously inactive Xray"
+  [[ "$(grep -n '^stop xray$' "$service_log" | cut -d: -f1)" -lt \
+    "$(grep -n '^start v2ray$' "$service_log" | cut -d: -f1)" ]] ||
+    fail "rollback started V2Ray before stopping the newly installed Xray"
+  grep -Fq 'enable v2ray' "$service_log" || fail "rollback did not restore enabled V2Ray"
+  grep -Fq 'disable xray' "$service_log" || fail "rollback did not restore disabled Xray"
 
   legacy="$temp_dir/v2ray-owned.conf"
   NGINX_SITE="$temp_dir/current-site.conf"
