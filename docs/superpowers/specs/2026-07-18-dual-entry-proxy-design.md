@@ -51,7 +51,7 @@ Xray listens publicly using:
 
 The script generates a REALITY X25519 key pair and a random short ID. Its default camouflage target is `www.microsoft.com:443`. Before using it, the script requires a successful Xray TLS probe and rejects resolved addresses inside Cloudflare's currently published IP ranges. An explicit `--reality-target` overrides the hostname but is subject to the same probe.
 
-After the first 1 MiB in each direction, unauthenticated fallback traffic is limited to 100 KiB/s with a 1 MiB/s burst ceiling to reduce the risk that a scanned endpoint is abused as a relay.
+The installer leaves REALITY fallback rate limits unset because fixed values can become a recognizable fingerprint. It instead rejects Cloudflare-backed targets and recommends a reachable ordinary HTTPS target in the VPS's ASN or a nearby network to reduce relay-abuse and routing anomalies.
 
 ### Cloudflare Entry
 
