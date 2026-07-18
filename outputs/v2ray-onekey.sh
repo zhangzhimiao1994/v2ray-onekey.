@@ -249,6 +249,329 @@ validate_options() {
   [[ -z "$WS_PATH" || "$WS_PATH" == /* ]] || die "WebSocket path must start with /"
 }
 
+STATE_KEYS=(
+  MODE DOMAIN EMAIL REALITY_PORT CLOUDFLARE_PORT INTERNAL_WS_PORT
+  REALITY_UUID CLOUDFLARE_UUID REALITY_PRIVATE_KEY REALITY_PUBLIC_KEY
+  REALITY_SHORT_ID REALITY_TARGET WS_PATH ALLOW_BITTORRENT
+)
+
+state_key_allowed() {
+  local key="$1"
+  local allowed=""
+  for allowed in "${STATE_KEYS[@]}"; do
+    [[ "$key" == "$allowed" ]] && return 0
+  done
+  return 1
+}
+
+state_value_is_shell_escaped() {
+  python3 - "$1" <<'PY'
+import sys
+
+value = sys.argv[1]
+safe = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_@%+=:,./-")
+index = 0
+while index < len(value):
+    character = value[index]
+    if character in safe:
+        index += 1
+    elif character == "\\":
+        index += 2
+    elif value.startswith("''", index):
+        index += 2
+    elif value.startswith("$'", index):
+        index += 2
+        while index < len(value):
+            if value[index] == "\\":
+                index += 2
+            elif value[index] == "'":
+                index += 1
+                break
+            else:
+                index += 1
+        else:
+            raise SystemExit(1)
+    else:
+        raise SystemExit(1)
+    if index > len(value):
+        raise SystemExit(1)
+PY
+}
+
+validate_loaded_runtime_values() {
+  if mode_has_cloudflare; then
+    valid_port "$INTERNAL_WS_PORT" || die "Invalid internal WebSocket port: $INTERNAL_WS_PORT"
+    [[ "$INTERNAL_WS_PORT" != "$REALITY_PORT" && "$INTERNAL_WS_PORT" != "$CLOUDFLARE_PORT" ]] ||
+      die "Internal WebSocket port must not match a public port"
+    [[ "$WS_PATH" == /* && -n "$WS_PATH" ]] || die "WebSocket path must start with /"
+  else
+    [[ -z "$INTERNAL_WS_PORT" && -z "$WS_PATH" ]] ||
+      die "Inactive Cloudflare state must not contain WebSocket values"
+  fi
+}
+
+save_state() (
+  local state_dir state_name temp_state key
+  state_dir="$(dirname "$STATE_FILE")"
+  state_name="$(basename "$STATE_FILE")"
+  install -d -m 700 "$state_dir"
+  chmod 700 "$state_dir"
+  temp_state="$(mktemp "$state_dir/.${state_name}.XXXXXX")"
+  trap 'rm -f -- "$temp_state"' EXIT
+  for key in "${STATE_KEYS[@]}"; do
+    printf '%s=%q\n' "$key" "${!key}" >>"$temp_state"
+  done
+  chmod 600 "$temp_state"
+  mv -f -- "$temp_state" "$STATE_FILE"
+)
+
+load_state() {
+  local owner mode line key value
+  local -A seen=()
+  [[ -f "$STATE_FILE" ]] || die "State file does not exist: $STATE_FILE"
+  owner="$(stat -c '%u' "$STATE_FILE")" || die "Unable to inspect state file: $STATE_FILE"
+  mode="$(stat -c '%a' "$STATE_FILE")" || die "Unable to inspect state file: $STATE_FILE"
+  (( (8#$mode & 0077) == 0 )) || die "State file must not be group or world writable"
+  if [[ "$owner" != "0" ]]; then
+    [[ "${V2RAY_ONEKEY_SOURCE_ONLY:-0}" == "1" && "$owner" == "$(id -u)" ]] ||
+      die "State file must be owned by root"
+  fi
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" =~ ^([A-Z_]+)=(.*)$ ]] || die "Malformed state assignment"
+    key="${BASH_REMATCH[1]}"
+    value="${BASH_REMATCH[2]}"
+    state_key_allowed "$key" || die "State contains unexpected assignment: $key"
+    [[ -z "${seen[$key]:-}" ]] || die "State contains duplicate assignment: $key"
+    state_value_is_shell_escaped "$value" || die "Malformed state value for $key"
+    seen["$key"]=1
+  done <"$STATE_FILE"
+  for key in "${STATE_KEYS[@]}"; do
+    [[ "${seen[$key]:-}" == "1" ]] || die "State is missing assignment: $key"
+  done
+
+  # The allowlist and shell-escape parser above make these assignments inert data.
+  # shellcheck disable=SC1090
+  source "$STATE_FILE"
+  ROTATE="0"
+  validate_options
+  validate_loaded_runtime_values
+}
+
+read_x25519_keypair() {
+  local output private_key public_key
+  output="$(xray x25519)" || die "Unable to generate REALITY x25519 key pair"
+  private_key="$(awk -F: '/^Private key:/{sub(/^[[:space:]]*/, "", $2); print $2; exit}' <<<"$output")"
+  public_key="$(awk -F: '/^Password:/{sub(/^[[:space:]]*/, "", $2); print $2; exit}' <<<"$output")"
+  [[ -n "$public_key" ]] ||
+    public_key="$(awk -F: '/^Public key:/{sub(/^[[:space:]]*/, "", $2); print $2; exit}' <<<"$output")"
+  [[ -n "$private_key" && -n "$public_key" ]] || die "Unable to parse xray x25519 output"
+  REALITY_PRIVATE_KEY="$private_key"
+  REALITY_PUBLIC_KEY="$public_key"
+}
+
+random_internal_ws_port() {
+  local candidate attempts=0
+  while (( attempts < 32 )); do
+    candidate="$(shuf -i 20000-50000 -n 1)" || die "Unable to select an internal WebSocket port"
+    if [[ "$candidate" != "$REALITY_PORT" && "$candidate" != "$CLOUDFLARE_PORT" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+    ((attempts += 1))
+  done
+  die "Unable to select an internal WebSocket port without a public-port collision"
+}
+
+generate_runtime_values() {
+  if mode_has_reality; then
+    [[ -n "$REALITY_UUID" ]] || REALITY_UUID="$(xray uuid)"
+    if [[ -z "$REALITY_PRIVATE_KEY" || -z "$REALITY_PUBLIC_KEY" ]]; then
+      read_x25519_keypair
+    fi
+    [[ -n "$REALITY_SHORT_ID" ]] || REALITY_SHORT_ID="$(openssl rand -hex 8)"
+  fi
+  if mode_has_cloudflare; then
+    [[ -n "$CLOUDFLARE_UUID" ]] || CLOUDFLARE_UUID="$(xray uuid)"
+    [[ -n "$INTERNAL_WS_PORT" ]] || INTERNAL_WS_PORT="$(random_internal_ws_port)"
+    [[ -n "$WS_PATH" ]] || WS_PATH="/$(openssl rand -hex 12)"
+  fi
+}
+
+rotate_runtime_values() {
+  REALITY_UUID=""
+  CLOUDFLARE_UUID=""
+  REALITY_PRIVATE_KEY=""
+  REALITY_PUBLIC_KEY=""
+  REALITY_SHORT_ID=""
+  INTERNAL_WS_PORT=""
+  WS_PATH=""
+}
+
+cloudflare_ipv4_file() { printf '%s\n' "${CLOUDFLARE_IPV4_FILE:-${RUNTIME_DIR:-/run/v2ray-onekey}/ips-v4}"; }
+cloudflare_ipv6_file() { printf '%s\n' "${CLOUDFLARE_IPV6_FILE:-${RUNTIME_DIR:-/run/v2ray-onekey}/ips-v6}"; }
+
+address_in_cloudflare_ranges() {
+  local address="$1"
+  python3 - "$address" "$(cloudflare_ipv4_file)" "$(cloudflare_ipv6_file)" <<'PY'
+import ipaddress
+import sys
+
+try:
+    address = ipaddress.ip_address(sys.argv[1])
+except ValueError:
+    raise SystemExit(1)
+
+for path in sys.argv[2:]:
+    try:
+        with open(path, encoding="utf-8") as handle:
+            for raw_line in handle:
+                line = raw_line.strip()
+                if line and address in ipaddress.ip_network(line, strict=True):
+                    raise SystemExit(0)
+    except (OSError, ValueError):
+        raise SystemExit(1)
+raise SystemExit(1)
+PY
+}
+
+resolve_host_addresses() {
+  local hostname="$1" output
+  output="$(getent ahosts "$hostname")" || return 1
+  printf '%s\n' "$output" | python3 -c '
+import ipaddress
+import sys
+
+seen = set()
+for line in sys.stdin:
+    fields = line.split()
+    if not fields:
+        continue
+    try:
+        address = ipaddress.ip_address(fields[0]).compressed
+    except ValueError:
+        continue
+    if address not in seen:
+        seen.add(address)
+        print(address)
+'
+}
+
+host_resolves_to_cloudflare() {
+  local hostname="$1" address
+  while IFS= read -r address; do
+    address_in_cloudflare_ranges "$address" && return 0
+  done < <(resolve_host_addresses "$hostname")
+  return 1
+}
+
+validate_cloudflare_domain() {
+  local domain="${1:-$DOMAIN}"
+  valid_domain "$domain" || die "Invalid domain: $domain"
+  host_resolves_to_cloudflare "$domain" || die "Cloudflare domain does not resolve to Cloudflare: $domain"
+}
+
+validate_cloudflare_range_file() {
+  local path="$1" family="$2"
+  python3 - "$path" "$family" <<'PY'
+import ipaddress
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line:
+                continue
+            if ipaddress.ip_network(line, strict=True).version != int(sys.argv[2]):
+                raise ValueError(line)
+except (OSError, ValueError):
+    raise SystemExit(1)
+PY
+}
+
+download_cloudflare_ranges() (
+  local run_dir v4 v6 temp_v4 temp_v6
+  run_dir="${RUNTIME_DIR:-/run/v2ray-onekey}"
+  v4="${CLOUDFLARE_IPV4_FILE:-$run_dir/ips-v4}"
+  v6="${CLOUDFLARE_IPV6_FILE:-$run_dir/ips-v6}"
+  install -d -m 700 "$run_dir"
+  temp_v4="$(mktemp "$run_dir/.ips-v4.XXXXXX")"
+  temp_v6="$(mktemp "$run_dir/.ips-v6.XXXXXX")"
+  trap 'rm -f -- "$temp_v4" "$temp_v6"' EXIT
+  curl -fsS https://www.cloudflare.com/ips-v4 -o "$temp_v4"
+  curl -fsS https://www.cloudflare.com/ips-v6 -o "$temp_v6"
+  validate_cloudflare_range_file "$temp_v4" 4 || die "Invalid Cloudflare IPv4 range data"
+  validate_cloudflare_range_file "$temp_v6" 6 || die "Invalid Cloudflare IPv6 range data"
+  mv -f -- "$temp_v4" "$v4"
+  mv -f -- "$temp_v6" "$v6"
+)
+
+validate_reality_target() {
+  local target="$1" hostname
+  valid_reality_target "$target" || die "Invalid REALITY target: $target (expected HOST:PORT)"
+  hostname="${target%:*}"
+  host_resolves_to_cloudflare "$hostname" && die "REALITY target resolves to Cloudflare: $hostname"
+  timeout 15 xray tls ping "$hostname" >/dev/null || die "REALITY target TLS ping failed: $hostname"
+}
+
+validate_unique_public_ports() {
+  local -a ports=()
+  mode_has_reality && ports+=("$REALITY_PORT")
+  mode_has_cloudflare && ports+=("$CLOUDFLARE_PORT")
+  [[ ${#ports[@]} -lt 2 || "${ports[0]}" != "${ports[1]}" ]] ||
+    die "REALITY and Cloudflare public ports must be different in dual mode"
+}
+
+legacy_nginx_config_path() {
+  [[ "$1" =~ ^/etc/nginx/conf\.d/v2ray-[A-Za-z0-9.-]+\.conf$ ]]
+}
+
+legacy_nginx_config_is_project_owned() {
+  local path="$1"
+  legacy_nginx_config_path "$path" || return 1
+  grep -Fq 'proxy_set_header Upgrade' "$path" &&
+    grep -Fq 'proxy_pass http://127.0.0.1:' "$path" &&
+    grep -Fq 'return 200 "ok' "$path"
+}
+
+legacy_project_nginx_exists() {
+  local path
+  for path in /etc/nginx/conf.d/v2ray-*.conf; do
+    [[ -e "$path" ]] || continue
+    legacy_nginx_config_is_project_owned "$path" && return 0
+  done
+  return 1
+}
+
+listener_is_managed() {
+  local listener="$1"
+  [[ "$listener" == *xray* || "$listener" == *v2ray* ]] && return 0
+  [[ "$listener" == *nginx* ]] && legacy_project_nginx_exists
+}
+
+check_public_port_listeners() {
+  local port listeners listener
+  for port in "${REALITY_PORT:-}" "${CLOUDFLARE_PORT:-}"; do
+    [[ -n "$port" ]] || continue
+    listeners="$(ss -H -ltnp "sport = :$port" 2>&1)" || die "Unable to inspect listeners with ss: $listeners"
+    [[ -z "$listeners" ]] && continue
+    while IFS= read -r listener; do
+      [[ -z "$listener" ]] && continue
+      listener_is_managed "$listener" || die "Public port $port listener conflict: $listener"
+    done <<<"$listeners"
+  done
+}
+
+preflight_environment() {
+  [[ "$(uname -s)" == "Linux" ]] || die "This script requires Linux"
+  [[ "$(id -u)" -eq 0 ]] || die "Please run as root"
+  command -v systemctl >/dev/null 2>&1 || die "systemd is required"
+  detect_pkg_manager
+  validate_unique_public_ports
+  check_public_port_listeners
+}
+
 detect_pkg_manager() {
   if command -v apt-get >/dev/null 2>&1; then
     PKG_MANAGER="apt"

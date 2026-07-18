@@ -237,7 +237,7 @@ assert_fails "Invalid REALITY UUID" validate_values reality "" "" "" "" bad-uuid
 assert_fails "Invalid Cloudflare UUID" validate_values cloudflare vpn.example.com admin@example.com "" "" "" bad-uuid
 assert_fails "WebSocket path must start with /" validate_values cloudflare vpn.example.com admin@example.com "" "" "" "" private
 
-test_renderers() {
+test_renderers() (
   local temp_dir
   temp_dir="$(mktemp -d)"
   trap 'rm -rf "$temp_dir"' RETURN
@@ -459,9 +459,295 @@ PY
     $'203.0.113.10\n@example.com'; do
     assert_invalid_uri_host "$invalid_address"
   done
-}
+)
 
 test_renderers
+
+test_state_round_trip() (
+  local temp_dir old_inode malicious_value
+  temp_dir="$(mktemp -d)"
+  trap 'rm -rf "$temp_dir"' RETURN
+  STATE_FILE="$temp_dir/private/state.env"
+  malicious_value='$(touch SHOULD_NOT_EXIST); spaces and $dollar'
+
+  reset_options
+  MODE="dual"
+  DOMAIN="vpn.example.com"
+  EMAIL="$malicious_value"
+  REALITY_PORT="1443"
+  CLOUDFLARE_PORT="2443"
+  INTERNAL_WS_PORT="31001"
+  REALITY_UUID="11111111-1111-4111-8111-111111111111"
+  CLOUDFLARE_UUID="22222222-2222-4222-8222-222222222222"
+  REALITY_PRIVATE_KEY="private key value"
+  REALITY_PUBLIC_KEY="public key value"
+  REALITY_SHORT_ID="0123456789abcdef"
+  REALITY_TARGET="www.microsoft.com:443"
+  WS_PATH="/state path; still data"
+  ALLOW_BITTORRENT="1"
+  save_state
+  assert_eq "700" "$(stat -c '%a' "$temp_dir/private")" "state directory permissions"
+  assert_eq "600" "$(stat -c '%a' "$STATE_FILE")" "state file permissions"
+  [[ ! -e SHOULD_NOT_EXIST ]] || fail "state data was executed"
+  grep -Fq 'EMAIL=\$\(touch\ SHOULD_NOT_EXIST\)\;\ spaces\ and\ \$dollar' "$STATE_FILE" ||
+    fail "state data was not shell escaped"
+
+  reset_options
+  load_state
+  assert_eq "dual" "$MODE" "loaded mode"
+  assert_eq "vpn.example.com" "$DOMAIN" "loaded domain"
+  assert_eq "$malicious_value" "$EMAIL" "loaded shell-metacharacter value"
+  assert_eq "1443" "$REALITY_PORT" "loaded REALITY port"
+  assert_eq "2443" "$CLOUDFLARE_PORT" "loaded Cloudflare port"
+  assert_eq "31001" "$INTERNAL_WS_PORT" "loaded internal WS port"
+  assert_eq "11111111-1111-4111-8111-111111111111" "$REALITY_UUID" "loaded REALITY UUID"
+  assert_eq "22222222-2222-4222-8222-222222222222" "$CLOUDFLARE_UUID" "loaded Cloudflare UUID"
+  assert_eq "private key value" "$REALITY_PRIVATE_KEY" "loaded private key"
+  assert_eq "public key value" "$REALITY_PUBLIC_KEY" "loaded public key"
+  assert_eq "0123456789abcdef" "$REALITY_SHORT_ID" "loaded short ID"
+  assert_eq "www.microsoft.com:443" "$REALITY_TARGET" "loaded target"
+  assert_eq "/state path; still data" "$WS_PATH" "loaded WS path"
+  assert_eq "1" "$ALLOW_BITTORRENT" "loaded BitTorrent setting"
+  assert_eq "0" "$ROTATE" "rotate is not persisted"
+
+  printf 'old permissive state\n' >"$STATE_FILE"
+  chmod 0666 "$STATE_FILE"
+  old_inode="$(stat -c '%i' "$STATE_FILE")"
+  save_state
+  assert_eq "600" "$(stat -c '%a' "$STATE_FILE")" "replaced state permissions"
+  [[ "$(stat -c '%i' "$STATE_FILE")" != "$old_inode" ]] ||
+    fail "state file was not atomically replaced"
+  [[ -z "$(find "$temp_dir/private" -name '.state.env.*' -print -quit)" ]] ||
+    fail "state save left a temporary file behind"
+)
+
+test_state_security() (
+  local temp_dir
+  temp_dir="$(mktemp -d)"
+  trap 'rm -rf "$temp_dir"' RETURN
+  STATE_FILE="$temp_dir/state.env"
+  cat >"$STATE_FILE" <<'EOF'
+MODE=reality
+DOMAIN=''
+EMAIL=''
+REALITY_PORT=443
+CLOUDFLARE_PORT=''
+INTERNAL_WS_PORT=''
+REALITY_UUID=''
+CLOUDFLARE_UUID=''
+REALITY_PRIVATE_KEY=''
+REALITY_PUBLIC_KEY=''
+REALITY_SHORT_ID=''
+REALITY_TARGET=www.microsoft.com:443
+WS_PATH=''
+ALLOW_BITTORRENT=0
+EOF
+  chmod 0660 "$STATE_FILE"
+  assert_fails "group or world writable" load_state
+  chmod 0600 "$STATE_FILE"
+  if [[ "$(id -u)" -eq 0 ]]; then
+    chown 1234 "$STATE_FILE"
+    assert_fails "must be owned by root" load_state
+    load_state_as_source_only() { V2RAY_ONEKEY_SOURCE_ONLY=1 load_state; }
+    assert_fails "must be owned by root" load_state_as_source_only
+    chown 0 "$STATE_FILE"
+    load_state_as_source_only
+  fi
+  cat >"$STATE_FILE" <<'EOF'
+MODE=cloudflare
+DOMAIN=bad_domain
+EMAIL=admin@example.com
+REALITY_PORT=''
+CLOUDFLARE_PORT=99999
+INTERNAL_WS_PORT=31001
+REALITY_UUID=''
+CLOUDFLARE_UUID=''
+REALITY_PRIVATE_KEY=''
+REALITY_PUBLIC_KEY=''
+REALITY_SHORT_ID=''
+REALITY_TARGET=www.microsoft.com:443
+WS_PATH=/ws
+ALLOW_BITTORRENT=0
+EOF
+  chmod 0600 "$STATE_FILE"
+  assert_fails "Invalid domain" load_state
+  printf 'MODE=reality\nEVIL=$(touch SHOULD_NOT_EXIST)\n' >"$STATE_FILE"
+  assert_fails "unexpected assignment" load_state
+  [[ ! -e SHOULD_NOT_EXIST ]] || fail "untrusted state line was executed"
+)
+
+test_state_round_trip
+test_state_security
+
+test_runtime_generation() (
+  local temp_dir old_path
+  temp_dir="$(mktemp -d)"
+  trap 'rm -rf "$temp_dir"' RETURN
+  old_path="$PATH"
+  PATH="$temp_dir:$PATH"
+  cat >"$temp_dir/xray" <<'EOF'
+#!/usr/bin/env bash
+case "$1 ${2:-}" in
+  'uuid ') printf '%s\n' 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa' ;;
+  'x25519 ') printf '%s\n' 'Private key: generated-private' 'Password: generated-public' ;;
+  *) exit 1 ;;
+esac
+EOF
+  cat >"$temp_dir/openssl" <<'EOF'
+#!/usr/bin/env bash
+[[ "$1 $2 $3" == 'rand -hex 8' ]] && { printf '0123456789abcdef\n'; exit; }
+[[ "$1 $2 $3" == 'rand -hex 12' ]] && { printf '0123456789abcdef01234567\n'; exit; }
+exit 1
+EOF
+  cat >"$temp_dir/shuf" <<'EOF'
+#!/usr/bin/env bash
+[[ "$*" == *'20000-50000'* ]] || exit 1
+printf '31001\n'
+EOF
+  chmod +x "$temp_dir/xray" "$temp_dir/openssl" "$temp_dir/shuf"
+
+  reset_options
+  MODE="reality"
+  generate_runtime_values
+  assert_eq "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" "$REALITY_UUID" "generated REALITY UUID"
+  assert_eq "generated-private" "$REALITY_PRIVATE_KEY" "generated REALITY private key"
+  assert_eq "generated-public" "$REALITY_PUBLIC_KEY" "generated REALITY public key"
+  assert_eq "0123456789abcdef" "$REALITY_SHORT_ID" "generated REALITY short ID"
+  assert_eq "" "$CLOUDFLARE_UUID" "reality does not generate Cloudflare UUID"
+  assert_eq "" "$INTERNAL_WS_PORT" "reality does not generate internal port"
+  assert_eq "" "$WS_PATH" "reality does not generate WS path"
+
+  reset_options
+  MODE="cloudflare"
+  generate_runtime_values
+  assert_eq "" "$REALITY_UUID" "Cloudflare does not generate REALITY UUID"
+  assert_eq "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" "$CLOUDFLARE_UUID" "generated Cloudflare UUID"
+  assert_eq "31001" "$INTERNAL_WS_PORT" "generated internal port"
+  assert_eq "/0123456789abcdef01234567" "$WS_PATH" "generated WS path"
+
+  reset_options
+  MODE="dual"
+  REALITY_PORT="443"
+  CLOUDFLARE_PORT="8443"
+  generate_runtime_values
+  [[ -n "$REALITY_UUID" && -n "$CLOUDFLARE_UUID" && -n "$REALITY_PRIVATE_KEY" ]] ||
+    fail "dual mode did not generate both credential sets"
+  REALITY_UUID="existing-reality"
+  CLOUDFLARE_UUID="existing-cloudflare"
+  REALITY_PRIVATE_KEY="existing-private"
+  REALITY_PUBLIC_KEY="existing-public"
+  REALITY_SHORT_ID="existing-short"
+  INTERNAL_WS_PORT="32001"
+  WS_PATH="/existing"
+  generate_runtime_values
+  assert_eq "existing-reality" "$REALITY_UUID" "existing REALITY UUID reused"
+  assert_eq "existing-cloudflare" "$CLOUDFLARE_UUID" "existing Cloudflare UUID reused"
+  assert_eq "existing-private" "$REALITY_PRIVATE_KEY" "existing private key reused"
+  assert_eq "existing-public" "$REALITY_PUBLIC_KEY" "existing public key reused"
+  assert_eq "existing-short" "$REALITY_SHORT_ID" "existing short ID reused"
+  assert_eq "32001" "$INTERNAL_WS_PORT" "existing internal port reused"
+  assert_eq "/existing" "$WS_PATH" "existing path reused"
+
+  reset_options
+  MODE="dual"
+  DOMAIN="vpn.example.com"
+  EMAIL="admin@example.com"
+  REALITY_PORT="443"
+  CLOUDFLARE_PORT="8443"
+  REALITY_TARGET="www.microsoft.com:443"
+  ALLOW_BITTORRENT="1"
+  REALITY_UUID="one"
+  CLOUDFLARE_UUID="two"
+  REALITY_PRIVATE_KEY="three"
+  REALITY_PUBLIC_KEY="four"
+  REALITY_SHORT_ID="five"
+  INTERNAL_WS_PORT="31001"
+  WS_PATH="/six"
+  rotate_runtime_values
+  [[ -z "$REALITY_UUID$CLOUDFLARE_UUID$REALITY_PRIVATE_KEY$REALITY_PUBLIC_KEY$REALITY_SHORT_ID$INTERNAL_WS_PORT$WS_PATH" ]] ||
+    fail "rotate did not clear generated runtime values"
+  assert_eq "dual" "$MODE" "rotate retains mode"
+  assert_eq "vpn.example.com" "$DOMAIN" "rotate retains domain"
+  assert_eq "443" "$REALITY_PORT" "rotate retains public ports"
+  assert_eq "www.microsoft.com:443" "$REALITY_TARGET" "rotate retains target"
+  assert_eq "1" "$ALLOW_BITTORRENT" "rotate retains BitTorrent setting"
+
+  xray() { printf '%s\n' 'Private key: private-from-public-label' 'Public key: public-fallback'; }
+  read_x25519_keypair
+  assert_eq "private-from-public-label" "$REALITY_PRIVATE_KEY" "parsed Private key label"
+  assert_eq "public-fallback" "$REALITY_PUBLIC_KEY" "parsed Public key fallback"
+  xray() { printf '%s\n' 'unparseable output'; }
+  assert_fails "Unable to parse" read_x25519_keypair
+  PATH="$old_path"
+)
+
+test_runtime_generation
+
+test_cloudflare_preflight() (
+  local temp_dir old_path
+  temp_dir="$(mktemp -d)"
+  trap 'rm -rf "$temp_dir"' RETURN
+  CLOUDFLARE_IPV4_FILE="$temp_dir/ips-v4"
+  CLOUDFLARE_IPV6_FILE="$temp_dir/ips-v6"
+  printf '%s\n' '104.16.0.0/13' >"$CLOUDFLARE_IPV4_FILE"
+  printf '%s\n' '2606:4700::/32' >"$CLOUDFLARE_IPV6_FILE"
+  address_in_cloudflare_ranges 104.16.1.1 || fail "known Cloudflare IPv4 rejected"
+  address_in_cloudflare_ranges 2606:4700::1234 || fail "known Cloudflare IPv6 rejected"
+  address_in_cloudflare_ranges 203.0.113.1 && fail "outside IPv4 accepted as Cloudflare"
+  address_in_cloudflare_ranges bad-ip && fail "malformed IP accepted as Cloudflare"
+
+  getent() {
+    [[ "$1 $2" == 'ahosts vpn.example.com' ]] || return 1
+    printf '%s\n' '104.16.1.1 STREAM vpn.example.com' '104.16.1.1 DGRAM vpn.example.com' '2606:4700:0:0:0:0:0:1 STREAM vpn.example.com'
+  }
+  local resolved
+  resolved="$(resolve_host_addresses vpn.example.com)"
+  assert_eq $'104.16.1.1\n2606:4700::1' "$resolved" "unique normalized resolved addresses"
+  host_resolves_to_cloudflare vpn.example.com || fail "Cloudflare hostname was not recognized"
+  DOMAIN="vpn.example.com"
+  validate_cloudflare_domain
+  getent() { printf '%s\n' '203.0.113.1 STREAM outside.example.com'; }
+  host_resolves_to_cloudflare outside.example.com && fail "outside hostname accepted as Cloudflare"
+  assert_fails "does not resolve to Cloudflare" validate_cloudflare_domain outside.example.com
+
+  getent() { printf '%s\n' '104.16.1.1 STREAM www.microsoft.com'; }
+  xray() { printf '%s\n' 'tls ping'; }
+  timeout() { shift; "$@"; }
+  assert_fails "resolves to Cloudflare" validate_reality_target www.microsoft.com:443
+  getent() { printf '%s\n' '203.0.113.2 STREAM example.net'; }
+  validate_reality_target example.net:443
+  xray() { return 1; }
+  assert_fails "TLS ping failed" validate_reality_target example.net:443
+
+  unset CLOUDFLARE_IPV4_FILE CLOUDFLARE_IPV6_FILE
+  RUNTIME_DIR="$temp_dir/run"
+  curl() {
+    [[ "$1" == '-fsS' ]] || return 1
+    if [[ "$2" == 'https://www.cloudflare.com/ips-v4' ]]; then printf '%s\n' '104.16.0.0/13' >"$4"; else printf '%s\n' '2606:4700::/32' >"$4"; fi
+  }
+  download_cloudflare_ranges
+  [[ -f "$RUNTIME_DIR/ips-v4" && -f "$RUNTIME_DIR/ips-v6" ]] || fail "range files were not downloaded"
+)
+
+test_cloudflare_preflight
+
+test_environment_preflight() (
+  reset_options
+  MODE="dual"
+  REALITY_PORT="443"
+  CLOUDFLARE_PORT="8443"
+  validate_unique_public_ports
+  CLOUDFLARE_PORT="443"
+  assert_fails "must be different" validate_unique_public_ports
+  legacy_nginx_config_path /etc/nginx/conf.d/v2ray-vpn.example.com.conf || fail "legacy Nginx path rejected"
+  legacy_nginx_config_path /tmp/v2ray-vpn.example.com.conf && fail "non-project Nginx path accepted"
+  ss() { printf '%s\n' 'LISTEN 0 4096 0.0.0.0:443 0.0.0.0:* users:(("other",pid=1,fd=3))'; }
+  REALITY_PORT="443"
+  CLOUDFLARE_PORT="8443"
+  assert_fails "listener conflict" check_public_port_listeners
+)
+
+test_environment_preflight
 
 execution_output=""
 if execution_output="$(
