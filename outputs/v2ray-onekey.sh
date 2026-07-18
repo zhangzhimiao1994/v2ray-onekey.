@@ -4,6 +4,7 @@ APP_NAME="v2ray-onekey"
 XRAY_CONFIG="${XRAY_CONFIG:-/usr/local/etc/xray/config.json}"
 STATE_FILE="${STATE_FILE:-/etc/v2ray-onekey/state.env}"
 BACKUP_ROOT="${BACKUP_ROOT:-/var/backups/v2ray-onekey}"
+DEPLOYMENT_LOCK_DIR="${DEPLOYMENT_LOCK_DIR:-/run/lock/v2ray-onekey}"
 NGINX_SITE="${NGINX_SITE:-/etc/nginx/conf.d/v2ray-onekey.conf}"
 RENEWAL_HOOK="${RENEWAL_HOOK:-/etc/letsencrypt/renewal-hooks/deploy/v2ray-onekey-nginx.sh}"
 LEGACY_V2RAY_CONFIG="${LEGACY_V2RAY_CONFIG:-/usr/local/etc/v2ray/config.json}"
@@ -12,6 +13,7 @@ DEFAULT_REALITY_TARGET="www.microsoft.com:443"
 CLOUDFLARE_CONNECT_TIMEOUT="${CLOUDFLARE_CONNECT_TIMEOUT:-10}"
 CLOUDFLARE_MAX_TIME="${CLOUDFLARE_MAX_TIME:-30}"
 TRANSACTION_ACTIVE="0"
+LOCK_HELD="0"
 
 log() { printf '\033[1;32m[%s]\033[0m %s\n' "$APP_NAME" "$*"; }
 warn() { printf '\033[1;33m[%s]\033[0m %s\n' "$APP_NAME" "$*"; }
@@ -704,9 +706,15 @@ current_nginx_config_is_project_owned() {
 }
 
 validate_managed_destination_ownership() {
-  if mode_has_cloudflare && [[ -e "$NGINX_SITE" ]] &&
-    ! current_nginx_config_is_project_owned "$NGINX_SITE"; then
-    die "Refusing to overwrite Nginx site without v2ray-onekey ownership signatures: $NGINX_SITE"
+  if mode_has_cloudflare; then
+    if [[ -e "$NGINX_SITE" || -L "$NGINX_SITE" ]] &&
+      ! current_nginx_config_is_project_owned "$NGINX_SITE"; then
+      die "Refusing to overwrite Nginx site without v2ray-onekey ownership signatures: $NGINX_SITE"
+    fi
+    if [[ -e "$RENEWAL_HOOK" || -L "$RENEWAL_HOOK" ]] &&
+      ! current_renewal_hook_is_project_owned "$RENEWAL_HOOK"; then
+      die "Refusing to overwrite renewal hook without exact v2ray-onekey ownership: $RENEWAL_HOOK"
+    fi
   fi
 }
 
@@ -759,6 +767,110 @@ init_backup_metadata() {
   : >"$BACKUP_DIR/services"
   : >"$BACKUP_DIR/legacy-renames"
   chmod 0600 "$BACKUP_DIR/manifest" "$BACKUP_DIR/services" "$BACKUP_DIR/legacy-renames"
+}
+
+lock_directory_is_safe() {
+  local path="$1" mode owner
+  [[ -d "$path" && ! -L "$path" ]] || return 1
+  mode="$(stat -c '%a' "$path" 2>/dev/null)" || return 1
+  owner="$(stat -c '%u' "$path" 2>/dev/null)" || return 1
+  [[ "$mode" == "700" && "$owner" == "0" ]]
+}
+
+lock_has_only_owner_file() {
+  local entry count=0
+  for entry in "$DEPLOYMENT_LOCK_DIR"/* "$DEPLOYMENT_LOCK_DIR"/.[!.]* "$DEPLOYMENT_LOCK_DIR"/..?*; do
+    [[ -e "$entry" || -L "$entry" ]] || continue
+    ((count += 1))
+    [[ "$entry" == "$DEPLOYMENT_LOCK_DIR/owner" ]] || return 1
+  done
+  [[ "$count" -eq 1 && -f "$DEPLOYMENT_LOCK_DIR/owner" && ! -L "$DEPLOYMENT_LOCK_DIR/owner" ]]
+}
+
+acquire_deployment_lock() {
+  local attempt owner owner_mode owner_uid stale_path lock_pid="$BASHPID" lock_parent
+  [[ "${LOCK_HELD:-0}" != "1" ]] || return 0
+  [[ "$DEPLOYMENT_LOCK_DIR" == /* && "$DEPLOYMENT_LOCK_DIR" != *$'\n'* ]] ||
+    die "Invalid deployment lock path: $DEPLOYMENT_LOCK_DIR"
+  lock_parent="$(dirname "$DEPLOYMENT_LOCK_DIR")"
+  [[ ! -L "$lock_parent" ]] || die "Refusing symlink deployment lock parent: $lock_parent"
+  [[ -d "$lock_parent" ]] || install -d -m 0755 "$lock_parent"
+
+  for attempt in 1 2 3; do
+    if mkdir -m 0700 -- "$DEPLOYMENT_LOCK_DIR" 2>/dev/null; then
+      if ! (umask 077; printf '%s\n' "$lock_pid" >"$DEPLOYMENT_LOCK_DIR/owner"); then
+        rm -f -- "$DEPLOYMENT_LOCK_DIR/owner"
+        rmdir -- "$DEPLOYMENT_LOCK_DIR" 2>/dev/null || true
+        die "Unable to record deployment lock owner: $DEPLOYMENT_LOCK_DIR"
+      fi
+      if ! chmod 0600 "$DEPLOYMENT_LOCK_DIR/owner"; then
+        rm -f -- "$DEPLOYMENT_LOCK_DIR/owner"
+        rmdir -- "$DEPLOYMENT_LOCK_DIR" 2>/dev/null || true
+        die "Unable to secure deployment lock owner: $DEPLOYMENT_LOCK_DIR/owner"
+      fi
+      LOCK_HELD="1"
+      return 0
+    fi
+
+    lock_directory_is_safe "$DEPLOYMENT_LOCK_DIR" ||
+      die "Unsafe deployment lock exists; inspect manually: $DEPLOYMENT_LOCK_DIR"
+    lock_has_only_owner_file ||
+      die "Deployment lock has unexpected contents; inspect manually: $DEPLOYMENT_LOCK_DIR"
+    owner_mode="$(stat -c '%a' "$DEPLOYMENT_LOCK_DIR/owner" 2>/dev/null)" ||
+      die "Unable to inspect deployment lock owner: $DEPLOYMENT_LOCK_DIR/owner"
+    owner_uid="$(stat -c '%u' "$DEPLOYMENT_LOCK_DIR/owner" 2>/dev/null)" ||
+      die "Unable to inspect deployment lock owner: $DEPLOYMENT_LOCK_DIR/owner"
+    [[ "$owner_mode" == "600" && "$owner_uid" == "0" ]] ||
+      die "Unsafe deployment lock owner file; inspect manually: $DEPLOYMENT_LOCK_DIR/owner"
+    IFS= read -r owner <"$DEPLOYMENT_LOCK_DIR/owner" || true
+    [[ "$owner" =~ ^[1-9][0-9]*$ ]] ||
+      die "Invalid deployment lock owner; inspect manually: $DEPLOYMENT_LOCK_DIR/owner"
+    if kill -0 "$owner" 2>/dev/null; then
+      die "Another v2ray-onekey deployment is already running (PID $owner)"
+    fi
+
+    stale_path="${DEPLOYMENT_LOCK_DIR}.stale.${BASHPID}.${attempt}"
+    if mv -- "$DEPLOYMENT_LOCK_DIR" "$stale_path" 2>/dev/null; then
+      rm -f -- "$stale_path/owner"
+      rmdir -- "$stale_path" || die "Unable to remove stale deployment lock: $stale_path"
+    fi
+  done
+  die "Unable to acquire deployment lock after concurrent attempts: $DEPLOYMENT_LOCK_DIR"
+}
+
+release_deployment_lock() {
+  local owner=""
+  [[ "${LOCK_HELD:-0}" == "1" ]] || return 0
+  if lock_directory_is_safe "$DEPLOYMENT_LOCK_DIR" && lock_has_only_owner_file; then
+    IFS= read -r owner <"$DEPLOYMENT_LOCK_DIR/owner" || true
+  fi
+  if [[ "$owner" == "$BASHPID" ]]; then
+    rm -f -- "$DEPLOYMENT_LOCK_DIR/owner" || true
+    rmdir -- "$DEPLOYMENT_LOCK_DIR" 2>/dev/null ||
+      warn "Could not remove deployment lock directory: $DEPLOYMENT_LOCK_DIR"
+  else
+    warn "Deployment lock ownership changed; leaving it for inspection: $DEPLOYMENT_LOCK_DIR"
+  fi
+  LOCK_HELD="0"
+  return 0
+}
+
+create_unique_backup_directory() {
+  local attempt candidate
+  [[ "$BACKUP_ROOT" == /* && "$BACKUP_ROOT" != *$'\n'* ]] || die "Invalid backup root: $BACKUP_ROOT"
+  [[ -L "$BACKUP_ROOT" ]] && die "Refusing symlink backup root: $BACKUP_ROOT"
+  install -d -m 0700 "$BACKUP_ROOT"
+  for ((attempt = 0; attempt < 100; attempt += 1)); do
+    candidate="$BACKUP_ROOT/$RUN_TIMESTAMP"
+    [[ "$attempt" -eq 0 ]] || candidate="${candidate}-${BASHPID}-${attempt}"
+    if mkdir -m 0700 -- "$candidate" 2>/dev/null; then
+      BACKUP_DIR="$candidate"
+      return 0
+    fi
+    [[ -e "$candidate" || -L "$candidate" ]] ||
+      die "Unable to create backup directory: $candidate"
+  done
+  die "Unable to allocate a unique backup directory under $BACKUP_ROOT"
 }
 
 manifest_has_path() {
@@ -823,8 +935,7 @@ collect_owned_legacy_nginx_files() {
 begin_transaction() {
   local managed_path
   RUN_TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-  BACKUP_DIR="$BACKUP_ROOT/$RUN_TIMESTAMP"
-  [[ ! -e "$BACKUP_DIR" ]] || BACKUP_DIR="${BACKUP_DIR}-$$"
+  create_unique_backup_directory
   init_backup_metadata
   record_service_states
   for managed_path in \
@@ -861,7 +972,7 @@ restore_service_states() {
   while IFS=$'\t' read -r service state enabled; do
     [[ -n "$service" ]] || continue
     if [[ "$state" == "active" ]]; then
-      systemctl start "$service" >/dev/null 2>&1 || warn "Could not restart $service during rollback"
+      systemctl restart "$service" >/dev/null 2>&1 || warn "Could not restart $service during rollback"
     fi
   done <"$BACKUP_DIR/services"
 
@@ -909,135 +1020,144 @@ rollback_current_run() {
   restore_service_states
 }
 
-legacy_nginx_config_for_port_is_project_owned() {
-  local port="$1" nginx_output
-  nginx_output="$(nginx -T 2>&1)" || return 1
+analyze_nginx_configuration() {
+  local analysis="$1" port="$2" domain="${3:-}" nginx_output
+  nginx_output="$(nginx -T 2>&1)" || return 2
   printf '%s\n' "$nginx_output" | python3 -c '
 import re
 import sys
 
-port = re.escape(sys.argv[1])
-path_pattern = re.compile(r"/etc/nginx/conf\.d/v2ray-[A-Za-z0-9.-]+\.conf")
-current_path = sys.argv[2]
-listen_pattern = re.compile(
-    rf"^\s*listen\s+(?:(?:\[[0-9A-Fa-f:]+\]|[0-9.]+):)?{port}(?=\s|;)",
-    re.MULTILINE,
-)
-header_pattern = re.compile(r"^# configuration file (.+):$")
-required_signatures = (
-    "proxy_set_header Upgrade",
-    "proxy_pass http://127.0.0.1:",
-    "return 200 \"ok",
-)
-current_signatures = required_signatures + ("# Managed by v2ray-onekey",)
-
-
-def classify_section(path, content):
-    listens_on_port = listen_pattern.search(content) is not None
-    project_owned = (
-        (
-            path != current_path
-            and path_pattern.fullmatch(path) is not None
-            and all(signature in content for signature in required_signatures)
-        )
-        or (
-            path == current_path
-            and all(signature in content for signature in current_signatures)
-        )
-    )
-    return listens_on_port, project_owned
-
-
-path = None
-content = []
-found_listener = False
-found_unowned_listener = False
-for line in sys.stdin:
-    header = header_pattern.match(line.rstrip("\n"))
-    if header:
-        if path is not None:
-            listens_on_port, project_owned = classify_section(path, "".join(content))
-            found_listener = found_listener or listens_on_port
-            found_unowned_listener = found_unowned_listener or (
-                listens_on_port and not project_owned
-            )
-        path = header.group(1)
-        content = []
-    elif path is not None:
-        content.append(line)
-if path is not None:
-    listens_on_port, project_owned = classify_section(path, "".join(content))
-    found_listener = found_listener or listens_on_port
-    found_unowned_listener = found_unowned_listener or (
-        listens_on_port and not project_owned
-    )
-if found_listener and not found_unowned_listener:
-    raise SystemExit(0)
-raise SystemExit(1)
-' "$port" "$NGINX_SITE"
-}
-
-nginx_has_unmanaged_domain_conflict() {
-  local port="$1" domain="$2" nginx_output
-  nginx_output="$(nginx -T 2>&1)" || return 0
-  printf '%s\n' "$nginx_output" | python3 -c '
-import re
-import sys
-
-port = re.escape(sys.argv[1])
-domain = sys.argv[2].lower()
-current_path = sys.argv[3]
+analysis, raw_port, domain, current_path = sys.argv[1:]
+port = re.escape(raw_port)
+domain = domain.lower()
 legacy_path = re.compile(r"/etc/nginx/conf\.d/v2ray-[A-Za-z0-9.-]+\.conf")
+header = re.compile(r"^# configuration file (.+):$")
 listen = re.compile(
     rf"^\s*listen\s+(?:(?:\[[0-9A-Fa-f:]+\]|[0-9.]+):)?{port}(?=\s|;)",
     re.MULTILINE,
 )
 server_name = re.compile(r"^\s*server_name\s+([^;]+);", re.MULTILINE)
-header = re.compile(r"^# configuration file (.+):$")
 legacy_signatures = (
     "proxy_set_header Upgrade",
     "proxy_pass http://127.0.0.1:",
     "return 200 \"ok",
 )
-current_signatures = legacy_signatures + ("# Managed by v2ray-onekey",)
 
 
-def conflicts(path, content):
-    if not listen.search(content):
-        return False
-    names = {
-        name.lower()
-        for match in server_name.finditer(content)
-        for name in match.group(1).split()
-    }
-    if domain not in names:
-        return False
-    managed = (
-        path == current_path
-        and all(signature in content for signature in current_signatures)
-    ) or (
+def file_sections(lines):
+    path = None
+    content = []
+    for line in lines:
+        match = header.match(line.rstrip("\n"))
+        if match:
+            if path is not None:
+                yield path, "".join(content)
+            path = match.group(1)
+            content = []
+        elif path is not None:
+            content.append(line)
+    if path is not None:
+        yield path, "".join(content)
+
+
+def matching_brace(text, opening):
+    depth = 0
+    quote = None
+    escaped = False
+    comment = False
+    for index in range(opening, len(text)):
+        character = text[index]
+        if comment:
+            if character == "\n":
+                comment = False
+            continue
+        if quote:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = None
+            continue
+        if character == "#":
+            comment = True
+        elif character in ("\"", chr(39)):
+            quote = character
+        elif character == "{":
+            depth += 1
+        elif character == "}":
+            depth -= 1
+            if depth == 0:
+                return index
+    return None
+
+
+def server_blocks(content):
+    position = 0
+    start_pattern = re.compile(r"\bserver\s*\{")
+    while True:
+        match = start_pattern.search(content, position)
+        if not match:
+            return
+        opening = content.find("{", match.start())
+        closing = matching_brace(content, opening)
+        if closing is None:
+            return
+        yield content[match.start():closing + 1]
+        position = closing + 1
+
+
+def block_is_owned(path, file_content, block):
+    legacy_owned = (
         path != current_path
         and legacy_path.fullmatch(path) is not None
-        and all(signature in content for signature in legacy_signatures)
+        and all(signature in block for signature in legacy_signatures)
     )
-    return not managed
+    if legacy_owned:
+        return True
+    if path != current_path or "# Managed by v2ray-onekey" not in file_content:
+        return False
+    if "return 200 \"ok" not in block or not server_name.search(block):
+        return False
+    proxy_block = all(signature in block for signature in legacy_signatures)
+    acme_block = (
+        "location ^~ /.well-known/acme-challenge/" in block
+        and re.search(r"^\s*root\s+[^;]+;", block, re.MULTILINE) is not None
+    )
+    return proxy_block or acme_block
 
 
-path = None
-content = []
-for line in sys.stdin:
-    match = header.match(line.rstrip("\n"))
-    if match:
-        if path is not None and conflicts(path, "".join(content)):
-            raise SystemExit(0)
-        path = match.group(1)
-        content = []
-    elif path is not None:
-        content.append(line)
-if path is not None and conflicts(path, "".join(content)):
-    raise SystemExit(0)
-raise SystemExit(1)
-' "$port" "$domain" "$NGINX_SITE"
+matching_blocks = []
+for path, file_content in file_sections(sys.stdin):
+    for block in server_blocks(file_content):
+        if not listen.search(block):
+            continue
+        names = {
+            name.lower()
+            for match in server_name.finditer(block)
+            for name in match.group(1).split()
+        }
+        matching_blocks.append((block_is_owned(path, file_content, block), names))
+
+if analysis == "all-owned":
+    raise SystemExit(0 if matching_blocks and all(owned for owned, _ in matching_blocks) else 1)
+if analysis == "domain-conflict":
+    conflict = any(domain in names and not owned for owned, names in matching_blocks)
+    raise SystemExit(0 if conflict else 1)
+raise SystemExit(2)
+' "$analysis" "$port" "$domain" "$NGINX_SITE"
+}
+
+legacy_nginx_config_for_port_is_project_owned() {
+  analyze_nginx_configuration all-owned "$1"
+}
+
+nginx_has_unmanaged_domain_conflict() {
+  local status=0
+  analyze_nginx_configuration domain-conflict "$1" "$2" && return 0
+  status=$?
+  [[ "$status" -eq 1 ]] && return 1
+  return 0
 }
 
 port_listener_conflicts() {
@@ -1449,12 +1569,18 @@ open_firewall_port() {
   local proto="${2:-tcp}"
 
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
-    ufw allow "${port}/${proto}" >/dev/null || true
+    if ! ufw allow "${port}/${proto}" >/dev/null; then
+      warn "UFW failed to allow ${port}/${proto}; add this rule manually"
+    fi
   fi
 
   if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld; then
-    firewall-cmd --permanent --add-port="${port}/${proto}" >/dev/null || true
-    firewall-cmd --reload >/dev/null || true
+    if ! firewall-cmd --add-port="${port}/${proto}" >/dev/null; then
+      warn "firewalld failed to add runtime rule ${port}/${proto}; add it manually"
+    fi
+    if ! firewall-cmd --permanent --add-port="${port}/${proto}" >/dev/null; then
+      warn "firewalld failed to add permanent rule ${port}/${proto}; add it manually"
+    fi
   fi
 }
 
@@ -1623,10 +1749,11 @@ stop_legacy_service_for_cutover() {
 
 activate_nginx_config() {
   nginx -t
+  systemctl enable nginx
   if systemctl is-active --quiet nginx; then
     systemctl reload nginx
   else
-    systemctl enable --now nginx
+    systemctl start nginx
   fi
 }
 
@@ -1799,13 +1926,18 @@ deploy_services() {
 transaction_exit_handler() {
   local status=$?
   trap - EXIT ERR INT TERM
-  if [[ "${TRANSACTION_ACTIVE:-0}" != "1" || "$status" -eq 0 ]]; then
+  if [[ "${TRANSACTION_ACTIVE:-0}" != "1" ]]; then
     exit "$status"
   fi
   TRANSACTION_ACTIVE="0"
   set +e
+  if [[ "$status" -eq 0 ]]; then
+    status=1
+    warn "Deployment ended before the transaction was completed"
+  fi
   warn "Deployment failed; restoring files from ${BACKUP_DIR:-the current backup}"
   rollback_current_run || warn "Automatic rollback was incomplete"
+  release_deployment_lock
   exit "$status"
 }
 
@@ -1817,6 +1949,7 @@ activate_transaction_traps() {
 }
 
 complete_transaction() {
+  release_deployment_lock
   TRANSACTION_ACTIVE="0"
   trap - EXIT ERR INT TERM
 }
@@ -1847,6 +1980,7 @@ main() {
   prepare_configuration
   preflight_environment
   activate_transaction_traps
+  acquire_deployment_lock
   deploy_services
   complete_transaction
 }

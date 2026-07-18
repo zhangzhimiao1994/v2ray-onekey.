@@ -902,6 +902,7 @@ NGINX
 # Managed by v2ray-onekey
 server {
   listen 8443 ssl;
+  server_name vpn.example.com;
   location / { return 200 "ok\n"; }
   proxy_set_header Upgrade $http_upgrade;
   proxy_pass http://127.0.0.1:31001;
@@ -947,6 +948,43 @@ NGINX
   }
   port_listener_conflicts cloudflare 8443 ||
     fail "same-domain Cloudflare Nginx conflict was not rejected"
+
+  nginx() {
+    [[ "$1" == '-T' ]] || return 1
+    cat <<'NGINX'
+# configuration file /etc/nginx/conf.d/v2ray-mixed.example.com.conf:
+server {
+  listen 443 ssl;
+  server_name vpn.example.com;
+  location / { return 200 "ok\n"; }
+  proxy_set_header Upgrade $http_upgrade;
+  proxy_pass http://127.0.0.1:31001;
+}
+server {
+  listen 443 ssl;
+  server_name unrelated.example.com;
+}
+NGINX
+  }
+  legacy_nginx_config_for_port_is_project_owned 443 &&
+    fail "mixed multi-vhost file was classified wholly project-owned"
+
+  nginx() {
+    [[ "$1" == '-T' ]] || return 1
+    cat <<'NGINX'
+# configuration file /etc/nginx/conf.d/unrelated.conf:
+server {
+  listen 8443 ssl;
+  server_name other.example.com;
+}
+server {
+  listen 443 ssl;
+  server_name vpn.example.com;
+}
+NGINX
+  }
+  nginx_has_unmanaged_domain_conflict 8443 vpn.example.com &&
+    fail "server_name from a different server block caused a false conflict"
 
   nginx() {
     [[ "$1" == '-T' ]] || return 1
@@ -1142,6 +1180,17 @@ test_nginx_and_acme() (
   assert_eq "755" "$(stat -c '%a' "$hook_path")" "renewal hook permissions"
   assert_eq $'#!/usr/bin/env bash\nset -e\nnginx -t\nsystemctl reload nginx' "$(cat "$hook_path")" "renewal hook content"
 
+  local service_log="$temp_dir/nginx-service.log"
+  nginx() { printf 'nginx %s\n' "$*" >>"$service_log"; }
+  systemctl() {
+    if [[ "$*" == 'is-active --quiet nginx' ]]; then return 0; fi
+    printf 'systemctl %s\n' "$*" >>"$service_log"
+  }
+  activate_nginx_config
+  grep -Fq 'systemctl enable nginx' "$service_log" || fail "active Nginx was not enabled"
+  grep -Fq 'systemctl reload nginx' "$service_log" || fail "active Nginx was not reloaded"
+  grep -Fq 'systemctl start nginx' "$service_log" && fail "active Nginx was started instead of reloaded"
+
   CLOUDFLARE_IPV4_FILE="$temp_dir/ips-v4"
   CLOUDFLARE_IPV6_FILE="$temp_dir/ips-v6"
   printf '%s\n' '104.16.0.0/13' >"$CLOUDFLARE_IPV4_FILE"
@@ -1207,6 +1256,24 @@ proxy_pass http://127.0.0.1:31001;
 return 200 "ok\n";
 EOF
   validate_managed_destination_ownership
+  install -d "$(dirname "$RENEWAL_HOOK")"
+  cat >"$RENEWAL_HOOK" <<'EOF'
+#!/usr/bin/env bash
+set -e
+nginx -t
+systemctl reload nginx
+EOF
+  validate_managed_destination_ownership
+  printf 'echo unexpected\n' >>"$RENEWAL_HOOK"
+  assert_fails "renewal hook" validate_managed_destination_ownership
+  rm -f "$RENEWAL_HOOK"
+  printf 'target\n' >"$temp_dir/hook-target"
+  ln -s "$temp_dir/hook-target" "$RENEWAL_HOOK"
+  assert_fails "renewal hook" validate_managed_destination_ownership
+  rm -f "$RENEWAL_HOOK"
+  mkdir "$RENEWAL_HOOK"
+  assert_fails "renewal hook" validate_managed_destination_ownership
+  rmdir "$RENEWAL_HOOK"
   rm -f "$NGINX_SITE"
   printf 'old-config\n' >"$XRAY_CONFIG"
   init_backup_metadata
@@ -1241,11 +1308,12 @@ EOF
   rollback_current_run
   assert_eq "old-config" "$(cat "$XRAY_CONFIG")" "rollback restored config"
   [[ ! -e "$STATE_FILE" ]] || fail "rollback did not remove newly created state"
-  grep -Fq 'start v2ray' "$service_log" || fail "rollback did not restore active V2Ray"
+  grep -Fq 'restart v2ray' "$service_log" || fail "rollback did not restart active V2Ray with restored config"
   grep -Fq 'stop xray' "$service_log" || fail "rollback did not stop previously inactive Xray"
   [[ "$(grep -n '^stop xray$' "$service_log" | cut -d: -f1)" -lt \
-    "$(grep -n '^start v2ray$' "$service_log" | cut -d: -f1)" ]] ||
-    fail "rollback started V2Ray before stopping the newly installed Xray"
+    "$(grep -n '^restart v2ray$' "$service_log" | cut -d: -f1)" ]] ||
+    fail "rollback restarted V2Ray before stopping the newly installed Xray"
+  grep -Fq 'restart nginx' "$service_log" || fail "rollback did not restart active Nginx with restored config"
   grep -Fq 'enable v2ray' "$service_log" || fail "rollback did not restore enabled V2Ray"
   grep -Fq 'disable xray' "$service_log" || fail "rollback did not restore disabled Xray"
 
@@ -1323,6 +1391,43 @@ EOF
 
 test_reality_mode_removes_owned_cloudflare_files_transactionally
 printf 'PASS: reality mode Cloudflare-file transition tests\n'
+
+test_deployment_lock_and_backup_collision() (
+  local temp_dir base first_lock_owner
+  temp_dir="$(mktemp -d)"
+  trap 'rm -rf "$temp_dir"' RETURN
+  DEPLOYMENT_LOCK_DIR="$temp_dir/deployment.lock"
+  LOCK_HELD="0"
+  acquire_deployment_lock
+  [[ -d "$DEPLOYMENT_LOCK_DIR" ]] || fail "deployment lock directory was not created"
+  assert_eq "700" "$(stat -c '%a' "$DEPLOYMENT_LOCK_DIR")" "deployment lock mode"
+  first_lock_owner="$(cat "$DEPLOYMENT_LOCK_DIR/owner")"
+  [[ "$first_lock_owner" =~ ^[0-9]+$ ]] || fail "deployment lock owner is not a PID"
+  competing_lock() { LOCK_HELD="0"; acquire_deployment_lock; }
+  assert_fails "already running" competing_lock
+  release_deployment_lock
+  [[ ! -e "$DEPLOYMENT_LOCK_DIR" ]] || fail "deployment lock was not released"
+
+  mkdir -m 700 "$DEPLOYMENT_LOCK_DIR"
+  printf '2147483647\n' >"$DEPLOYMENT_LOCK_DIR/owner"
+  chmod 600 "$DEPLOYMENT_LOCK_DIR/owner"
+  LOCK_HELD="0"
+  acquire_deployment_lock
+  assert_eq "$BASHPID" "$(cat "$DEPLOYMENT_LOCK_DIR/owner")" "stale lock owner replacement"
+  release_deployment_lock
+
+  BACKUP_ROOT="$temp_dir/backups"
+  RUN_TIMESTAMP="20260719T000000Z"
+  install -d -m 700 "$BACKUP_ROOT"
+  base="$BACKUP_ROOT/$RUN_TIMESTAMP"
+  mkdir -m 700 "$base"
+  create_unique_backup_directory
+  [[ "$BACKUP_DIR" != "$base" && -d "$BACKUP_DIR" ]] || fail "backup collision was not resolved atomically"
+  assert_eq "700" "$(stat -c '%a' "$BACKUP_DIR")" "unique backup directory mode"
+)
+
+test_deployment_lock_and_backup_collision
+printf 'PASS: deployment lock and backup collision tests\n'
 
 test_prepare_configuration_reuse_and_rotate() (
   local temp_dir
@@ -1442,7 +1547,17 @@ test_packages_permissions_and_firewall() (
   firewalld_state="active"
   open_firewall_port 8443 tcp
   grep -Fq 'ufw allow 8443/tcp' "$firewall_log" || fail "active UFW was not updated"
+  grep -Fq 'firewall --add-port=8443/tcp' "$firewall_log" || fail "firewalld runtime rule missing"
   grep -Fq 'firewall --permanent --add-port=8443/tcp' "$firewall_log" || fail "active firewalld was not updated"
+  grep -Fq -- '--reload' "$firewall_log" && fail "firewalld global reload was used"
+
+  : >"$firewall_log"
+  ufw_state="inactive"
+  firewall-cmd() { printf 'firewall %s\n' "$*" >>"$firewall_log"; return 1; }
+  local firewall_warning=""
+  firewall_warning="$(open_firewall_port 2053 tcp 2>&1)"
+  [[ "$firewall_warning" == *'firewalld'* && "$firewall_warning" == *'2053/tcp'* ]] ||
+    fail "firewalld failure was silent: $firewall_warning"
   grep -Eq '(apt-get|dnf|yum).*(remove|erase)' "$SCRIPT" &&
     fail "installer contains package-removal behavior"
 
@@ -1544,6 +1659,9 @@ test_transaction_exit_trap() (
   (
     set -Eeuo pipefail
     activate_transaction_traps
+    DEPLOYMENT_LOCK_DIR="$temp_dir/explicit-exit.lock"
+    LOCK_HELD="0"
+    acquire_deployment_lock
     printf 'changed\n' >"$managed"
     die "forced explicit exit"
   ) >/dev/null 2>&1
@@ -1552,39 +1670,52 @@ test_transaction_exit_trap() (
   assert_eq "1" "$status" "explicit die exit status"
   assert_eq "old" "$(cat "$managed")" "explicit die rollback"
   assert_eq "1" "$(wc -l <"$rollback_log" | tr -d ' ')" "explicit die rollback count"
+  [[ ! -e "$temp_dir/explicit-exit.lock" ]] || fail "explicit die left deployment lock behind"
 
   : >"$rollback_log"
   set +e
   (
     set -Eeuo pipefail
     activate_transaction_traps
+    DEPLOYMENT_LOCK_DIR="$temp_dir/failure.lock"
+    LOCK_HELD="0"
+    acquire_deployment_lock
     false
   ) >/dev/null 2>&1
   status=$?
   set -e
   assert_eq "1" "$status" "ordinary failure exit status"
   assert_eq "1" "$(wc -l <"$rollback_log" | tr -d ' ')" "ordinary failure rollback count"
+  [[ ! -e "$temp_dir/failure.lock" ]] || fail "ordinary failure left deployment lock behind"
 
   : >"$rollback_log"
   (
     set -Eeuo pipefail
     activate_transaction_traps
+    DEPLOYMENT_LOCK_DIR="$temp_dir/success.lock"
+    LOCK_HELD="0"
+    acquire_deployment_lock
     true
     complete_transaction
   )
   [[ ! -s "$rollback_log" ]] || fail "successful transaction rolled back"
+  [[ ! -e "$temp_dir/success.lock" ]] || fail "successful transaction left deployment lock behind"
 
   : >"$rollback_log"
   set +e
   (
     set -Eeuo pipefail
     activate_transaction_traps
+    DEPLOYMENT_LOCK_DIR="$temp_dir/term.lock"
+    LOCK_HELD="0"
+    acquire_deployment_lock
     kill -TERM "$BASHPID"
   ) >/dev/null 2>&1
   status=$?
   set -e
   assert_eq "143" "$status" "TERM transaction exit status"
   assert_eq "1" "$(wc -l <"$rollback_log" | tr -d ' ')" "TERM rollback count"
+  [[ ! -e "$temp_dir/term.lock" ]] || fail "TERM left deployment lock behind"
 )
 
 test_transaction_exit_trap
