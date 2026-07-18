@@ -414,4 +414,6 @@ main() {
   print_result
 }
 
-main "$@"
+if [[ "${V2RAY_ONEKEY_SOURCE_ONLY:-0}" != "1" ]]; then
+  main "$@"
+fi
