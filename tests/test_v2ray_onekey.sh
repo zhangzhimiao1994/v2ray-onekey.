@@ -1180,6 +1180,9 @@ test_nginx_and_acme() (
   grep -Fq 'location / {' "$temp_dir/site.conf" || fail "initial ordinary location missing"
   grep -Fq 'return 200 "ok\n";' "$temp_dir/site.conf" || fail "initial ordinary response missing"
   grep -Fq 'ssl_certificate ' "$temp_dir/site.conf" && fail "initial site unexpectedly contains TLS"
+  NGINX_SITE="$temp_dir/site.conf"
+  current_nginx_config_is_project_owned "$NGINX_SITE" ||
+    fail "installer-generated initial Nginx site was not recognized"
 
   render_nginx_site "$temp_dir/site.conf" final
   assert_eq "644" "$(stat -c '%a' "$temp_dir/site.conf")" "Nginx site permissions"
@@ -1201,6 +1204,19 @@ test_nginx_and_acme() (
   grep -Fq 'return 200 "ok\n";' "$temp_dir/site.conf" || fail "final ordinary response missing"
   grep -Fq "$REALITY_PRIVATE_KEY" "$temp_dir/site.conf" && fail "Nginx config contains proxy credentials"
   grep -Fq "$CLOUDFLARE_UUID" "$temp_dir/site.conf" && fail "Nginx config contains proxy credentials"
+  current_nginx_config_is_project_owned "$NGINX_SITE" ||
+    fail "installer-generated final Nginx site was not recognized"
+  cat >>"$NGINX_SITE" <<'EOF'
+
+server {
+    listen 9443 ssl;
+    server_name unrelated.example.com;
+}
+EOF
+  current_nginx_config_is_project_owned "$NGINX_SITE" &&
+    fail "mixed current Nginx site was classified as project-owned"
+  assert_fails "Refusing to overwrite Nginx site" validate_managed_destination_ownership
+  render_nginx_site "$NGINX_SITE" final
   assert_fails "Invalid Nginx render mode" render_nginx_site "$temp_dir/site.conf" unsupported
   CLOUDFLARE_PORT="2443"
   assert_fails "Unsupported Cloudflare port" render_nginx_site "$temp_dir/site.conf" final
@@ -1281,6 +1297,10 @@ test_transaction_backup_and_rollback() (
 
   XRAY_CONFIG="$temp_dir/xray/config.json"
   MODE="cloudflare"
+  DOMAIN="vpn.example.com"
+  CLOUDFLARE_PORT="8443"
+  INTERNAL_WS_PORT="31001"
+  WS_PATH="/transaction-path"
   STATE_FILE="$temp_dir/state/state.env"
   NGINX_SITE="$temp_dir/nginx/v2ray-onekey.conf"
   RENEWAL_HOOK="$temp_dir/hooks/v2ray-onekey-nginx.sh"
@@ -1290,12 +1310,7 @@ test_transaction_backup_and_rollback() (
   install -d "$(dirname "$NGINX_SITE")"
   printf 'server { listen 8443 ssl; }\n' >"$NGINX_SITE"
   assert_fails "Refusing to overwrite Nginx site" validate_managed_destination_ownership
-  cat >"$NGINX_SITE" <<'EOF'
-# Managed by v2ray-onekey
-proxy_set_header Upgrade $http_upgrade;
-proxy_pass http://127.0.0.1:31001;
-return 200 "ok\n";
-EOF
+  render_nginx_site "$NGINX_SITE" final
   validate_managed_destination_ownership
   install -d "$(dirname "$RENEWAL_HOOK")"
   cat >"$RENEWAL_HOOK" <<'EOF'
@@ -1392,16 +1407,17 @@ test_transaction_backup_and_rollback
 printf 'PASS: transactional backup and rollback tests\n'
 
 test_mixed_legacy_nginx_file_is_never_disabled() (
-  local temp_dir owned mixed owned_disabled
+  local temp_dir owned mixed malformed owned_disabled
   temp_dir="$(mktemp -d)"
   trap 'rm -rf "$temp_dir"' RETURN
   owned="$temp_dir/v2ray-owned.conf"
   mixed="$temp_dir/v2ray-mixed.conf"
+  malformed="$temp_dir/v2ray-malformed.conf"
   NGINX_SITE="$temp_dir/v2ray-onekey.conf"
   BACKUP_DIR="$temp_dir/backup"
   RUN_TIMESTAMP="20260719T010000Z"
-  legacy_nginx_config_path() { [[ "$1" == "$owned" || "$1" == "$mixed" ]]; }
-  legacy_nginx_config_paths() { printf '%s\n' "$owned" "$mixed"; }
+  legacy_nginx_config_path() { [[ "$1" == "$owned" || "$1" == "$mixed" || "$1" == "$malformed" ]]; }
+  legacy_nginx_config_paths() { printf '%s\n' "$owned" "$mixed" "$malformed"; }
 
   cat >"$owned" <<'EOF'
 # comments outside the only server block are allowed
@@ -1422,11 +1438,26 @@ server {
   server_name unrelated.example.com;
 }
 EOF
+  cat >"$malformed" <<'EOF'
+server {
+  proxy_set_header Upgrade $http_upgrade;
+  proxy_pass http://127.0.0.1:31001;
+  return 200 "ok\n";
+EOF
+
+  python3() { return 127; }
+  legacy_nginx_config_is_project_owned "$owned" ||
+    fail "valid legacy Nginx file required python3 for ownership classification"
+  legacy_nginx_config_is_project_owned "$mixed" &&
+    fail "mixed legacy Nginx file was accepted without python3"
+  legacy_nginx_config_is_project_owned "$malformed" &&
+    fail "malformed legacy Nginx file was accepted without python3"
 
   init_backup_metadata
   collect_owned_legacy_nginx_files
   grep -Fqx "$owned" "$BACKUP_DIR/legacy-files" || fail "owned legacy Nginx file was not collected"
   grep -Fqx "$mixed" "$BACKUP_DIR/legacy-files" && fail "mixed legacy Nginx file was collected"
+  grep -Fqx "$malformed" "$BACKUP_DIR/legacy-files" && fail "malformed legacy Nginx file was collected"
   [[ -f "$BACKUP_DIR$owned" ]] || fail "owned legacy Nginx file was not backed up"
   [[ ! -e "$BACKUP_DIR$mixed" ]] || fail "mixed legacy Nginx file was backed up"
 
@@ -1454,13 +1485,12 @@ test_reality_mode_removes_owned_cloudflare_files_transactionally() (
   LEGACY_V2RAY_CONFIG="$temp_dir/v2ray/config.json"
   BACKUP_DIR="$temp_dir/backup"
   RUN_TIMESTAMP="test"
+  DOMAIN="vpn.example.com"
+  CLOUDFLARE_PORT="8443"
+  INTERNAL_WS_PORT="31001"
+  WS_PATH="/transition-path"
   install -d "$(dirname "$NGINX_SITE")" "$(dirname "$RENEWAL_HOOK")"
-  cat >"$NGINX_SITE" <<'EOF'
-# Managed by v2ray-onekey
-proxy_set_header Upgrade $http_upgrade;
-proxy_pass http://127.0.0.1:31001;
-return 200 "ok\n";
-EOF
+  render_nginx_site "$NGINX_SITE" final
   cat >"$RENEWAL_HOOK" <<'EOF'
 #!/usr/bin/env bash
 set -e
@@ -1484,8 +1514,19 @@ EOF
   rollback_current_run
   [[ -f "$NGINX_SITE" && -f "$RENEWAL_HOOK" ]] || fail "rollback did not restore Cloudflare files"
 
+  cat >>"$NGINX_SITE" <<'EOF'
+
+server {
+    listen 9443 ssl;
+    server_name unrelated.example.com;
+}
+EOF
+  local mixed_site_content
+  mixed_site_content="$(cat "$NGINX_SITE")"
   printf 'echo unrelated\n' >>"$RENEWAL_HOOK"
   release_legacy_nginx_listeners >/dev/null
+  [[ -f "$NGINX_SITE" ]] || fail "reality transition removed a mixed current Nginx site"
+  assert_eq "$mixed_site_content" "$(cat "$NGINX_SITE")" "mixed current Nginx site preservation"
   grep -Fqx 'echo unrelated' "$RENEWAL_HOOK" || fail "extra-command renewal hook was modified"
 )
 

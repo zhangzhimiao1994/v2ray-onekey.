@@ -685,141 +685,157 @@ legacy_nginx_config_path() {
   [[ "$1" != "$NGINX_SITE" && "$1" =~ ^/etc/nginx/conf\.d/v2ray-[A-Za-z0-9.-]+\.conf$ ]]
 }
 
+nginx_config_has_owned_shape() {
+  local path="$1" shape="$2"
+  awk -v shape="$shape" '
+function trim(value) {
+  sub(/^[[:space:]]+/, "", value)
+  sub(/[[:space:]]+$/, "", value)
+  return value
+}
+
+function regex_count(value, pattern, count) {
+  count = 0
+  while (match(value, pattern)) {
+    count += 1
+    value = substr(value, RSTART + RLENGTH)
+  }
+  return count
+}
+
+function one_server_block(value) {
+  return regex_count(value, "(^|[[:space:]])server[[:space:]]*\\{") == 1
+}
+
+function managed_http_block(value) {
+  return one_server_block(value) &&
+    regex_count(value, "(^|[[:space:]])listen[[:space:]]") == 2 &&
+    index(value, "listen 80;") &&
+    index(value, "listen [::]:80;") &&
+    regex_count(value, "(^|[[:space:]])server_name[[:space:]]") == 1 &&
+    index(value, "location ^~ /.well-known/acme-challenge/ {") &&
+    regex_count(value, "(^|[[:space:]])location[[:space:]]") == 2 &&
+    regex_count(value, "(^|[[:space:]])root[[:space:]]") == 1 &&
+    index(value, "location / {") &&
+    regex_count(value, "return[[:space:]]+200[[:space:]]+\"ok") == 1 &&
+    !index(value, "proxy_pass ")
+}
+
+function managed_tls_block(value) {
+  return one_server_block(value) &&
+    regex_count(value, "(^|[[:space:]])listen[[:space:]]") == 2 &&
+    regex_count(value, "listen[[:space:]]+[0-9]+[[:space:]]+ssl;") == 1 &&
+    regex_count(value, "listen[[:space:]]+\\[::\\]:[0-9]+[[:space:]]+ssl;") == 1 &&
+    regex_count(value, "(^|[[:space:]])server_name[[:space:]]") == 1 &&
+    regex_count(value, "(^|[[:space:]])ssl_certificate[[:space:]]") == 1 &&
+    regex_count(value, "(^|[[:space:]])ssl_certificate_key[[:space:]]") == 1 &&
+    index(value, "ssl_protocols TLSv1.2 TLSv1.3;") &&
+    regex_count(value, "(^|[[:space:]])location[[:space:]]") == 2 &&
+    regex_count(value, "location[[:space:]]*=[[:space:]]*/[A-Za-z0-9._~-]+[[:space:]]*\\{") == 1 &&
+    regex_count(value, "proxy_pass[[:space:]]+http://127\\.0\\.0\\.1:[0-9]+;") == 1 &&
+    index(value, "proxy_http_version 1.1;") &&
+    index(value, "proxy_set_header Upgrade $http_upgrade;") &&
+    index(value, "proxy_set_header Connection \"upgrade\";") &&
+    index(value, "proxy_set_header Host $host;") &&
+    index(value, "proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;") &&
+    index(value, "proxy_read_timeout 3600s;") &&
+    index(value, "proxy_send_timeout 3600s;") &&
+    index(value, "proxy_buffering off;") &&
+    index(value, "location / {") &&
+    regex_count(value, "return[[:space:]]+200[[:space:]]+\"ok") == 1 &&
+    !index(value, "location ^~ /.well-known/acme-challenge/")
+}
+
+{
+  if ($0 ~ /^[[:space:]]*#[[:space:]]*Managed by v2ray-onekey[[:space:]]*$/) {
+    marker_count += 1
+  }
+  line = $0 "\n"
+  for (position = 1; position <= length(line); position += 1) {
+    character = substr(line, position, 1)
+    if (comment) {
+      if (character == "\n") {
+        comment = 0
+        if (depth > 0) block = block character
+        else outside = outside character
+      }
+      continue
+    }
+    if (quote != "") {
+      if (depth > 0) block = block character
+      else outside = outside character
+      if (escaped) escaped = 0
+      else if (character == "\\") escaped = 1
+      else if (character == quote) quote = ""
+      continue
+    }
+    if (character == "#") {
+      comment = 1
+      continue
+    }
+    if (character == "\"" || character == "\047") {
+      quote = character
+      if (depth > 0) block = block character
+      else outside = outside character
+      continue
+    }
+    if (depth == 0) {
+      if (character == "{") {
+        if (trim(outside) != "server") invalid = 1
+        outside = ""
+        block_count += 1
+        block = "server {"
+        depth = 1
+      } else if (character == "}") {
+        invalid = 1
+      } else {
+        outside = outside character
+      }
+    } else {
+      block = block character
+      if (character == "{") depth += 1
+      else if (character == "}") {
+        depth -= 1
+        if (depth == 0) {
+          blocks[block_count] = block
+          block = ""
+        }
+      }
+    }
+  }
+}
+
+END {
+  if (invalid || depth != 0 || quote != "" || trim(outside) != "") exit 1
+  if (shape == "legacy") {
+    if (block_count != 1 || !one_server_block(blocks[1])) exit 1
+    if (!index(blocks[1], "proxy_set_header Upgrade") ||
+        !index(blocks[1], "proxy_pass http://127.0.0.1:") ||
+        !index(blocks[1], "return 200 \"ok")) exit 1
+    exit 0
+  }
+  if (shape == "current") {
+    if (marker_count != 1 || !managed_http_block(blocks[1])) exit 1
+    if (block_count == 1) exit 0
+    if (block_count == 2 && managed_tls_block(blocks[2])) exit 0
+    exit 1
+  }
+  exit 1
+}
+' "$path"
+}
+
 legacy_nginx_config_is_project_owned() {
   local path="$1"
   legacy_nginx_config_path "$path" || return 1
   [[ -f "$path" && ! -L "$path" ]] || return 1
-  python3 - "$path" <<'PY'
-import pathlib
-import sys
-
-
-def matching_brace(text, opening):
-    depth = 0
-    quote = None
-    escaped = False
-    comment = False
-    for index in range(opening, len(text)):
-        character = text[index]
-        if comment:
-            if character == "\n":
-                comment = False
-            continue
-        if quote:
-            if escaped:
-                escaped = False
-            elif character == "\\":
-                escaped = True
-            elif character == quote:
-                quote = None
-            continue
-        if character == "#":
-            comment = True
-        elif character in ('"', "'"):
-            quote = character
-        elif character == "{":
-            depth += 1
-        elif character == "}":
-            depth -= 1
-            if depth == 0:
-                return index
-    return None
-
-
-def next_server_opening(text, start):
-    index = start
-    quote = None
-    escaped = False
-    comment = False
-    while index < len(text):
-        character = text[index]
-        if comment:
-            if character == "\n":
-                comment = False
-            index += 1
-            continue
-        if quote:
-            if escaped:
-                escaped = False
-            elif character == "\\":
-                escaped = True
-            elif character == quote:
-                quote = None
-            index += 1
-            continue
-        if character == "#":
-            comment = True
-            index += 1
-            continue
-        if character in ('"', "'"):
-            quote = character
-            index += 1
-            continue
-        if text.startswith("server", index):
-            before = text[index - 1] if index else ""
-            after_index = index + len("server")
-            after = text[after_index] if after_index < len(text) else ""
-            if not (before.isalnum() or before == "_") and not (after.isalnum() or after == "_"):
-                while after_index < len(text) and text[after_index].isspace():
-                    after_index += 1
-                if after_index < len(text) and text[after_index] == "{":
-                    return index, after_index
-        index += 1
-    return None
-
-
-try:
-    content = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
-except (OSError, UnicodeError):
-    raise SystemExit(1)
-
-blocks = []
-spans = []
-position = 0
-while True:
-    server_opening = next_server_opening(content, position)
-    if server_opening is None:
-        break
-    server_start, opening = server_opening
-    closing = matching_brace(content, opening)
-    if closing is None:
-        raise SystemExit(1)
-    blocks.append(content[opening + 1:closing])
-    spans.append((server_start, closing + 1))
-    position = closing + 1
-
-if len(blocks) != 1:
-    raise SystemExit(1)
-
-outside_parts = []
-position = 0
-for opening, closing in spans:
-    outside_parts.append(content[position:opening])
-    position = closing
-outside_parts.append(content[position:])
-outside = "".join(outside_parts)
-outside = "\n".join(line.split("#", 1)[0] for line in outside.splitlines())
-if outside.strip():
-    raise SystemExit(1)
-
-signatures = (
-    "proxy_set_header Upgrade",
-    "proxy_pass http://127.0.0.1:",
-    'return 200 "ok',
-)
-raise SystemExit(0 if all(signature in blocks[0] for signature in signatures) else 1)
-PY
+  nginx_config_has_owned_shape "$path" legacy
 }
 
 current_nginx_config_is_project_owned() {
   local path="$1"
   [[ "$path" == "$NGINX_SITE" && -f "$path" && ! -L "$path" ]] || return 1
-  # The literal Nginx runtime variable is an ownership signature.
-  # shellcheck disable=SC2016
-  grep -Fq '# Managed by v2ray-onekey' "$path" &&
-    grep -Fq 'proxy_set_header Upgrade $http_upgrade;' "$path" &&
-    grep -Fq 'proxy_pass http://127.0.0.1:' "$path" &&
-    grep -Fq 'return 200 "ok' "$path"
+  nginx_config_has_owned_shape "$path" current
 }
 
 validate_managed_destination_ownership() {
