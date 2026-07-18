@@ -92,6 +92,20 @@ assert_fails() {
   [[ "$output" == *"$expected"* ]] || fail "failure did not contain '$expected': $output"
 }
 
+assert_invalid_uri_host() {
+  local address="$1"
+  local formatted=""
+  local link=""
+  if formatted="$(format_uri_host "$address" 2>/dev/null)"; then
+    fail "invalid URI host was accepted"
+  fi
+  [[ -z "$formatted" ]] || fail "invalid URI host produced output: $formatted"
+  if link="$(make_reality_link "$address" 2>&1)"; then
+    fail "REALITY link accepted an invalid address"
+  fi
+  [[ "$link" != *"vless://"* ]] || fail "invalid address produced a VLESS URI: $link"
+}
+
 reset_options
 MODE="reality"
 resolve_default_ports
@@ -243,14 +257,34 @@ test_renderers() {
   WS_PATH="/6f4f5304d2e84dc8"
   ALLOW_BITTORRENT="0"
 
+  printf 'old permissive config\n' >"$temp_dir/config.json"
+  chmod 0644 "$temp_dir/config.json"
+  local old_config_inode
+  old_config_inode="$(stat -c '%i' "$temp_dir/config.json")"
   render_xray_config "$temp_dir/config.json"
+  assert_eq "600" "$(stat -c '%a' "$temp_dir/config.json")" \
+    "replacement config permissions"
+  [[ "$(stat -c '%i' "$temp_dir/config.json")" != "$old_config_inode" ]] ||
+    fail "renderer did not replace the existing config atomically"
   MODE="reality"
   render_xray_config "$temp_dir/reality.json"
+  assert_eq "600" "$(stat -c '%a' "$temp_dir/reality.json")" \
+    "new config permissions"
   MODE="cloudflare"
   render_xray_config "$temp_dir/cloudflare.json"
   MODE="dual"
   ALLOW_BITTORRENT="1"
   render_xray_config "$temp_dir/allow-bittorrent.json"
+
+  mkdir "$temp_dir/failed-render"
+  MODE="reality"
+  REALITY_PORT="invalid"
+  if render_xray_config "$temp_dir/failed-render/config.json" >/dev/null 2>&1; then
+    fail "renderer accepted an invalid port"
+  fi
+  [[ -z "$(find "$temp_dir/failed-render" -mindepth 1 -maxdepth 1 -print -quit)" ]] ||
+    fail "failed renderer left a temporary file behind"
+  REALITY_PORT="443"
 
   python3 - \
     "$temp_dir/config.json" \
@@ -355,11 +389,18 @@ assert [item["tag"] for item in cloudflare_only["inbounds"]] == [
 assert allow_bittorrent["routing"]["rules"] == [private_rule]
 PY
 
-  local reality_link cloudflare_link
+  local reality_link cloudflare_link ipv6_link
   ALLOW_BITTORRENT="0"
+  assert_eq "203.0.113.10" "$(format_uri_host "203.0.113.10")" \
+    "formatted IPv4 host"
+  assert_eq "[2001:db8::1]" "$(format_uri_host "2001:db8::1")" \
+    "formatted IPv6 host"
   reality_link="$(make_reality_link "203.0.113.10")"
+  ipv6_link="$(make_reality_link "2001:db8::1")"
+  [[ "$ipv6_link" == "vless://$REALITY_UUID@[2001:db8::1]:443"* ]] ||
+    fail "bad IPv6 REALITY URI: $ipv6_link"
   cloudflare_link="$(make_cloudflare_link)"
-  python3 - "$reality_link" "$cloudflare_link" <<'PY'
+  python3 - "$reality_link" "$cloudflare_link" "$ipv6_link" <<'PY'
 import sys
 import urllib.parse
 
@@ -388,6 +429,12 @@ assert reality_query["sid"] == "0123456789abcdef"
 assert reality_query["type"] == "tcp"
 assert urllib.parse.unquote(reality.fragment) == "VLESS-REALITY-direct"
 
+ipv6, ipv6_query = parse_link(sys.argv[3])
+assert ipv6.username == "11111111-1111-4111-8111-111111111111"
+assert ipv6.hostname == "2001:db8::1"
+assert ipv6.port == 443
+assert ipv6_query == reality_query
+
 cloudflare, cloudflare_query = parse_link(sys.argv[2])
 assert cloudflare.username == "22222222-2222-4222-8222-222222222222"
 assert cloudflare.hostname == "vpn.example.com"
@@ -402,6 +449,16 @@ assert cloudflare_query["path"] == "/6f4f5304d2e84dc8"
 assert "path=%2F6f4f5304d2e84dc8" in cloudflare.query
 assert urllib.parse.unquote(cloudflare.fragment) == "VLESS-Cloudflare-fallback"
 PY
+
+  local invalid_address
+  for invalid_address in \
+    "vpn.example.com" \
+    "203.0.113.999" \
+    "203.0.113.10 " \
+    "203.0.113.10/path" \
+    $'203.0.113.10\n@example.com'; do
+    assert_invalid_uri_host "$invalid_address"
+  done
 }
 
 test_renderers

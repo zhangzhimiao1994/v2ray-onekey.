@@ -305,9 +305,14 @@ public_ip() {
 
 render_xray_config() {
   local output_path="$1"
-  install -d -m 755 "$(dirname "$output_path")"
+  local output_dir=""
+  local render_status="0"
+  local temp_path=""
+  output_dir="$(dirname "$output_path")"
+  install -d -m 755 "$output_dir"
+  temp_path="$(mktemp "$output_dir/.xray-config.XXXXXX")"
   python3 - \
-    "$output_path" \
+    "$temp_path" \
     "$MODE" \
     "$REALITY_PORT" \
     "$INTERNAL_WS_PORT" \
@@ -317,7 +322,7 @@ render_xray_config() {
     "$REALITY_SHORT_ID" \
     "$REALITY_TARGET" \
     "$WS_PATH" \
-    "$ALLOW_BITTORRENT" <<'PY'
+    "$ALLOW_BITTORRENT" <<'PY' || render_status=$?
 import json
 import sys
 
@@ -431,10 +436,40 @@ with open(output_path, "w", encoding="utf-8") as handle:
     json.dump(config, handle, indent=2)
     handle.write("\n")
 PY
+  if (( render_status != 0 )); then
+    rm -f -- "$temp_path" || true
+    return "$render_status"
+  fi
+  if ! chmod 0600 "$temp_path"; then
+    rm -f -- "$temp_path" || true
+    return 1
+  fi
+  if ! mv -f -- "$temp_path" "$output_path"; then
+    rm -f -- "$temp_path" || true
+    return 1
+  fi
 }
 
 urlencode() {
   python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1"
+}
+
+format_uri_host() {
+  python3 - "$1" <<'PY'
+import ipaddress
+import sys
+
+
+try:
+    address = ipaddress.ip_address(sys.argv[1])
+except ValueError:
+    raise SystemExit(1)
+
+if address.version == 6:
+    print(f"[{address.compressed}]")
+else:
+    print(address.compressed)
+PY
 }
 
 open_firewall_port() {
@@ -511,9 +546,11 @@ restart_v2ray() {
 
 make_reality_link() {
   local address="$1"
+  local uri_host=""
+  uri_host="$(format_uri_host "$address")" || return 1
   local server_name="${REALITY_TARGET%:*}"
   printf 'vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp&headerType=none#%s\n' \
-    "$REALITY_UUID" "$address" "$REALITY_PORT" \
+    "$REALITY_UUID" "$uri_host" "$REALITY_PORT" \
     "$(urlencode "$server_name")" "$(urlencode "$REALITY_PUBLIC_KEY")" \
     "$(urlencode "$REALITY_SHORT_ID")" "$(urlencode "VLESS-REALITY-direct")"
 }
