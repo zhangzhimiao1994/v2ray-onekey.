@@ -104,7 +104,7 @@ sudo bash outputs/v2ray-onekey.sh --mode reality --reality-target www.apple.com:
 6. `cloudflare` 模式需要开放 TCP `80` 和 `443`；`dual` 模式需要开放 TCP `80`、`443` 和 `8443`。使用自定义端口时按实际值配置。REALITY 端口必须保持公网直连，不能限制为仅 Cloudflare 来源。
 7. 双入口模式中，REALITY 默认通过服务器 IP 和 `443` 直连，不能放到 Cloudflare 代理后面；Cloudflare 仅代理域名对应的 WebSocket + TLS 入口。
 
-Let's Encrypt 使用 HTTP-01 验证，因此 TCP `80` 必须能从公网访问。如果域名开启代理后证书签发失败，可先将该 DNS 记录临时切换为 **DNS only**，重新运行脚本；签发成功后再恢复橙色云朵。
+Let's Encrypt 使用 HTTP-01 验证，因此 TCP `80` 必须能从公网访问。证书签发失败时请保持 **Proxied**，检查 DNS 是否已生效、TCP `80` 是否放行，以及 Cloudflare WAF/重定向规则是否拦截 `/.well-known/acme-challenge/`；修正后再运行脚本。安装器会在签发前验证域名仍通过 Cloudflare 代理，因此不要切到 **DNS only** 后直接重跑。
 
 安装器仅在检测到 UFW 或 firewalld 已处于活动状态时，自动放行所选本机端口。云服务商安全组、服务商防火墙及其来源 IP 限制仍需用户自行配置和维护；Cloudflare IP 段可能更新，防火墙规则应始终以官方当前列表为准。
 

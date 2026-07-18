@@ -72,7 +72,7 @@ Cloudflare mode requires the user to create an A or AAAA record for the selected
 
 Cloudflare is a trusted intermediary in this mode because it terminates client TLS and can observe WebSocket metadata and decrypted frames at the edge. The Cloudflare entry is intended as a reachable fallback path; the direct REALITY entry remains the preferred path when end-to-end transport security to the VPS is desired. In dual mode, the direct entry also makes the origin IP public, so Cloudflare is not used to conceal the VPS address.
 
-Let's Encrypt is used for the origin certificate through an HTTP-01 challenge on port 80. If issuance fails while the proxy is enabled, the script leaves the previous service intact and explains that the record can be temporarily changed to DNS-only before retrying. Certificate renewal is handled by the distribution's Certbot timer.
+Let's Encrypt is used for the origin certificate through an HTTP-01 challenge on port 80. If issuance fails, the script leaves the previous service intact and directs the user to keep the hostname proxied while checking DNS propagation, TCP port 80, and Cloudflare WAF or redirect rules for the challenge path. Certificate renewal is handled by the distribution's Certbot timer.
 
 ## Installation Components
 

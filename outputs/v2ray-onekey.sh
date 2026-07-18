@@ -707,6 +707,39 @@ function one_server_block(value) {
   return regex_count(value, "(^|[[:space:]])server[[:space:]]*\\{") == 1
 }
 
+function block_server_name(value,    lines, count, line_number, line, name) {
+  count = split(value, lines, "\n")
+  name = ""
+  for (line_number = 1; line_number <= count; line_number += 1) {
+    line = trim(lines[line_number])
+    if (line ~ /^server_name[[:space:]]+/) {
+      sub(/^server_name[[:space:]]+/, "", line)
+      sub(/;.*/, "", line)
+      line = trim(line)
+      if (name != "" || line == "" || line ~ /[[:space:]]/) return ""
+      name = line
+    }
+  }
+  return name
+}
+
+function legacy_proxy_block(value) {
+  return one_server_block(value) &&
+    block_server_name(value) != "" &&
+    index(value, "proxy_set_header Upgrade") &&
+    index(value, "proxy_pass http://127.0.0.1:") &&
+    index(value, "return 200 \"ok")
+}
+
+function certbot_auxiliary_block(value, marker) {
+  return marker && one_server_block(value) &&
+    block_server_name(value) != "" &&
+    !index(value, "proxy_pass ") &&
+    regex_count(value, "(^|[[:space:]])location[[:space:]]") == 0 &&
+    (index(value, "return 301 https://$host$request_uri;") ||
+      regex_count(value, "return[[:space:]]+404[[:space:]]*;") == 1)
+}
+
 function managed_http_block(value) {
   return one_server_block(value) &&
     regex_count(value, "(^|[[:space:]])listen[[:space:]]") == 2 &&
@@ -749,6 +782,9 @@ function managed_tls_block(value) {
 {
   if ($0 ~ /^[[:space:]]*#[[:space:]]*Managed by v2ray-onekey[[:space:]]*$/) {
     marker_count += 1
+  }
+  if (depth > 0 && tolower($0) ~ /managed by certbot/) {
+    certbot_marker[block_count] = 1
   }
   line = $0 "\n"
   for (position = 1; position <= length(line); position += 1) {
@@ -808,10 +844,22 @@ function managed_tls_block(value) {
 END {
   if (invalid || depth != 0 || quote != "" || trim(outside) != "") exit 1
   if (shape == "legacy") {
-    if (block_count != 1 || !one_server_block(blocks[1])) exit 1
-    if (!index(blocks[1], "proxy_set_header Upgrade") ||
-        !index(blocks[1], "proxy_pass http://127.0.0.1:") ||
-        !index(blocks[1], "return 200 \"ok")) exit 1
+    if (block_count < 1 || block_count > 3) exit 1
+    project_blocks = 0
+    expected_name = ""
+    for (block_number = 1; block_number <= block_count; block_number += 1) {
+      name = block_server_name(blocks[block_number])
+      if (legacy_proxy_block(blocks[block_number])) {
+        project_blocks += 1
+        if (expected_name == "") expected_name = name
+      } else if (!certbot_auxiliary_block(blocks[block_number], certbot_marker[block_number])) {
+        exit 1
+      }
+    }
+    if (project_blocks != 1 || expected_name == "") exit 1
+    for (block_number = 1; block_number <= block_count; block_number += 1) {
+      if (block_server_name(blocks[block_number]) != expected_name) exit 1
+    }
     exit 0
   }
   if (shape == "current") {
@@ -1233,12 +1281,22 @@ def server_blocks(content):
 
 
 def block_is_owned(path, file_content, block):
+    legacy_file = path != current_path and legacy_path.fullmatch(path) is not None
     legacy_owned = (
-        path != current_path
-        and legacy_path.fullmatch(path) is not None
+        legacy_file
         and all(signature in block for signature in legacy_signatures)
     )
-    if legacy_owned:
+    certbot_auxiliary = (
+        legacy_file
+        and "managed by certbot" in block.lower()
+        and server_name.search(block) is not None
+        and "proxy_pass " not in block
+        and (
+            "return 301 https://$host$request_uri;" in block
+            or re.search(r"\breturn\s+404\s*;", block) is not None
+        )
+    )
+    if legacy_owned or certbot_auxiliary:
         return True
     if path != current_path or "# Managed by v2ray-onekey" not in file_content:
         return False
@@ -1451,7 +1509,12 @@ install_packages() {
 }
 
 install_required_packages() {
-  local -a base_packages=(curl ca-certificates openssl python3 coreutils iproute2)
+  local -a base_packages=(curl ca-certificates openssl python3 coreutils)
+  if [[ "$PKG_MANAGER" == "apt" ]]; then
+    base_packages+=(iproute2)
+  else
+    base_packages+=(iproute)
+  fi
   install_packages "${base_packages[@]}"
   if mode_has_cloudflare; then
     install_packages nginx certbot

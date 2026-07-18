@@ -1030,6 +1030,35 @@ NGINX
   nginx() {
     [[ "$1" == '-T' ]] || return 1
     cat <<'NGINX'
+# configuration file /etc/nginx/conf.d/v2ray-vpn.example.com.conf:
+server {
+  listen 80;
+  listen 443 ssl; # managed by Certbot
+  server_name vpn.example.com;
+  proxy_set_header Upgrade $http_upgrade;
+  proxy_pass http://127.0.0.1:31001;
+  return 200 "ok\n";
+}
+server {
+  if ($host = vpn.example.com) {
+    return 301 https://$host$request_uri;
+  } # managed by Certbot
+  listen 80;
+  server_name vpn.example.com;
+  return 404; # managed by Certbot
+}
+NGINX
+  }
+  nginx_has_unmanaged_domain_conflict 80 vpn.example.com &&
+    fail "Certbot redirect block was treated as an unmanaged ACME conflict"
+  legacy_nginx_config_for_port_is_project_owned 80 ||
+    fail "Certbot-modified legacy TCP 80 blocks were not recognized"
+  legacy_nginx_config_for_port_is_project_owned 443 ||
+    fail "Certbot-modified legacy TLS block was not recognized"
+
+  nginx() {
+    [[ "$1" == '-T' ]] || return 1
+    cat <<'NGINX'
 # configuration file /etc/nginx/conf.d/unrelated.conf:
 server {
   listen 80;
@@ -1384,6 +1413,7 @@ EOF
   cat >"$legacy" <<'EOF'
 # legacy comment outside the server block
 server {
+  server_name vpn.example.com;
   proxy_set_header Upgrade $http_upgrade;
   proxy_pass http://127.0.0.1:31001;
   return 200 "ok\n";
@@ -1407,28 +1437,53 @@ test_transaction_backup_and_rollback
 printf 'PASS: transactional backup and rollback tests\n'
 
 test_mixed_legacy_nginx_file_is_never_disabled() (
-  local temp_dir owned mixed malformed owned_disabled
+  local temp_dir owned certbot mixed malformed owned_disabled certbot_disabled
   temp_dir="$(mktemp -d)"
   trap 'rm -rf "$temp_dir"' RETURN
   owned="$temp_dir/v2ray-owned.conf"
+  certbot="$temp_dir/v2ray-certbot.conf"
   mixed="$temp_dir/v2ray-mixed.conf"
   malformed="$temp_dir/v2ray-malformed.conf"
   NGINX_SITE="$temp_dir/v2ray-onekey.conf"
   BACKUP_DIR="$temp_dir/backup"
   RUN_TIMESTAMP="20260719T010000Z"
-  legacy_nginx_config_path() { [[ "$1" == "$owned" || "$1" == "$mixed" || "$1" == "$malformed" ]]; }
-  legacy_nginx_config_paths() { printf '%s\n' "$owned" "$mixed" "$malformed"; }
+  legacy_nginx_config_path() {
+    [[ "$1" == "$owned" || "$1" == "$certbot" || "$1" == "$mixed" || "$1" == "$malformed" ]]
+  }
+  legacy_nginx_config_paths() { printf '%s\n' "$owned" "$certbot" "$mixed" "$malformed"; }
 
   cat >"$owned" <<'EOF'
 # comments outside the only server block are allowed
 server {
+  server_name vpn.example.com;
   proxy_set_header Upgrade $http_upgrade;
   proxy_pass http://127.0.0.1:31001;
   return 200 "ok\n";
 }
 EOF
+  cat >"$certbot" <<'EOF'
+server {
+  listen 80;
+  server_name vpn.example.com;
+  proxy_set_header Upgrade $http_upgrade;
+  proxy_pass http://127.0.0.1:31001;
+  return 200 "ok\n";
+  listen 443 ssl; # managed by Certbot
+  ssl_certificate /etc/letsencrypt/live/vpn.example.com/fullchain.pem; # managed by Certbot
+  ssl_certificate_key /etc/letsencrypt/live/vpn.example.com/privkey.pem; # managed by Certbot
+}
+server {
+  if ($host = vpn.example.com) {
+    return 301 https://$host$request_uri;
+  } # managed by Certbot
+  listen 80;
+  server_name vpn.example.com;
+  return 404; # managed by Certbot
+}
+EOF
   cat >"$mixed" <<'EOF'
 server {
+  server_name vpn.example.com;
   proxy_set_header Upgrade $http_upgrade;
   proxy_pass http://127.0.0.1:31001;
   return 200 "ok\n";
@@ -1440,6 +1495,7 @@ server {
 EOF
   cat >"$malformed" <<'EOF'
 server {
+  server_name vpn.example.com;
   proxy_set_header Upgrade $http_upgrade;
   proxy_pass http://127.0.0.1:31001;
   return 200 "ok\n";
@@ -1448,6 +1504,8 @@ EOF
   python3() { return 127; }
   legacy_nginx_config_is_project_owned "$owned" ||
     fail "valid legacy Nginx file required python3 for ownership classification"
+  legacy_nginx_config_is_project_owned "$certbot" ||
+    fail "Certbot-modified legacy Nginx file was not recognized"
   legacy_nginx_config_is_project_owned "$mixed" &&
     fail "mixed legacy Nginx file was accepted without python3"
   legacy_nginx_config_is_project_owned "$malformed" &&
@@ -1456,14 +1514,18 @@ EOF
   init_backup_metadata
   collect_owned_legacy_nginx_files
   grep -Fqx "$owned" "$BACKUP_DIR/legacy-files" || fail "owned legacy Nginx file was not collected"
+  grep -Fqx "$certbot" "$BACKUP_DIR/legacy-files" || fail "Certbot legacy Nginx file was not collected"
   grep -Fqx "$mixed" "$BACKUP_DIR/legacy-files" && fail "mixed legacy Nginx file was collected"
   grep -Fqx "$malformed" "$BACKUP_DIR/legacy-files" && fail "malformed legacy Nginx file was collected"
   [[ -f "$BACKUP_DIR$owned" ]] || fail "owned legacy Nginx file was not backed up"
+  [[ -f "$BACKUP_DIR$certbot" ]] || fail "Certbot legacy Nginx file was not backed up"
   [[ ! -e "$BACKUP_DIR$mixed" ]] || fail "mixed legacy Nginx file was backed up"
 
   disable_owned_legacy_nginx_files
   owned_disabled="${owned}.v2ray-onekey-disabled-${RUN_TIMESTAMP}"
+  certbot_disabled="${certbot}.v2ray-onekey-disabled-${RUN_TIMESTAMP}"
   [[ -f "$owned_disabled" && ! -e "$owned" ]] || fail "owned legacy Nginx file was not disabled"
+  [[ -f "$certbot_disabled" && ! -e "$certbot" ]] || fail "Certbot legacy Nginx file was not disabled"
   [[ -f "$mixed" ]] || fail "mixed legacy Nginx file was renamed or disabled"
   if grep -Fq "$mixed" "$BACKUP_DIR/legacy-renames"; then
     fail "mixed legacy Nginx rename was recorded"
@@ -1658,12 +1720,20 @@ test_packages_permissions_and_firewall() (
   }
   reset_options
   MODE="reality"
+  PKG_MANAGER="apt"
   install_required_packages
   grep -Fq 'curl ca-certificates openssl python3 coreutils iproute2' "$package_log" ||
-    fail "base package set is incomplete"
+    fail "APT base package set is incomplete"
   grep -Eq 'nginx|certbot' "$package_log" && fail "reality-only installed Cloudflare packages"
   : >"$package_log"
+  PKG_MANAGER="dnf"
+  install_required_packages
+  grep -Fq 'curl ca-certificates openssl python3 coreutils iproute' "$package_log" ||
+    fail "RPM base package set does not include iproute"
+  grep -Fq 'iproute2' "$package_log" && fail "RPM package set incorrectly uses iproute2"
+  : >"$package_log"
   MODE="cloudflare"
+  PKG_MANAGER="apt"
   install_required_packages
   grep -Fq 'nginx certbot' "$package_log" || fail "Cloudflare packages missing"
   grep -Fq 'python3-certbot-nginx' "$package_log" || fail "optional Certbot Nginx package not attempted"
