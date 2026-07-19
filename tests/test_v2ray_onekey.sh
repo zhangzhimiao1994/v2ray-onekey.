@@ -730,6 +730,15 @@ EOF
   read_x25519_keypair
   assert_eq "private-from-public-label" "$REALITY_PRIVATE_KEY" "parsed Private key label"
   assert_eq "public-fallback" "$REALITY_PUBLIC_KEY" "parsed Public key fallback"
+  xray() {
+    printf '%s\n' \
+      'PrivateKey: private-from-current-xray' \
+      'Password (PublicKey): public-from-current-xray' \
+      'Hash32: ignored-current-xray-hash'
+  }
+  read_x25519_keypair
+  assert_eq "private-from-current-xray" "$REALITY_PRIVATE_KEY" "parsed current Xray private key label"
+  assert_eq "public-from-current-xray" "$REALITY_PUBLIC_KEY" "parsed current Xray Password (PublicKey) label"
   xray() { printf '%s\n' 'unparseable output'; }
   assert_fails "Unable to parse" read_x25519_keypair
   PATH="$old_path"
@@ -1675,6 +1684,27 @@ test_prepare_configuration_reuse_and_rotate() (
 
 test_prepare_configuration_reuse_and_rotate
 printf 'PASS: state reuse and rotation tests\n'
+
+test_interactive_dual_mode_collects_domain_and_email() (
+  local temp_dir
+  temp_dir="$(mktemp -d)"
+  trap 'rm -rf "$temp_dir"' RETURN
+  STATE_FILE="$temp_dir/missing-state.env"
+  stdin_is_tty() { return 0; }
+
+  reset_options
+  parse_args
+  prepare_configuration <<< $'3\nVPN.Example.COM\nadmin@example.com\n'
+
+  assert_eq "dual" "$MODE" "interactive mode selection"
+  assert_eq "vpn.example.com" "$DOMAIN" "interactive Cloudflare domain"
+  assert_eq "admin@example.com" "$EMAIL" "interactive certificate email"
+  assert_eq "443" "$REALITY_PORT" "interactive REALITY default port"
+  assert_eq "8443" "$CLOUDFLARE_PORT" "interactive Cloudflare default port"
+)
+
+test_interactive_dual_mode_collects_domain_and_email
+printf 'PASS: interactive Cloudflare identity tests\n'
 
 test_port_resolution() (
   reset_options

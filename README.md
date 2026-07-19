@@ -37,6 +37,8 @@ cd 'v2ray-onekey.'
 sudo bash outputs/v2ray-onekey.sh
 ```
 
+选择 `2) Cloudflare only` 或 `3) Dual entry` 后，脚本会继续询问已开启 Cloudflare 代理的完整域名（例如 `vpn.example.com`）和 Let's Encrypt 证书通知邮箱。选择 `1) Direct only` 不需要域名。
+
 只安装无域名的 REALITY 入口：
 
 ```bash

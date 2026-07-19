@@ -148,6 +148,17 @@ choose_mode() {
   esac
 }
 
+prompt_cloudflare_identity() {
+  if [[ -z "$DOMAIN" ]]; then
+    read -r -p "Cloudflare domain (for example vpn.example.com): " DOMAIN ||
+      die "Unable to read Cloudflare domain"
+  fi
+  if [[ -z "$EMAIL" ]]; then
+    read -r -p "Email for Let's Encrypt certificate notices: " EMAIL ||
+      die "Unable to read certificate email"
+  fi
+}
+
 usage() {
   cat <<'USAGE'
 Usage:
@@ -251,7 +262,7 @@ parse_args() {
 select_mode() {
   [[ -n "$MODE" ]] && return 0
 
-  if [[ -t 0 ]]; then
+  if stdin_is_tty; then
     choose_mode
   else
     die "--mode is required for non-interactive use. Example: sudo bash v2ray-onekey.sh --mode dual --domain vpn.example.com --email admin@example.com"
@@ -427,8 +438,8 @@ load_state() {
 read_x25519_keypair() {
   local output private_key public_key
   output="$(xray x25519)" || die "Unable to generate REALITY x25519 key pair"
-  private_key="$(awk -F: '/^Private key:/{sub(/^[[:space:]]*/, "", $2); print $2; exit}' <<<"$output")"
-  public_key="$(awk -F: '/^Password:/{sub(/^[[:space:]]*/, "", $2); print $2; exit}' <<<"$output")"
+  private_key="$(awk -F: '/^Private( key|Key):/{sub(/^[[:space:]]*/, "", $2); print $2; exit}' <<<"$output")"
+  public_key="$(awk -F: '/^Password( \(PublicKey\))?:/{sub(/^[[:space:]]*/, "", $2); print $2; exit}' <<<"$output")"
   [[ -n "$public_key" ]] ||
     public_key="$(awk -F: '/^Public key:/{sub(/^[[:space:]]*/, "", $2); print $2; exit}' <<<"$output")"
   [[ -n "$private_key" && -n "$public_key" ]] || die "Unable to parse xray x25519 output"
@@ -501,6 +512,10 @@ prepare_configuration() {
     fi
   else
     select_mode
+  fi
+
+  if mode_needs_domain && stdin_is_tty; then
+    prompt_cloudflare_identity
   fi
 
   validate_options
