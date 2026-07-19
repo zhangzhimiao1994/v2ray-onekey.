@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+INSTALLER_VARIANT="new"
 
 APP_NAME="v2ray-onekey"
 XRAY_CONFIG="${XRAY_CONFIG:-/usr/local/etc/xray/config.json}"

@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SCRIPT="$ROOT_DIR/outputs/v2ray-onekey.sh"
+SCRIPT="$ROOT_DIR/outputs/v2ray-onekey-new.sh"
 
 fail() {
   printf 'FAIL: %s\n' "$*" >&2
@@ -74,7 +74,7 @@ BASH
 printf '%s\n' "$source_only_output"
 
 export V2RAY_ONEKEY_SOURCE_ONLY=1
-# shellcheck source=../outputs/v2ray-onekey.sh
+# shellcheck source=../outputs/v2ray-onekey-new.sh
 source "$SCRIPT"
 
 assert_eq() {
