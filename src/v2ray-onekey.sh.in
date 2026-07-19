@@ -21,7 +21,19 @@ log() { printf '\033[1;32m[%s]\033[0m %s\n' "$APP_NAME" "$*"; }
 warn() { printf '\033[1;33m[%s]\033[0m %s\n' "$APP_NAME" "$*"; }
 die() { printf '\033[1;31m[%s]\033[0m %s\n' "$APP_NAME" "$*" >&2; exit 1; }
 
+SENSITIVE_RUNTIME_VARS=(
+  CLOUDFLARE_UUID WS_PATH HY2_AUTH HY2_OBFS_PASSWORD HY2_SNI HY2_CERT_PIN SS_KEY
+)
+
+unexport_sensitive_runtime_values() {
+  local name
+  for name in "${SENSITIVE_RUNTIME_VARS[@]}"; do
+    export -n "$name" 2>/dev/null || true
+  done
+}
+
 reset_options() {
+  unexport_sensitive_runtime_values
   STATE_SCHEMA=""
   MODE=""
   DOMAIN=""
@@ -149,6 +161,7 @@ resolve_default_ports() {
       WS_PATH=""
       HY2_PORT_RANGE="${HY2_PORT_RANGE:-20000-20100}"
       SS_PORT="${SS_PORT:-8388}"
+      SS_METHOD="${SS_METHOD:-2022-blake3-aes-128-gcm}"
       ;;
     cloudflare)
       CLOUDFLARE_PORT="${CLOUDFLARE_PORT:-443}"
@@ -166,6 +179,7 @@ resolve_default_ports() {
       CLOUDFLARE_PORT="${CLOUDFLARE_PORT:-443}"
       HY2_PORT_RANGE="${HY2_PORT_RANGE:-20000-20100}"
       SS_PORT="${SS_PORT:-8388}"
+      SS_METHOD="${SS_METHOD:-2022-blake3-aes-128-gcm}"
       ;;
     *) die "Mode must be direct, cloudflare, or full" ;;
   esac
@@ -461,6 +475,19 @@ while index < len(value):
 '
 }
 
+valid_ss_key() {
+  local key="${1:-}" decoded_size canonical
+  [[ "$key" =~ ^[A-Za-z0-9+/]{22}==$ ]] || return 1
+  decoded_size="$(printf '%s' "$key" | openssl base64 -d -A 2>/dev/null | wc -c | tr -d '[:space:]')" || return 1
+  [[ "$decoded_size" == "16" ]] || return 1
+  canonical="$(printf '%s' "$key" | openssl base64 -d -A 2>/dev/null | openssl base64 -A 2>/dev/null)" || return 1
+  [[ "$canonical" == "$key" ]]
+}
+
+generate_ss_key() {
+  openssl rand -base64 16 | tr -d '\r\n'
+}
+
 validate_loaded_runtime_values() {
   if mode_has_cloudflare; then
     valid_uuid "$CLOUDFLARE_UUID" || die "Invalid Cloudflare UUID in state"
@@ -477,7 +504,11 @@ validate_loaded_runtime_values() {
     [[ -z "$HY2_AUTH$HY2_OBFS_PASSWORD$HY2_SNI$HY2_CERT_PIN" ]] ||
       die "Inactive Hysteria2 state must not contain credentials"
   fi
-  if ! mode_has_shadowsocks; then
+  if mode_has_shadowsocks; then
+    [[ "$SS_METHOD" == "2022-blake3-aes-128-gcm" ]] ||
+      die "Invalid Shadowsocks method in state"
+    valid_ss_key "$SS_KEY" || die "Invalid Shadowsocks key in state"
+  else
     [[ -z "$SS_METHOD$SS_KEY" ]] ||
       die "Inactive Shadowsocks state must not contain settings or credentials"
   fi
@@ -489,6 +520,7 @@ valid_ws_path() {
 
 save_state() (
   local state_dir state_name temp_state key
+  unexport_sensitive_runtime_values
   STATE_SCHEMA="2"
   state_dir="$(dirname "$STATE_FILE")"
   state_name="$(basename "$STATE_FILE")"
@@ -506,6 +538,7 @@ save_state() (
 load_state() {
   local owner mode line key value loaded_schema="1"
   local -A seen=()
+  unexport_sensitive_runtime_values
   [[ -f "$STATE_FILE" ]] || die "State file does not exist: $STATE_FILE"
   owner="$(stat -c '%u' "$STATE_FILE")" || die "Unable to inspect state file: $STATE_FILE"
   mode="$(stat -c '%a' "$STATE_FILE")" || die "Unable to inspect state file: $STATE_FILE"
@@ -583,6 +616,10 @@ load_state() {
     SS_KEY=""
     SERVER_ADDRESS=""
     ALLOW_MAIL="0"
+    if mode_has_shadowsocks; then
+      SS_METHOD="2022-blake3-aes-128-gcm"
+      SS_KEY="$(generate_ss_key)"
+    fi
   else
     # The allowlist and shell-escape parser above make these assignments inert data.
     # shellcheck disable=SC1090
@@ -607,14 +644,21 @@ random_internal_ws_port() {
 }
 
 generate_runtime_values() {
+  unexport_sensitive_runtime_values
   if mode_has_cloudflare; then
     [[ -n "$CLOUDFLARE_UUID" ]] || CLOUDFLARE_UUID="$(xray uuid)"
     [[ -n "$INTERNAL_WS_PORT" ]] || INTERNAL_WS_PORT="$(random_internal_ws_port)"
     [[ -n "$WS_PATH" ]] || WS_PATH="/$(openssl rand -hex 12)"
   fi
+  if mode_has_shadowsocks; then
+    SS_METHOD="${SS_METHOD:-2022-blake3-aes-128-gcm}"
+    [[ -n "$SS_KEY" ]] || SS_KEY="$(generate_ss_key)"
+    valid_ss_key "$SS_KEY" || die "Unable to generate a valid Shadowsocks key"
+  fi
 }
 
 rotate_runtime_values() {
+  unexport_sensitive_runtime_values
   CLOUDFLARE_UUID=""
   INTERNAL_WS_PORT=""
   WS_PATH=""
@@ -1705,28 +1749,33 @@ render_xray_config() {
   local output_dir=""
   local render_status="0"
   local temp_path=""
+  unexport_sensitive_runtime_values
   output_dir="$(dirname "$output_path")"
   install -d -m 755 "$output_dir"
   temp_path="$(mktemp "$output_dir/.xray-config.XXXXXX")"
-  python3 - \
-    "$temp_path" \
-    "$MODE" \
-    "$INTERNAL_WS_PORT" \
-    "$CLOUDFLARE_UUID" \
-    "$WS_PATH" \
-    "$ALLOW_BITTORRENT" <<'PY' || render_status=$?
+  printf '%s\0%s\0%s\0%s\0%s\0%s\0%s\0%s\0' \
+    "$MODE" "$INTERNAL_WS_PORT" "$CLOUDFLARE_UUID" "$WS_PATH" \
+    "$ALLOW_BITTORRENT" "$SS_PORT" "$SS_METHOD" "$SS_KEY" |
+    python3 - "$temp_path" 3<&0 <<'PY' || render_status=$?
 import json
+import os
 import sys
 
 
+records = os.fdopen(3, "rb").read().decode("utf-8").split("\0")
+if records[-1] != "" or len(records) != 9:
+    raise SystemExit("invalid renderer input")
 (
-    output_path,
     mode,
     internal_ws_port,
     cloudflare_uuid,
     ws_path,
     allow_bittorrent,
-) = sys.argv[1:]
+    ss_port,
+    ss_method,
+    ss_key,
+) = records[:-1]
+output_path = sys.argv[1]
 
 sniffing = {
     "enabled": True,
@@ -1750,6 +1799,22 @@ if mode in ("cloudflare", "full"):
                 "network": "ws",
                 "security": "none",
                 "wsSettings": {"path": ws_path},
+            },
+            "sniffing": sniffing,
+        }
+    )
+
+if mode in ("direct", "full"):
+    inbounds.append(
+        {
+            "tag": "shadowsocks-2022-in",
+            "listen": "0.0.0.0",
+            "port": int(ss_port),
+            "protocol": "shadowsocks",
+            "settings": {
+                "method": ss_method,
+                "password": ss_key,
+                "network": "tcp,udp",
             },
             "sniffing": sniffing,
         }
@@ -1800,6 +1865,13 @@ PY
 
 urlencode() {
   python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1"
+}
+
+format_uri_host() {
+  case "$1" in
+    *:*) printf '[%s]\n' "$1" ;;
+    *) printf '%s\n' "$1" ;;
+  esac
 }
 
 open_firewall_port() {
@@ -2194,10 +2266,19 @@ complete_transaction() {
 }
 
 make_cloudflare_link() {
+  unexport_sensitive_runtime_values
   printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=chrome&type=ws&host=%s&path=%s#%s\n' \
     "$CLOUDFLARE_UUID" "$DOMAIN" "$CLOUDFLARE_PORT" \
     "$(urlencode "$DOMAIN")" "$(urlencode "$DOMAIN")" \
     "$(urlencode "$WS_PATH")" "$(urlencode "VLESS-Cloudflare-fallback")"
+}
+
+make_shadowsocks_link() {
+  local authority
+  unexport_sensitive_runtime_values
+  authority="$(printf '%s' "$SS_METHOD:$SS_KEY" | openssl base64 -A | tr '+/' '-_' | tr -d '=')"
+  printf 'ss://%s@%s:%s#%s\n' "$authority" "$(format_uri_host "$SERVER_ADDRESS")" \
+    "$SS_PORT" "$(urlencode 'Shadowsocks-2022-direct')"
 }
 
 main() {

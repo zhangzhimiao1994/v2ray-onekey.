@@ -95,6 +95,7 @@ assert_fails() {
 }
 
 expected_state_keys="STATE_SCHEMA MODE DOMAIN EMAIL CLOUDFLARE_PORT INTERNAL_WS_PORT CLOUDFLARE_UUID WS_PATH HY2_PORT_RANGE HY2_AUTH HY2_OBFS_PASSWORD HY2_SNI HY2_CERT_PIN SS_PORT SS_METHOD SS_KEY SERVER_ADDRESS ALLOW_BITTORRENT ALLOW_MAIL"
+SS_TEST_KEY="MDEyMzQ1Njc4OWFiY2RlZg=="
 assert_state_keys() {
   local actual
   actual="$(printf '%s ' "${STATE_KEYS[@]}")"
@@ -109,6 +110,7 @@ resolve_default_ports
 assert_eq "" "$CLOUDFLARE_PORT" "direct Cloudflare port"
 assert_eq "20000-20100" "$HY2_PORT_RANGE" "direct Hysteria2 port range"
 assert_eq "8388" "$SS_PORT" "direct Shadowsocks port"
+assert_eq "2022-blake3-aes-128-gcm" "$SS_METHOD" "direct Shadowsocks method"
 mode_needs_domain && fail "direct mode must not require a domain"
 mode_has_cloudflare && fail "direct mode must not include Cloudflare"
 mode_has_hysteria || fail "direct mode must include Hysteria2"
@@ -120,6 +122,7 @@ resolve_default_ports
 assert_eq "443" "$CLOUDFLARE_PORT" "cloudflare port"
 assert_eq "" "$HY2_PORT_RANGE" "cloudflare Hysteria2 range"
 assert_eq "" "$SS_PORT" "cloudflare Shadowsocks port"
+assert_eq "" "$SS_METHOD" "cloudflare Shadowsocks method"
 mode_needs_domain || fail "cloudflare mode must require a domain"
 mode_has_cloudflare || fail "cloudflare mode must include Cloudflare"
 mode_has_hysteria && fail "cloudflare mode must not include Hysteria2"
@@ -131,6 +134,7 @@ resolve_default_ports
 assert_eq "443" "$CLOUDFLARE_PORT" "full Cloudflare port"
 assert_eq "20000-20100" "$HY2_PORT_RANGE" "full Hysteria2 port range"
 assert_eq "8388" "$SS_PORT" "full Shadowsocks port"
+assert_eq "2022-blake3-aes-128-gcm" "$SS_METHOD" "full Shadowsocks method"
 mode_needs_domain || fail "full mode must require a domain"
 mode_has_cloudflare || fail "full mode must include Cloudflare"
 mode_has_hysteria || fail "full mode must include Hysteria2"
@@ -333,8 +337,89 @@ assert_fails "Invalid Cloudflare UUID" validate_values cloudflare vpn.example.co
 assert_fails "WebSocket path" validate_values cloudflare vpn.example.com admin@example.com "" "" "" "" "" private
 assert_fails "WebSocket path" validate_values cloudflare vpn.example.com admin@example.com "" "" "" "" "" '/invalid;path'
 
-test_renderers() (
+test_shadowsocks_key_validation() (
+  valid_ss_key "$SS_TEST_KEY" || fail "valid 16-byte Shadowsocks key rejected"
+  valid_ss_key "MDEyMzQ1Njc4OWFiY2RlZh==" && fail "non-canonical Shadowsocks key accepted"
+  valid_ss_key "MDEyMzQ1Njc4OWFiY2Rl" && fail "15-byte Shadowsocks key accepted"
+  valid_ss_key "not-base64" && fail "malformed Shadowsocks key accepted"
+
+  reset_options
+  MODE="direct"
+  SS_METHOD="aes-256-gcm"
+  SS_KEY="$SS_TEST_KEY"
+  assert_fails "Invalid Shadowsocks method in state" validate_loaded_runtime_values
+
+  SS_METHOD="2022-blake3-aes-128-gcm"
+  SS_KEY="MDEyMzQ1Njc4OWFiY2RlZh=="
+  assert_fails "Invalid Shadowsocks key in state" validate_loaded_runtime_values
+)
+
+test_shadowsocks_key_validation
+
+assert_sensitive_runtime_not_exported() {
+  bash -c '[[ -z ${SS_KEY+x} && -z ${HY2_AUTH+x} && -z ${HY2_OBFS_PASSWORD+x} && -z ${HY2_SNI+x} && -z ${HY2_CERT_PIN+x} && -z ${CLOUDFLARE_UUID+x} && -z ${WS_PATH+x} ]]' ||
+    fail "sensitive runtime value was inherited by a child process"
+}
+
+test_sensitive_runtime_exports() (
   local temp_dir
+  temp_dir="$(mktemp -d)"
+  trap 'rm -rf "$temp_dir"' RETURN
+
+  export SS_KEY="sentinel-ss"
+  export HY2_AUTH="sentinel-hy2-auth"
+  export HY2_OBFS_PASSWORD="sentinel-hy2-obfs"
+  export HY2_SNI="sentinel-hy2-sni"
+  export HY2_CERT_PIN="sentinel-hy2-pin"
+  export CLOUDFLARE_UUID="sentinel-cf-uuid"
+  export WS_PATH="sentinel-ws-path"
+  reset_options
+  assert_sensitive_runtime_not_exported
+
+  MODE="direct"
+  resolve_default_ports
+  export SS_KEY=""
+  generate_runtime_values
+  valid_ss_key "$SS_KEY" || fail "generate path did not create a valid Shadowsocks key"
+  assert_sensitive_runtime_not_exported
+
+  STATE_FILE="$temp_dir/state.env"
+  MODE="full"
+  DOMAIN="vpn.example.com"
+  EMAIL="admin@example.com"
+  CLOUDFLARE_PORT="443"
+  INTERNAL_WS_PORT="31001"
+  CLOUDFLARE_UUID="22222222-2222-4222-8222-222222222222"
+  WS_PATH="/loaded-path"
+  HY2_PORT_RANGE="20000-20100"
+  HY2_AUTH="loaded-hy2-auth"
+  HY2_OBFS_PASSWORD="loaded-hy2-obfs"
+  HY2_SNI="loaded.example.com"
+  HY2_CERT_PIN="loaded-pin"
+  SS_PORT="8388"
+  SS_METHOD="2022-blake3-aes-128-gcm"
+  SS_KEY="$SS_TEST_KEY"
+  SERVER_ADDRESS="edge.example.com"
+  save_state
+
+  export SS_KEY="sentinel-ss"
+  export HY2_AUTH="sentinel-hy2-auth"
+  export HY2_OBFS_PASSWORD="sentinel-hy2-obfs"
+  export HY2_SNI="sentinel-hy2-sni"
+  export HY2_CERT_PIN="sentinel-hy2-pin"
+  export CLOUDFLARE_UUID="sentinel-cf-uuid"
+  export WS_PATH="sentinel-ws-path"
+  load_state
+  assert_eq "$SS_TEST_KEY" "$SS_KEY" "loaded Shadowsocks key after export cleanup"
+  assert_eq "loaded-hy2-auth" "$HY2_AUTH" "loaded Hysteria2 auth after export cleanup"
+  assert_eq "22222222-2222-4222-8222-222222222222" "$CLOUDFLARE_UUID" "loaded UUID after export cleanup"
+  assert_sensitive_runtime_not_exported
+)
+
+test_sensitive_runtime_exports
+
+test_renderers() (
+  local temp_dir old_path real_python
   temp_dir="$(mktemp -d)"
   trap 'rm -rf "$temp_dir"' RETURN
 
@@ -345,7 +430,35 @@ test_renderers() (
   INTERNAL_WS_PORT="31001"
   CLOUDFLARE_UUID="22222222-2222-4222-8222-222222222222"
   WS_PATH="/6f4f5304d2e84dc8"
+  SS_PORT="8388"
+  SS_METHOD="2022-blake3-aes-128-gcm"
+  SS_KEY="$SS_TEST_KEY"
+  SERVER_ADDRESS="vpn.example.net"
   ALLOW_BITTORRENT="0"
+
+  real_python="$(command -v python3)"
+  old_path="$PATH"
+  install -d "$temp_dir/bin"
+  cat >"$temp_dir/bin/python3" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\0' "$@" >>"$PYTHON_ARGV_LOG"
+[[ -z ${SS_KEY+x} ]] || printf 'SS_KEY\n' >>"$PYTHON_ENV_LOG"
+[[ -z ${HY2_AUTH+x} ]] || printf 'HY2_AUTH\n' >>"$PYTHON_ENV_LOG"
+[[ -z ${HY2_OBFS_PASSWORD+x} ]] || printf 'HY2_OBFS_PASSWORD\n' >>"$PYTHON_ENV_LOG"
+[[ -z ${HY2_SNI+x} ]] || printf 'HY2_SNI\n' >>"$PYTHON_ENV_LOG"
+[[ -z ${HY2_CERT_PIN+x} ]] || printf 'HY2_CERT_PIN\n' >>"$PYTHON_ENV_LOG"
+[[ -z ${CLOUDFLARE_UUID+x} ]] || printf 'CLOUDFLARE_UUID\n' >>"$PYTHON_ENV_LOG"
+[[ -z ${WS_PATH+x} ]] || printf 'WS_PATH\n' >>"$PYTHON_ENV_LOG"
+exec "$REAL_PYTHON" "$@"
+EOF
+  chmod +x "$temp_dir/bin/python3"
+  : >"$temp_dir/python-argv.log"
+  : >"$temp_dir/python-env.log"
+  export PYTHON_ARGV_LOG="$temp_dir/python-argv.log"
+  export PYTHON_ENV_LOG="$temp_dir/python-env.log"
+  export REAL_PYTHON="$real_python"
+  PATH="$temp_dir/bin:$PATH"
+  export SS_KEY HY2_AUTH HY2_OBFS_PASSWORD HY2_SNI HY2_CERT_PIN CLOUDFLARE_UUID WS_PATH
 
   printf 'old permissive config\n' >"$temp_dir/config.json"
   chmod 0644 "$temp_dir/config.json"
@@ -376,6 +489,17 @@ test_renderers() (
     fail "failed renderer left a temporary file behind"
   INTERNAL_WS_PORT="31001"
 
+  PATH="$old_path"
+  unset PYTHON_ARGV_LOG PYTHON_ENV_LOG REAL_PYTHON
+  if grep -aFq "$SS_TEST_KEY" "$temp_dir/python-argv.log"; then
+    fail "Shadowsocks key was exposed in Python argv"
+  fi
+  if grep -aFq "2022-blake3-aes-128-gcm:$SS_TEST_KEY" "$temp_dir/python-argv.log"; then
+    fail "Shadowsocks authority was exposed in Python argv"
+  fi
+  [[ ! -s "$temp_dir/python-env.log" ]] ||
+    fail "renderer child inherited sensitive variables: $(paste -sd, "$temp_dir/python-env.log")"
+
   python3 - \
     "$temp_dir/config.json" \
     "$temp_dir/direct.json" \
@@ -392,7 +516,10 @@ def load(path):
 
 full, direct_only, cloudflare_only, allow_bittorrent = map(load, sys.argv[1:])
 assert full["log"] == {"loglevel": "warning"}
-assert [item["tag"] for item in full["inbounds"]] == ["cloudflare-ws-in"]
+assert [item["tag"] for item in full["inbounds"]] == [
+    "cloudflare-ws-in",
+    "shadowsocks-2022-in",
+]
 
 cloudflare = full["inbounds"][0]
 assert cloudflare["listen"] == "127.0.0.1"
@@ -418,6 +545,19 @@ sniffing = {
     "routeOnly": True,
 }
 assert cloudflare["sniffing"] == sniffing
+shadowsocks = full["inbounds"][1]
+assert shadowsocks == {
+    "tag": "shadowsocks-2022-in",
+    "listen": "0.0.0.0",
+    "port": 8388,
+    "protocol": "shadowsocks",
+    "settings": {
+        "method": "2022-blake3-aes-128-gcm",
+        "password": "MDEyMzQ1Njc4OWFiY2RlZg==",
+        "network": "tcp,udp",
+    },
+    "sniffing": sniffing,
+}
 assert full["outbounds"] == [
     {"tag": "direct", "protocol": "freedom"},
     {"tag": "block", "protocol": "blackhole"},
@@ -437,11 +577,13 @@ assert full["routing"] == {
     "rules": [private_rule, bittorrent_rule],
 }
 assert all(item["protocol"] != "vmess" for item in full["inbounds"])
-assert direct_only["inbounds"] == []
+assert direct_only["inbounds"] == [shadowsocks]
 assert [item["tag"] for item in cloudflare_only["inbounds"]] == [
     "cloudflare-ws-in"
 ]
 assert allow_bittorrent["routing"]["rules"] == [private_rule]
+assert all(item["tag"] != "reality-in" for item in full["inbounds"])
+assert all(item["tag"] != "reality-in" for item in direct_only["inbounds"])
 PY
 
   local cloudflare_link
@@ -477,6 +619,41 @@ assert "path=%2F6f4f5304d2e84dc8" in cloudflare.query
 assert urllib.parse.unquote(cloudflare.fragment) == "VLESS-Cloudflare-fallback"
 PY
 
+  local ss_ipv4 ss_ipv6 ss_hostname
+  MODE="direct"
+  SS_PORT="8388"
+  SS_METHOD="2022-blake3-aes-128-gcm"
+  SS_KEY="$SS_TEST_KEY"
+  SERVER_ADDRESS="192.0.2.10"
+  ss_ipv4="$(make_shadowsocks_link)"
+  SERVER_ADDRESS="2001:db8::10"
+  ss_ipv6="$(make_shadowsocks_link)"
+  SERVER_ADDRESS="vpn.example.net"
+  ss_hostname="$(make_shadowsocks_link)"
+
+  printf '%s\0%s\0%s\0' "$ss_ipv4" "$ss_ipv6" "$ss_hostname" |
+    python3 - 3<&0 <<'PY'
+import base64
+import os
+import urllib.parse
+
+
+links = os.fdopen(3, "rb").read().decode("utf-8").split("\0")[:-1]
+expected_hosts = ["192.0.2.10", "2001:db8::10", "vpn.example.net"]
+for link, expected_host in zip(links, expected_hosts):
+    parsed = urllib.parse.urlsplit(link)
+    assert parsed.scheme == "ss"
+    assert parsed.hostname == expected_host
+    assert parsed.port == 8388
+    assert parsed.password is None
+    assert parsed.username is not None and "=" not in parsed.username
+    padding = "=" * ((4 - len(parsed.username) % 4) % 4)
+    authority = base64.urlsafe_b64decode(parsed.username + padding).decode("utf-8")
+    assert authority == "2022-blake3-aes-128-gcm:MDEyMzQ1Njc4OWFiY2RlZg=="
+    assert urllib.parse.unquote(parsed.fragment) == "Shadowsocks-2022-direct"
+assert "@[2001:db8::10]:8388" in links[1]
+PY
+
 )
 
 test_renderers
@@ -503,7 +680,7 @@ test_state_round_trip() (
   HY2_CERT_PIN="sha256:cert-pin"
   SS_PORT="8388"
   SS_METHOD="2022-blake3-aes-128-gcm"
-  SS_KEY="ss-key"
+  SS_KEY="$SS_TEST_KEY"
   SERVER_ADDRESS="edge.example.com"
   ALLOW_BITTORRENT="1"
   ALLOW_MAIL="1"
@@ -548,7 +725,7 @@ EOF
   assert_eq "sha256:cert-pin" "$HY2_CERT_PIN" "loaded Hysteria2 certificate pin"
   assert_eq "8388" "$SS_PORT" "loaded Shadowsocks port"
   assert_eq "2022-blake3-aes-128-gcm" "$SS_METHOD" "loaded Shadowsocks method"
-  assert_eq "ss-key" "$SS_KEY" "loaded Shadowsocks key"
+  assert_eq "$SS_TEST_KEY" "$SS_KEY" "loaded Shadowsocks key"
   assert_eq "edge.example.com" "$SERVER_ADDRESS" "loaded server address"
   assert_eq "1" "$ALLOW_BITTORRENT" "loaded BitTorrent setting"
   assert_eq "1" "$ALLOW_MAIL" "loaded mail setting"
@@ -558,7 +735,7 @@ EOF
     /state-path \
     hy2-auth \
     hy2-obfs \
-    ss-key; do
+    "$SS_TEST_KEY"; do
     if grep -aFq "$secret" "$temp_dir/python-argv.log"; then
       fail "state secret was exposed in Python argv: $secret"
     fi
@@ -708,6 +885,13 @@ EOF
   cat >"$temp_dir/openssl" <<'EOF'
 #!/usr/bin/env bash
 [[ "$1 $2 $3" == 'rand -hex 12' ]] && { printf '0123456789abcdef01234567\n'; exit; }
+[[ "$1 $2 $3" == 'rand -base64 16' ]] && { printf 'YWJjZGVmZ2hpamtsbW5vcA==\n'; exit; }
+if [[ "$1 $2" == 'base64 -d' && "${3:-}" == '-A' ]]; then
+  exec /usr/bin/openssl "$@"
+fi
+if [[ "$1 $2" == 'base64 -A' ]]; then
+  exec /usr/bin/openssl "$@"
+fi
 exit 1
 EOF
   cat >"$temp_dir/shuf" <<'EOF'
@@ -723,6 +907,8 @@ EOF
   assert_eq "" "$CLOUDFLARE_UUID" "direct mode does not generate Cloudflare UUID"
   assert_eq "" "$INTERNAL_WS_PORT" "direct mode does not generate internal port"
   assert_eq "" "$WS_PATH" "direct mode does not generate WS path"
+  assert_eq "2022-blake3-aes-128-gcm" "$SS_METHOD" "generated Shadowsocks method"
+  assert_eq "YWJjZGVmZ2hpamtsbW5vcA==" "$SS_KEY" "generated Shadowsocks key"
 
   reset_options
   MODE="cloudflare"
@@ -739,10 +925,12 @@ EOF
   CLOUDFLARE_UUID="existing-cloudflare"
   INTERNAL_WS_PORT="32001"
   WS_PATH="/existing"
+  SS_KEY="$SS_TEST_KEY"
   generate_runtime_values
   assert_eq "existing-cloudflare" "$CLOUDFLARE_UUID" "existing Cloudflare UUID reused"
   assert_eq "32001" "$INTERNAL_WS_PORT" "existing internal port reused"
   assert_eq "/existing" "$WS_PATH" "existing path reused"
+  assert_eq "$SS_TEST_KEY" "$SS_KEY" "existing Shadowsocks key reused"
 
   reset_options
   MODE="full"
@@ -761,7 +949,8 @@ EOF
   HY2_OBFS_PASSWORD="eight"
   HY2_SNI="nine"
   HY2_CERT_PIN="ten"
-  SS_KEY="eleven"
+  SS_METHOD="2022-blake3-aes-128-gcm"
+  SS_KEY="$SS_TEST_KEY"
   rotate_runtime_values
   [[ -z "$CLOUDFLARE_UUID$INTERNAL_WS_PORT$WS_PATH$HY2_AUTH$HY2_OBFS_PASSWORD$HY2_SNI$HY2_CERT_PIN$SS_KEY" ]] ||
     fail "rotate did not clear generated runtime values"
@@ -774,6 +963,9 @@ EOF
   assert_eq "edge.example.com" "$SERVER_ADDRESS" "rotate retains server address"
   assert_eq "1" "$ALLOW_BITTORRENT" "rotate retains BitTorrent setting"
   assert_eq "1" "$ALLOW_MAIL" "rotate retains mail setting"
+  generate_runtime_values
+  assert_eq "YWJjZGVmZ2hpamtsbW5vcA==" "$SS_KEY" "rotate generated a new Shadowsocks key"
+  [[ "$SS_KEY" != "$SS_TEST_KEY" ]] || fail "rotate reused the old Shadowsocks key"
   PATH="$old_path"
 )
 
@@ -1696,7 +1888,7 @@ test_prepare_configuration_reuse_and_rotate() (
   HY2_CERT_PIN="saved-pin"
   SS_PORT="8388"
   SS_METHOD="2022-blake3-aes-128-gcm"
-  SS_KEY="saved-ss-key"
+  SS_KEY="$SS_TEST_KEY"
   SERVER_ADDRESS="edge.example.com"
   ALLOW_MAIL="1"
   save_state
@@ -1744,7 +1936,7 @@ test_prepare_configuration_reuse_and_rotate() (
   HY2_CERT_PIN="direct-pin"
   SS_PORT="18388"
   SS_METHOD="2022-blake3-aes-128-gcm"
-  SS_KEY="direct-key"
+  SS_KEY="$SS_TEST_KEY"
   SERVER_ADDRESS="198.51.100.10"
   save_state
 
