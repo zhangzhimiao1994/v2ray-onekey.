@@ -739,6 +739,14 @@ EOF
   read_x25519_keypair
   assert_eq "private-from-current-xray" "$REALITY_PRIVATE_KEY" "parsed current Xray private key label"
   assert_eq "public-from-current-xray" "$REALITY_PUBLIC_KEY" "parsed current Xray Password (PublicKey) label"
+  xray() {
+    printf 'PrivateKey: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\r\n'
+    printf 'Password (PublicKey): BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\r\n'
+    printf 'Hash32: CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC\r\n'
+  }
+  read_x25519_keypair
+  assert_eq "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" "$REALITY_PRIVATE_KEY" "trimmed CRLF private key"
+  assert_eq "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB" "$REALITY_PUBLIC_KEY" "trimmed CRLF public key"
   xray() { printf '%s\n' 'unparseable output'; }
   assert_fails "Unable to parse" read_x25519_keypair
   PATH="$old_path"

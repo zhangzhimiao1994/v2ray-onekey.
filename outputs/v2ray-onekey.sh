@@ -355,8 +355,10 @@ PY
 validate_loaded_runtime_values() {
   if mode_has_reality; then
     valid_uuid "$REALITY_UUID" || die "Invalid REALITY UUID in state"
-    valid_x25519_key "$REALITY_PRIVATE_KEY" || die "Invalid REALITY private key in state"
-    valid_x25519_key "$REALITY_PUBLIC_KEY" || die "Invalid REALITY public key in state"
+    valid_x25519_key "$REALITY_PRIVATE_KEY" ||
+      die "Invalid REALITY private key (length ${#REALITY_PRIVATE_KEY}; expected 43 URL-safe characters)"
+    valid_x25519_key "$REALITY_PUBLIC_KEY" ||
+      die "Invalid REALITY public key (length ${#REALITY_PUBLIC_KEY}; expected 43 URL-safe characters)"
     valid_reality_short_id "$REALITY_SHORT_ID" || die "Invalid REALITY short ID in state"
   else
     [[ -z "$REALITY_UUID" && -z "$REALITY_PRIVATE_KEY" && -z "$REALITY_PUBLIC_KEY" && -z "$REALITY_SHORT_ID" ]] ||
@@ -438,10 +440,10 @@ load_state() {
 read_x25519_keypair() {
   local output private_key public_key
   output="$(xray x25519)" || die "Unable to generate REALITY x25519 key pair"
-  private_key="$(awk -F: '/^Private( key|Key):/{sub(/^[[:space:]]*/, "", $2); print $2; exit}' <<<"$output")"
-  public_key="$(awk -F: '/^Password( \(PublicKey\))?:/{sub(/^[[:space:]]*/, "", $2); print $2; exit}' <<<"$output")"
+  private_key="$(awk -F: '/^Private( key|Key):/{gsub(/\r/, "", $2); sub(/^[ \t]*/, "", $2); sub(/[ \t]*$/, "", $2); print $2; exit}' <<<"$output")"
+  public_key="$(awk -F: '/^Password( \(PublicKey\))?:/{gsub(/\r/, "", $2); sub(/^[ \t]*/, "", $2); sub(/[ \t]*$/, "", $2); print $2; exit}' <<<"$output")"
   [[ -n "$public_key" ]] ||
-    public_key="$(awk -F: '/^Public key:/{sub(/^[[:space:]]*/, "", $2); print $2; exit}' <<<"$output")"
+    public_key="$(awk -F: '/^Public key:/{gsub(/\r/, "", $2); sub(/^[ \t]*/, "", $2); sub(/[ \t]*$/, "", $2); print $2; exit}' <<<"$output")"
   [[ -n "$private_key" && -n "$public_key" ]] || die "Unable to parse xray x25519 output"
   REALITY_PRIVATE_KEY="$private_key"
   REALITY_PUBLIC_KEY="$public_key"
