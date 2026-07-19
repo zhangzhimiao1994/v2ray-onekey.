@@ -12,6 +12,8 @@ XRAY_INSTALL_URL="https://github.com/XTLS/Xray-install/raw/main/install-release.
 DEFAULT_REALITY_TARGET="www.microsoft.com:443"
 CLOUDFLARE_CONNECT_TIMEOUT="${CLOUDFLARE_CONNECT_TIMEOUT:-10}"
 CLOUDFLARE_MAX_TIME="${CLOUDFLARE_MAX_TIME:-30}"
+LISTENER_WAIT_ATTEMPTS="${LISTENER_WAIT_ATTEMPTS:-15}"
+LISTENER_WAIT_INTERVAL="${LISTENER_WAIT_INTERVAL:-1}"
 TRANSACTION_ACTIVE="0"
 LOCK_HELD="0"
 
@@ -1526,7 +1528,7 @@ install_packages() {
 }
 
 install_required_packages() {
-  local -a base_packages=(curl ca-certificates openssl python3 coreutils)
+  local -a base_packages=(curl ca-certificates openssl python3 coreutils gawk)
   if [[ "$PKG_MANAGER" == "apt" ]]; then
     base_packages+=(iproute2)
   else
@@ -1998,16 +2000,38 @@ $output"
   fi
 }
 
+print_service_diagnostics() {
+  local service="$1"
+  warn "Recent $service service diagnostics:"
+  systemctl status "$service" --no-pager --full 2>&1 || true
+  journalctl -u "$service" -n 30 --no-pager 2>&1 || true
+}
+
+wait_for_listener_owner() {
+  local port="$1" owner="$2" binding="${3:-}" output attempt
+  for ((attempt = 1; attempt <= LISTENER_WAIT_ATTEMPTS; attempt++)); do
+    output="$(listener_output "$port")" || die "Unable to inspect listener on TCP $port: $output"
+    if [[ -n "$output" && "$output" == *"$owner"* ]]; then
+      if [[ -z "$binding" || "$output" == *"$binding:$port"* ]]; then
+        return 0
+      fi
+    fi
+    (( attempt < LISTENER_WAIT_ATTEMPTS )) && sleep "$LISTENER_WAIT_INTERVAL"
+  done
+  print_service_diagnostics "$owner"
+  require_listener_owner "$port" "$owner" "$binding"
+}
+
 verify_started_services() {
   systemctl is-active --quiet xray || die "Xray is not active after restart"
   if mode_has_reality; then
-    require_listener_owner "$REALITY_PORT" xray
+    wait_for_listener_owner "$REALITY_PORT" xray
   fi
   if mode_has_cloudflare; then
     systemctl is-active --quiet nginx || die "Nginx is not active after reload"
-    require_listener_owner "$INTERNAL_WS_PORT" xray 127.0.0.1
-    require_listener_owner "$CLOUDFLARE_PORT" nginx
-    require_listener_owner 80 nginx
+    wait_for_listener_owner "$INTERNAL_WS_PORT" xray 127.0.0.1
+    wait_for_listener_owner "$CLOUDFLARE_PORT" nginx
+    wait_for_listener_owner 80 nginx
   fi
 }
 

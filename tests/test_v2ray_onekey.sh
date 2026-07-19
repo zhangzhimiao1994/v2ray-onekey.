@@ -1760,13 +1760,13 @@ test_packages_permissions_and_firewall() (
   MODE="reality"
   PKG_MANAGER="apt"
   install_required_packages
-  grep -Fq 'curl ca-certificates openssl python3 coreutils iproute2' "$package_log" ||
+  grep -Fq 'curl ca-certificates openssl python3 coreutils gawk iproute2' "$package_log" ||
     fail "APT base package set is incomplete"
   grep -Eq 'nginx|certbot' "$package_log" && fail "reality-only installed Cloudflare packages"
   : >"$package_log"
   PKG_MANAGER="dnf"
   install_required_packages
-  grep -Fq 'curl ca-certificates openssl python3 coreutils iproute' "$package_log" ||
+  grep -Fq 'curl ca-certificates openssl python3 coreutils gawk iproute' "$package_log" ||
     fail "RPM base package set does not include iproute"
   grep -Fq 'iproute2' "$package_log" && fail "RPM package set incorrectly uses iproute2"
   : >"$package_log"
@@ -1826,6 +1826,55 @@ test_packages_permissions_and_firewall() (
 
 test_packages_permissions_and_firewall
 printf 'PASS: package, permission, and firewall tests\n'
+
+test_listener_readiness_waits_for_delayed_bind() (
+  local temp_dir attempt_log sleep_log
+  temp_dir="$(mktemp -d)"
+  trap 'rm -rf "$temp_dir"' RETURN
+  attempt_log="$temp_dir/attempts.log"
+  sleep_log="$temp_dir/sleeps.log"
+
+  listener_output() {
+    printf '%s\n' "$1" >>"$attempt_log"
+    if [[ "$(wc -l <"$attempt_log" | tr -d ' ')" -ge 3 ]]; then
+      printf 'LISTEN 0 4096 0.0.0.0:%s 0.0.0.0:* users:(("xray",pid=42,fd=3))\n' "$1"
+    fi
+  }
+  sleep() { printf '%s\n' "$1" >>"$sleep_log"; }
+
+  LISTENER_WAIT_ATTEMPTS=4
+  LISTENER_WAIT_INTERVAL=1
+  wait_for_listener_owner 443 xray
+
+  assert_eq "3" "$(wc -l <"$attempt_log" | tr -d ' ')" "delayed listener attempt count"
+  assert_eq "2" "$(wc -l <"$sleep_log" | tr -d ' ')" "delayed listener sleep count"
+)
+
+test_listener_readiness_waits_for_delayed_bind
+printf 'PASS: delayed listener readiness tests\n'
+
+test_listener_timeout_prints_service_diagnostics() (
+  local output
+  listener_output() { :; }
+  sleep() { :; }
+  systemctl() {
+    printf 'mock xray status: failed\n'
+    return 3
+  }
+  journalctl() { printf 'mock xray journal: bind failed\n'; }
+
+  LISTENER_WAIT_ATTEMPTS=2
+  LISTENER_WAIT_INTERVAL=1
+  if output="$(wait_for_listener_owner 443 xray 2>&1)"; then
+    fail "missing listener unexpectedly passed readiness verification"
+  fi
+  [[ "$output" == *'mock xray status: failed'* ]] || fail "listener failure omitted systemd status: $output"
+  [[ "$output" == *'mock xray journal: bind failed'* ]] || fail "listener failure omitted journal output: $output"
+  [[ "$output" == *'Expected xray listener on TCP 443'* ]] || fail "listener failure omitted final error: $output"
+)
+
+test_listener_timeout_prints_service_diagnostics
+printf 'PASS: listener failure diagnostic tests\n'
 
 test_deployment_order_and_failure_trap() (
   local temp_dir order_log status
