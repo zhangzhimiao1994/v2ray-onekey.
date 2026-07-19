@@ -10,6 +10,13 @@ NGINX_SITE="${NGINX_SITE:-/etc/nginx/conf.d/v2ray-onekey.conf}"
 RENEWAL_HOOK="${RENEWAL_HOOK:-/etc/letsencrypt/renewal-hooks/deploy/v2ray-onekey-nginx.sh}"
 LEGACY_V2RAY_CONFIG="${LEGACY_V2RAY_CONFIG:-/usr/local/etc/v2ray/config.json}"
 XRAY_INSTALL_URL="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
+HYSTERIA_DOWNLOAD_URL="https://download.hysteria.network/app/latest/hysteria-linux-amd64"
+HYSTERIA_BIN="/usr/local/bin/hysteria"
+HYSTERIA_CONFIG="/etc/hysteria/config.yaml"
+HYSTERIA_ACL="/etc/hysteria/acl.txt"
+HYSTERIA_CERT="/etc/hysteria/server.crt"
+HYSTERIA_KEY="/etc/hysteria/server.key"
+HYSTERIA_UNIT="/etc/systemd/system/hysteria-server.service"
 CLOUDFLARE_CONNECT_TIMEOUT="${CLOUDFLARE_CONNECT_TIMEOUT:-10}"
 CLOUDFLARE_MAX_TIME="${CLOUDFLARE_MAX_TIME:-30}"
 LISTENER_WAIT_ATTEMPTS="${LISTENER_WAIT_ATTEMPTS:-15}"
@@ -65,6 +72,7 @@ reset_options() {
   CLI_WS_PATH_SET="0"
   CLI_ALLOW_BITTORRENT_SET="0"
   CLI_ALLOW_MAIL_SET="0"
+  LEGACY_HY2_BOOTSTRAP="0"
 }
 
 valid_domain() {
@@ -488,7 +496,40 @@ generate_ss_key() {
   openssl rand -base64 16 | tr -d '\r\n'
 }
 
+valid_hy2_secret() {
+  local secret="${1:-}" decoded_size canonical
+  [[ "$secret" =~ ^[A-Za-z0-9_-]{43}$ ]] || return 1
+  decoded_size="$(
+    printf '%s=' "$secret" | tr '_-' '/+' |
+      openssl base64 -d -A 2>/dev/null | wc -c | tr -d '[:space:]'
+  )" || return 1
+  [[ "$decoded_size" == "32" ]] || return 1
+  canonical="$(
+    printf '%s=' "$secret" | tr '_-' '/+' |
+      openssl base64 -d -A 2>/dev/null |
+      openssl base64 -A 2>/dev/null | tr '+/' '-_' | tr -d '='
+  )" || return 1
+  [[ "$canonical" == "$secret" ]]
+}
+
+valid_hy2_sni() {
+  [[ "${1:-}" =~ ^[0-9a-f]{16}\.invalid$ ]]
+}
+
+valid_hy2_cert_pin() {
+  [[ "${1:-}" =~ ^([0-9A-F]{2}:){31}[0-9A-F]{2}$ ]]
+}
+
+random_urlsafe_secret() {
+  openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\r\n'
+}
+
+generate_hy2_sni() {
+  printf '%s.invalid\n' "$(openssl rand -hex 8)"
+}
+
 validate_loaded_runtime_values() {
+  local allow_missing_hy2_pin="${1:-0}"
   if mode_has_cloudflare; then
     valid_uuid "$CLOUDFLARE_UUID" || die "Invalid Cloudflare UUID in state"
     valid_port "$INTERNAL_WS_PORT" || die "Invalid internal WebSocket port: $INTERNAL_WS_PORT"
@@ -500,7 +541,16 @@ validate_loaded_runtime_values() {
       die "Inactive Cloudflare state must not contain credentials"
   fi
 
-  if ! mode_has_hysteria; then
+  if mode_has_hysteria; then
+    valid_hy2_secret "$HY2_AUTH" || die "Invalid Hysteria2 authentication value in state"
+    valid_hy2_secret "$HY2_OBFS_PASSWORD" || die "Invalid Hysteria2 obfuscation value in state"
+    valid_hy2_sni "$HY2_SNI" || die "Invalid Hysteria2 SNI in state"
+    if [[ -n "$HY2_CERT_PIN" ]]; then
+      valid_hy2_cert_pin "$HY2_CERT_PIN" || die "Invalid Hysteria2 certificate pin in state"
+    elif [[ "$allow_missing_hy2_pin" != "1" ]]; then
+      die "Invalid Hysteria2 certificate pin in state"
+    fi
+  else
     [[ -z "$HY2_AUTH$HY2_OBFS_PASSWORD$HY2_SNI$HY2_CERT_PIN" ]] ||
       die "Inactive Hysteria2 state must not contain credentials"
   fi
@@ -539,6 +589,7 @@ load_state() {
   local owner mode line key value loaded_schema="1"
   local -A seen=()
   unexport_sensitive_runtime_values
+  LEGACY_HY2_BOOTSTRAP="0"
   [[ -f "$STATE_FILE" ]] || die "State file does not exist: $STATE_FILE"
   owner="$(stat -c '%u' "$STATE_FILE")" || die "Unable to inspect state file: $STATE_FILE"
   mode="$(stat -c '%a' "$STATE_FILE")" || die "Unable to inspect state file: $STATE_FILE"
@@ -620,6 +671,12 @@ load_state() {
       SS_METHOD="2022-blake3-aes-128-gcm"
       SS_KEY="$(generate_ss_key)"
     fi
+    if mode_has_hysteria; then
+      HY2_AUTH="$(random_urlsafe_secret)"
+      HY2_OBFS_PASSWORD="$(random_urlsafe_secret)"
+      HY2_SNI="$(generate_hy2_sni)"
+      LEGACY_HY2_BOOTSTRAP="1"
+    fi
   else
     # The allowlist and shell-escape parser above make these assignments inert data.
     # shellcheck disable=SC1090
@@ -627,7 +684,11 @@ load_state() {
   fi
   ROTATE="0"
   validate_options state
-  validate_loaded_runtime_values
+  if [[ "$loaded_schema" == "1" ]]; then
+    validate_loaded_runtime_values 1
+  else
+    validate_loaded_runtime_values
+  fi
 }
 
 random_internal_ws_port() {
@@ -649,6 +710,16 @@ generate_runtime_values() {
     [[ -n "$CLOUDFLARE_UUID" ]] || CLOUDFLARE_UUID="$(xray uuid)"
     [[ -n "$INTERNAL_WS_PORT" ]] || INTERNAL_WS_PORT="$(random_internal_ws_port)"
     [[ -n "$WS_PATH" ]] || WS_PATH="/$(openssl rand -hex 12)"
+  fi
+  if mode_has_hysteria; then
+    [[ -n "$HY2_AUTH" ]] || HY2_AUTH="$(random_urlsafe_secret)"
+    [[ -n "$HY2_OBFS_PASSWORD" ]] || HY2_OBFS_PASSWORD="$(random_urlsafe_secret)"
+    [[ -n "$HY2_SNI" ]] || HY2_SNI="$(generate_hy2_sni)"
+    valid_hy2_secret "$HY2_AUTH" || die "Unable to generate valid Hysteria2 authentication"
+    valid_hy2_secret "$HY2_OBFS_PASSWORD" || die "Unable to generate valid Hysteria2 obfuscation"
+    valid_hy2_sni "$HY2_SNI" || die "Unable to generate a valid Hysteria2 SNI"
+    [[ -z "$HY2_CERT_PIN" ]] || valid_hy2_cert_pin "$HY2_CERT_PIN" ||
+      die "Invalid Hysteria2 certificate pin"
   fi
   if mode_has_shadowsocks; then
     SS_METHOD="${SS_METHOD:-2022-blake3-aes-128-gcm}"
@@ -708,7 +779,7 @@ prepare_configuration() {
   if [[ "$ROTATE" == "1" ]]; then
     rotate_runtime_values
   elif [[ -f "$STATE_FILE" ]]; then
-    validate_loaded_runtime_values
+    validate_loaded_runtime_values "$LEGACY_HY2_BOOTSTRAP"
   fi
 }
 
@@ -1706,6 +1777,343 @@ install_xray_core() {
   bash -c "$installer" @ install
 }
 
+stage_hysteria_binary() (
+  local staged="$1" staged_dir effective_file="" hashes_file="" effective_url=""
+  local release_version="" hashes_url line expected_hash="" actual_hash checksum_output
+  local target_count=0 valid_count=0 keep_binary="0"
+  cleanup_hysteria_download() {
+    [[ -z "$effective_file" ]] || rm -f -- "$effective_file" || true
+    [[ -z "$hashes_file" ]] || rm -f -- "$hashes_file" || true
+    if [[ "$keep_binary" != "1" ]]; then
+      rm -f -- "$staged" || true
+    fi
+  }
+  trap cleanup_hysteria_download EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  umask 077
+  [[ "$staged" != "$HYSTERIA_BIN" ]] || die "Hysteria2 must be validated in staging before installation"
+  staged_dir="$(dirname "$staged")"
+  install -d -m 0700 "$staged_dir" || die "Unable to create the Hysteria2 staging directory"
+  [[ -d "$staged_dir" && ! -L "$staged_dir" ]] || die "Invalid Hysteria2 staging directory"
+  rm -f -- "$staged" || die "Unable to clear the Hysteria2 staging binary"
+  effective_file="$(mktemp "$staged_dir/.hysteria-effective.XXXXXX")" ||
+    die "Unable to create the Hysteria2 effective URL file"
+  if ! curl -LfsS --proto '=https' --proto-redir '=https' \
+    --connect-timeout 10 --max-time 120 -o "$staged" \
+    --write-out '%{url_effective}\n' "$HYSTERIA_DOWNLOAD_URL" >"$effective_file"; then
+    die "Unable to download the official Hysteria2 binary"
+  fi
+  [[ -f "$staged" && ! -L "$staged" && -s "$staged" ]] ||
+    die "The official Hysteria2 binary download was empty or invalid"
+
+  [[ "$(wc -l <"$effective_file" | tr -d '[:space:]')" == "1" ]] ||
+    die "Hysteria2 binary effective URL was malformed"
+  IFS= read -r effective_url <"$effective_file" ||
+    die "Hysteria2 binary effective URL was missing"
+  [[ "$effective_url" != *$'\r'* ]] ||
+    die "Hysteria2 binary effective URL was malformed"
+  if [[ "$effective_url" =~ ^https://download\.hysteria\.network/app/(v[0-9]+\.[0-9]+\.[0-9]+)/hysteria-linux-amd64$ ]]; then
+    release_version="${BASH_REMATCH[1]}"
+  elif [[ "$effective_url" =~ ^https://github\.com/apernet/hysteria/releases/download/app%2F(v[0-9]+\.[0-9]+\.[0-9]+)/hysteria-linux-amd64$ ]]; then
+    release_version="${BASH_REMATCH[1]}"
+  elif [[ "$effective_url" =~ ^https://github\.com/apernet/hysteria/releases/download/app/(v[0-9]+\.[0-9]+\.[0-9]+)/hysteria-linux-amd64$ ]]; then
+    release_version="${BASH_REMATCH[1]}"
+  else
+    die "Hysteria2 binary effective URL was not an official versioned release asset"
+  fi
+
+  hashes_url="https://github.com/apernet/hysteria/releases/download/app/$release_version/hashes.txt"
+  hashes_file="$(mktemp "$staged_dir/.hysteria-hashes.XXXXXX")" ||
+    die "Unable to create the Hysteria2 checksum file"
+  if ! curl -LfsS --proto '=https' --proto-redir '=https' \
+    --connect-timeout 10 --max-time 120 -o "$hashes_file" "$hashes_url"; then
+    die "Unable to download the Hysteria2 release checksums"
+  fi
+  [[ -f "$hashes_file" && ! -L "$hashes_file" && -s "$hashes_file" ]] ||
+    die "The Hysteria2 release checksum file was empty or invalid"
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" == *"build/hysteria-linux-amd64" ]]; then
+      ((target_count += 1))
+      if [[ "$line" =~ ^([0-9a-f]{64})\ \ build/hysteria-linux-amd64$ ]]; then
+        ((valid_count += 1))
+        expected_hash="${BASH_REMATCH[1]}"
+      fi
+    fi
+  done <"$hashes_file"
+  [[ "$target_count" == "1" && "$valid_count" == "1" ]] ||
+    die "Hysteria2 release checksum entry was missing, duplicate, or malformed"
+
+  checksum_output="$(sha256sum -- "$staged")" ||
+    die "Unable to calculate the Hysteria2 binary checksum"
+  actual_hash="${checksum_output%% *}"
+  [[ "$actual_hash" =~ ^[0-9a-f]{64}$ ]] ||
+    die "The calculated Hysteria2 binary checksum was malformed"
+  [[ "$actual_hash" == "$expected_hash" ]] ||
+    die "Hysteria2 binary checksum mismatch"
+
+  chmod 0700 "$staged" || die "Unable to protect the staged Hysteria2 binary"
+  if ! "$staged" version >/dev/null 2>&1; then
+    die "Hysteria2 version validation failed"
+  fi
+  chmod 0755 "$staged" || die "Unable to finalize the staged Hysteria2 binary"
+  keep_binary="1"
+)
+
+install_validated_hysteria_binary() {
+  local staged="$1"
+  [[ -f "$staged" && ! -L "$staged" && -s "$staged" ]] ||
+    die "Validated Hysteria2 staging binary is missing"
+  [[ "$(stat -c '%a' "$staged")" == "755" ]] ||
+    die "Hysteria2 staging binary has not passed validation"
+  install -o root -g root -m 0755 "$staged" "$HYSTERIA_BIN"
+}
+
+generate_hysteria_certificate_files() (
+  local staged_cert="$1" staged_key="$2" config="" pin cert_dir key_dir
+  local keep_files="0"
+  cleanup_hysteria_certificate_files() {
+    [[ -z "$config" ]] || rm -f -- "$config" || true
+    if [[ "$keep_files" != "1" ]]; then
+      rm -f -- "$staged_cert" "$staged_key" || true
+    fi
+  }
+  trap cleanup_hysteria_certificate_files EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  unexport_sensitive_runtime_values
+  cert_dir="$(dirname "$staged_cert")"
+  key_dir="$(dirname "$staged_key")"
+  install -d -m 0700 "$cert_dir" "$key_dir" || exit 1
+  config="$(mktemp "$cert_dir/.openssl-hysteria.XXXXXX")" || exit 1
+  chmod 0600 "$config" || exit 1
+  printf '%s\n' \
+    '[req]' \
+    'distinguished_name=dn' \
+    'prompt=no' \
+    'x509_extensions=v3_req' \
+    '[dn]' \
+    "CN=$HY2_SNI" \
+    '[v3_req]' \
+    "subjectAltName=DNS:$HY2_SNI" >"$config" || exit 1
+  rm -f -- "$staged_cert" "$staged_key" || exit 1
+  if ! openssl ecparam -genkey -name prime256v1 -noout -out "$staged_key"; then
+    exit 1
+  fi
+  chmod 0400 "$staged_key" || exit 1
+  if ! openssl req -new -x509 -sha256 -days 3650 -key "$staged_key" \
+    -out "$staged_cert" -config "$config"; then
+    exit 1
+  fi
+  rm -f -- "$config" || exit 1
+  config=""
+  chmod 0440 "$staged_cert" || exit 1
+  pin="$(
+    openssl x509 -noout -fingerprint -sha256 -in "$staged_cert" 2>/dev/null |
+      awk -F= 'NF == 2 { print $2 }' | tr 'a-f' 'A-F' | tr -d '\r\n'
+  )" || exit 1
+  valid_hy2_cert_pin "$pin" || exit 1
+  keep_files="1"
+  printf '%s\n' "$pin"
+)
+
+generate_hysteria_certificate() {
+  local staged_cert="$1" staged_key="$2" pin
+  unexport_sensitive_runtime_values
+  valid_hy2_sni "$HY2_SNI" || die "Invalid generated Hysteria2 SNI"
+  pin="$(generate_hysteria_certificate_files "$staged_cert" "$staged_key")" ||
+    die "Unable to generate the Hysteria2 certificate or compute its pin"
+  valid_hy2_cert_pin "$pin" || die "Unable to compute a valid Hysteria2 certificate pin"
+  HY2_CERT_PIN="$pin"
+  export -n HY2_CERT_PIN 2>/dev/null || true
+}
+
+render_hysteria_config() (
+  local output_path="$1" cert_path="$2" key_path="$3" acl_path="$4"
+  local output_dir temp_path="" render_status="0" source_path
+  cleanup_hysteria_config_render() {
+    [[ -z "$temp_path" ]] || rm -f -- "$temp_path" || true
+  }
+  trap cleanup_hysteria_config_render EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  unexport_sensitive_runtime_values
+  valid_hy2_port_range "$HY2_PORT_RANGE" || die "Invalid Hysteria2 port range"
+  valid_hy2_secret "$HY2_AUTH" || die "Invalid Hysteria2 authentication value"
+  valid_hy2_secret "$HY2_OBFS_PASSWORD" || die "Invalid Hysteria2 obfuscation value"
+  for source_path in "$cert_path" "$key_path" "$acl_path"; do
+    if [[ -e "$source_path" || -L "$source_path" ]]; then
+      [[ -f "$source_path" && ! -L "$source_path" ]] ||
+        die "Hysteria2 renderer source must not be a symlink or non-regular file"
+    fi
+  done
+  output_dir="$(dirname "$output_path")"
+  install -d -m 0700 "$output_dir" || die "Unable to create the Hysteria2 config staging directory"
+  temp_path="$(mktemp "$output_dir/.hysteria-config.XXXXXX")" ||
+    die "Unable to create the Hysteria2 config staging file"
+  printf '%s\0%s\0%s\0%s\0%s\0%s\0' \
+    "$HY2_PORT_RANGE" "$HY2_AUTH" "$HY2_OBFS_PASSWORD" \
+    "$cert_path" "$key_path" "$acl_path" |
+    python3 - "$temp_path" 3<&0 <<'PY' || render_status=$?
+import json
+import os
+import sys
+
+
+records = os.fdopen(3, "rb").read().decode("utf-8").split("\0")
+if records[-1] != "" or len(records) != 7:
+    raise SystemExit("invalid Hysteria2 renderer input")
+port_range, auth, obfs_password, cert, key, acl = records[:-1]
+
+
+def quoted(value):
+    return json.dumps(value, ensure_ascii=True)
+
+
+content = "\n".join(
+    [
+        "listen: " + quoted(":" + port_range),
+        "tls:",
+        "  cert: " + quoted(cert),
+        "  key: " + quoted(key),
+        "  sniGuard: " + quoted("strict"),
+        "auth:",
+        "  type: " + quoted("password"),
+        "  password: " + quoted(auth),
+        "obfs:",
+        "  type: " + quoted("salamander"),
+        "  salamander:",
+        "    password: " + quoted(obfs_password),
+        "acl:",
+        "  file: " + quoted(acl),
+        "",
+    ]
+)
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    handle.write(content)
+PY
+  if (( render_status != 0 )); then
+    rm -f -- "$temp_path" || true
+    return "$render_status"
+  fi
+  chmod 0600 "$temp_path" || return 1
+  mv -f -- "$temp_path" "$output_path" || return 1
+  temp_path=""
+)
+
+render_hysteria_acl() (
+  local output_path="$1" output_dir temp_path=""
+  cleanup_hysteria_acl_render() {
+    [[ -z "$temp_path" ]] || rm -f -- "$temp_path" || true
+  }
+  trap cleanup_hysteria_acl_render EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  output_dir="$(dirname "$output_path")"
+  install -d -m 0700 "$output_dir" || die "Unable to create the Hysteria2 ACL staging directory"
+  temp_path="$(mktemp "$output_dir/.hysteria-acl.XXXXXX")" ||
+    die "Unable to create the Hysteria2 ACL staging file"
+  {
+    printf '%s\n' \
+      'reject(0.0.0.0/8)' \
+      'reject(10.0.0.0/8)' \
+      'reject(100.64.0.0/10)' \
+      'reject(127.0.0.0/8)' \
+      'reject(169.254.0.0/16)' \
+      'reject(172.16.0.0/12)' \
+      'reject(192.168.0.0/16)' \
+      'reject(224.0.0.0/4)' \
+      'reject(::1/128)' \
+      'reject(fc00::/7)' \
+      'reject(fe80::/10)'
+    if [[ "$ALLOW_MAIL" != "1" ]]; then
+      printf '%s\n' \
+        'reject(all, tcp/25)' \
+        'reject(all, tcp/465)' \
+        'reject(all, tcp/587)'
+    fi
+    printf '%s\n' 'direct(all)'
+  } >"$temp_path" || return 1
+  # Hysteria2 has no reliable BitTorrent matcher; Xray enforces that policy separately.
+  chmod 0600 "$temp_path" || return 1
+  mv -f -- "$temp_path" "$output_path" || return 1
+  temp_path=""
+)
+
+render_hysteria_unit() (
+  local output_path="$1" output_dir temp_path=""
+  cleanup_hysteria_unit_render() {
+    [[ -z "$temp_path" ]] || rm -f -- "$temp_path" || true
+  }
+  trap cleanup_hysteria_unit_render EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  output_dir="$(dirname "$output_path")"
+  install -d -m 0755 "$output_dir" || die "Unable to create the Hysteria2 unit staging directory"
+  temp_path="$(mktemp "$output_dir/.hysteria-unit.XXXXXX")" ||
+    die "Unable to create the Hysteria2 unit staging file"
+  cat >"$temp_path" <<'EOF' || return 1
+[Unit]
+Description=Hysteria2 Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=hysteria
+Group=hysteria
+ExecStart=/usr/local/bin/hysteria server -c /etc/hysteria/config.yaml
+Restart=on-failure
+RestartSec=5s
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  chmod 0644 "$temp_path" || return 1
+  mv -f -- "$temp_path" "$output_path" || return 1
+  temp_path=""
+)
+
+install_hysteria_runtime_files() {
+  local staged_config="$1" staged_acl="$2" staged_cert="$3" staged_key="$4"
+  local staged_unit="$5" staged
+  for staged in "$staged_config" "$staged_acl" "$staged_cert" "$staged_key" "$staged_unit"; do
+    [[ -f "$staged" && ! -L "$staged" && -s "$staged" ]] ||
+      die "Invalid Hysteria2 staging file"
+  done
+  install -d -o root -g hysteria -m 0750 "$(dirname "$HYSTERIA_CONFIG")"
+  install -o root -g hysteria -m 0440 "$staged_config" "$HYSTERIA_CONFIG"
+  install -o root -g hysteria -m 0440 "$staged_acl" "$HYSTERIA_ACL"
+  install -o root -g hysteria -m 0440 "$staged_cert" "$HYSTERIA_CERT"
+  install -o root -g hysteria -m 0440 "$staged_key" "$HYSTERIA_KEY"
+  install -o root -g root -m 0644 "$staged_unit" "$HYSTERIA_UNIT"
+}
+
+validate_hysteria_staged() (
+  local binary="$1" config="$2" log_path="$3" status
+  unexport_sensitive_runtime_values
+  : >"$log_path"
+  chmod 0600 "$log_path"
+  set +e
+  timeout --signal=TERM --kill-after=2s 4s \
+    "$binary" server -c "$config" >"$log_path" 2>&1
+  status=$?
+  set -e
+  if [[ "$status" != "124" && "$status" != "143" ]] ||
+    ! grep -Fq 'server up and running' "$log_path"; then
+    die "Hysteria2 staged validation did not become ready"
+  fi
+)
+
 xray_service_identity() {
   local user group
   user="$(systemctl show -p User --value xray 2>/dev/null || true)"
@@ -2279,6 +2687,78 @@ make_shadowsocks_link() {
   authority="$(printf '%s' "$SS_METHOD:$SS_KEY" | openssl base64 -A | tr '+/' '-_' | tr -d '=')"
   printf 'ss://%s@%s:%s#%s\n' "$authority" "$(format_uri_host "$SERVER_ADDRESS")" \
     "$SS_PORT" "$(urlencode 'Shadowsocks-2022-direct')"
+}
+
+make_hysteria_link() {
+  local link_status="0"
+  unexport_sensitive_runtime_values
+  if ! valid_server_address "$SERVER_ADDRESS" ||
+    ! valid_hy2_port_range "$HY2_PORT_RANGE" ||
+    ! valid_hy2_secret "$HY2_AUTH" ||
+    ! valid_hy2_secret "$HY2_OBFS_PASSWORD" ||
+    ! valid_hy2_sni "$HY2_SNI" ||
+    ! valid_hy2_cert_pin "$HY2_CERT_PIN"; then
+    die "Invalid Hysteria2 link values"
+  fi
+  printf '%s\0%s\0%s\0%s\0%s\0%s\0' \
+    "$HY2_AUTH" "$SERVER_ADDRESS" "$HY2_PORT_RANGE" \
+    "$HY2_OBFS_PASSWORD" "$HY2_SNI" "$HY2_CERT_PIN" |
+    python3 - 3<&0 <<'PY' || link_status=$?
+import ipaddress
+import os
+import re
+import urllib.parse
+
+
+records = os.fdopen(3, "rb").read().decode("utf-8").split("\0")
+if records[-1] != "" or len(records) != 7:
+    raise SystemExit("invalid Hysteria2 URI input")
+auth, address, port_range, obfs_password, sni, pin = records[:-1]
+if not re.fullmatch(r"[A-Za-z0-9_-]{43}", auth):
+    raise SystemExit("invalid auth")
+if not re.fullmatch(r"[A-Za-z0-9_-]{43}", obfs_password):
+    raise SystemExit("invalid obfuscation password")
+if not re.fullmatch(r"[0-9a-f]{16}\.invalid", sni):
+    raise SystemExit("invalid SNI")
+if not re.fullmatch(r"(?:[0-9A-F]{2}:){31}[0-9A-F]{2}", pin):
+    raise SystemExit("invalid certificate pin")
+if not re.fullmatch(r"[1-9][0-9]{0,4}-[1-9][0-9]{0,4}", port_range):
+    raise SystemExit("invalid port range")
+start, end = (int(value) for value in port_range.split("-", 1))
+if not (1 <= start <= end <= 65535 and end - start + 1 <= 1000):
+    raise SystemExit("invalid port range")
+try:
+    parsed_address = ipaddress.ip_address(address)
+except ValueError:
+    host = address.lower()
+else:
+    host = "[{}]".format(parsed_address) if parsed_address.version == 6 else str(parsed_address)
+
+quote = lambda value: urllib.parse.quote(value, safe="")
+query = urllib.parse.urlencode(
+    [
+        ("obfs", "salamander"),
+        ("obfs-password", obfs_password),
+        ("sni", sni),
+        ("insecure", "1"),
+        ("pinSHA256", pin),
+    ],
+    quote_via=urllib.parse.quote,
+)
+link = "hysteria2://{}@{}:{}/?{}#{}".format(
+    quote(auth), host, port_range, query, quote("Hysteria2-direct")
+)
+parsed = urllib.parse.urlsplit(link)
+if parsed.scheme != "hysteria2" or parsed.hostname != host.strip("[]"):
+    raise SystemExit("URI validation failed")
+if not parsed.netloc.endswith(":" + port_range):
+    raise SystemExit("URI port range validation failed")
+parsed_query = urllib.parse.parse_qs(parsed.query, strict_parsing=True)
+if parsed_query.get("obfs") != ["salamander"]:
+    raise SystemExit("URI query validation failed")
+print(link)
+PY
+  (( link_status == 0 )) || die "Unable to validate the Hysteria2 sharing link"
 }
 
 main() {

@@ -96,6 +96,10 @@ assert_fails() {
 
 expected_state_keys="STATE_SCHEMA MODE DOMAIN EMAIL CLOUDFLARE_PORT INTERNAL_WS_PORT CLOUDFLARE_UUID WS_PATH HY2_PORT_RANGE HY2_AUTH HY2_OBFS_PASSWORD HY2_SNI HY2_CERT_PIN SS_PORT SS_METHOD SS_KEY SERVER_ADDRESS ALLOW_BITTORRENT ALLOW_MAIL"
 SS_TEST_KEY="MDEyMzQ1Njc4OWFiY2RlZg=="
+HY2_TEST_AUTH="MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY"
+HY2_TEST_OBFS="ZmVkY2JhOTg3NjU0MzIxMGZlZGNiYTk4NzY1NDMyMTA"
+HY2_TEST_SNI="0123456789abcdef.invalid"
+HY2_TEST_PIN="$(printf 'AB:%.0s' {1..31})AB"
 assert_state_keys() {
   local actual
   actual="$(printf '%s ' "${STATE_KEYS[@]}")"
@@ -103,6 +107,30 @@ assert_state_keys() {
 }
 
 assert_state_keys
+assert_eq "https://download.hysteria.network/app/latest/hysteria-linux-amd64" \
+  "${HYSTERIA_DOWNLOAD_URL-}" "official Hysteria2 download URL"
+assert_eq "/usr/local/bin/hysteria" "${HYSTERIA_BIN-}" "Hysteria2 binary path"
+assert_eq "/etc/hysteria/config.yaml" "${HYSTERIA_CONFIG-}" "Hysteria2 config path"
+assert_eq "/etc/hysteria/acl.txt" "${HYSTERIA_ACL-}" "Hysteria2 ACL path"
+assert_eq "/etc/hysteria/server.crt" "${HYSTERIA_CERT-}" "Hysteria2 certificate path"
+assert_eq "/etc/hysteria/server.key" "${HYSTERIA_KEY-}" "Hysteria2 key path"
+assert_eq "/etc/systemd/system/hysteria-server.service" "${HYSTERIA_UNIT-}" \
+  "Hysteria2 systemd unit path"
+grep -Fqx '  local staged="$1" staged_dir effective_file="" hashes_file="" effective_url=""' \
+  "$SCRIPT" || fail "Hysteria2 cleanup trap temporary paths must be explicitly initialized"
+inherited_hysteria_paths="$(
+  HYSTERIA_BIN=/tmp/injected-bin \
+  HYSTERIA_CONFIG=$'/tmp/injected\nconfig' \
+  HYSTERIA_ACL=/tmp/injected-acl \
+  HYSTERIA_CERT=/tmp/injected-cert \
+  HYSTERIA_KEY=/tmp/injected-key \
+  HYSTERIA_UNIT=/tmp/injected-unit \
+  V2RAY_ONEKEY_SOURCE_ONLY=1 bash -c \
+    'source "$1"; printf "%s\n%s\n%s\n%s\n%s\n%s\n" "$HYSTERIA_BIN" "$HYSTERIA_CONFIG" "$HYSTERIA_ACL" "$HYSTERIA_CERT" "$HYSTERIA_KEY" "$HYSTERIA_UNIT"' \
+    bash "$SCRIPT"
+)"
+assert_eq $'/usr/local/bin/hysteria\n/etc/hysteria/config.yaml\n/etc/hysteria/acl.txt\n/etc/hysteria/server.crt\n/etc/hysteria/server.key\n/etc/systemd/system/hysteria-server.service' \
+  "$inherited_hysteria_paths" "inherited Hysteria2 path overrides must be ignored"
 
 reset_options
 MODE="direct"
@@ -345,6 +373,10 @@ test_shadowsocks_key_validation() (
 
   reset_options
   MODE="direct"
+  HY2_AUTH="$HY2_TEST_AUTH"
+  HY2_OBFS_PASSWORD="$HY2_TEST_OBFS"
+  HY2_SNI="$HY2_TEST_SNI"
+  HY2_CERT_PIN="$HY2_TEST_PIN"
   SS_METHOD="aes-256-gcm"
   SS_KEY="$SS_TEST_KEY"
   assert_fails "Invalid Shadowsocks method in state" validate_loaded_runtime_values
@@ -355,6 +387,494 @@ test_shadowsocks_key_validation() (
 )
 
 test_shadowsocks_key_validation
+
+test_hysteria_validation_and_rendering() (
+  local temp_dir old_path real_openssl expected_acl expected_acl_mail expected_unit
+  local ipv4_link ipv6_link hostname_link uppercase_link secret expected_pin
+  temp_dir="$(mktemp -d)"
+  trap 'rm -rf "$temp_dir"' RETURN
+
+  valid_hy2_secret "$HY2_TEST_AUTH" || fail "valid Hysteria2 auth rejected"
+  valid_hy2_secret "$HY2_TEST_OBFS" || fail "valid Hysteria2 obfs password rejected"
+  valid_hy2_secret "${HY2_TEST_AUTH}A" && fail "oversized Hysteria2 secret accepted"
+  valid_hy2_secret "bad+secret" && fail "non-URL-safe Hysteria2 secret accepted"
+  valid_hy2_sni "$HY2_TEST_SNI" || fail "valid generated Hysteria2 SNI rejected"
+  valid_hy2_sni "VPN.example.com" && fail "non-generated Hysteria2 SNI accepted"
+  valid_hy2_cert_pin "$HY2_TEST_PIN" || fail "valid certificate pin rejected"
+  valid_hy2_cert_pin "sha256:$HY2_TEST_PIN" && fail "prefixed certificate pin accepted"
+  valid_hy2_cert_pin "${HY2_TEST_PIN,,}" && fail "lowercase certificate pin accepted"
+
+  reset_options
+  MODE="direct"
+  HY2_AUTH="$HY2_TEST_AUTH"
+  HY2_OBFS_PASSWORD="$HY2_TEST_OBFS"
+  HY2_SNI="$HY2_TEST_SNI"
+  HY2_CERT_PIN="$HY2_TEST_PIN"
+  SS_METHOD="2022-blake3-aes-128-gcm"
+  SS_KEY="$SS_TEST_KEY"
+  validate_loaded_runtime_values
+  HY2_AUTH="short"
+  assert_fails "Invalid Hysteria2 authentication value in state" validate_loaded_runtime_values
+  HY2_AUTH="$HY2_TEST_AUTH"
+  HY2_SNI="vpn.example.com"
+  assert_fails "Invalid Hysteria2 SNI in state" validate_loaded_runtime_values
+  HY2_SNI="$HY2_TEST_SNI"
+  HY2_CERT_PIN="invalid"
+  assert_fails "Invalid Hysteria2 certificate pin in state" validate_loaded_runtime_values
+
+  old_path="$PATH"
+  install -d -m 700 "$temp_dir/runtime" "$temp_dir/bin"
+  cat >"$temp_dir/bin/curl" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$HY2_CURL_LOG"
+output="" url="" write_out=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -o|--output) output="$2"; shift 2 ;;
+    -w|--write-out) write_out="$2"; shift 2 ;;
+    --proto|--proto-redir|--connect-timeout|--max-time) shift 2 ;;
+    -*) shift ;;
+    *) url="$1"; shift ;;
+  esac
+done
+[[ -n "$output" && -n "$url" ]] || exit 2
+if [[ "$url" == *'/hashes.txt' ]]; then
+  hash="$(sha256sum "$HY2_DOWNLOADED_BINARY" | awk '{print $1}')"
+  case "$HY2_CURL_SCENARIO" in
+    success|http-effective|wrong-owner) printf '%s  build/hysteria-linux-amd64\n' "$hash" >"$output" ;;
+    mismatch) printf '%064d  build/hysteria-linux-amd64\n' 0 >"$output" ;;
+    malformed) printf '%s build/hysteria-linux-amd64\n' "$hash" >"$output" ;;
+    duplicate) printf '%s  build/hysteria-linux-amd64\n%s  build/hysteria-linux-amd64\n' "$hash" "$hash" >"$output" ;;
+    missing) printf '%s  build/hysteria-linux-arm64\n' "$hash" >"$output" ;;
+    *) exit 3 ;;
+  esac
+  exit 0
+fi
+cat >"$output" <<'BIN'
+#!/usr/bin/env bash
+printf '%s mode=%s\n' "$*" "$(stat -c '%a' "$0")" >>"$HY2_BINARY_LOG"
+[[ "${1:-}" == "version" ]]
+BIN
+HY2_DOWNLOADED_BINARY="$output"
+export HY2_DOWNLOADED_BINARY
+case "$HY2_CURL_SCENARIO" in
+  http-effective) effective='http://download.hysteria.network/app/v2.10.0/hysteria-linux-amd64' ;;
+  wrong-owner) effective='https://downloads.example.net/app/v2.10.0/hysteria-linux-amd64' ;;
+  latest-effective) effective='https://download.hysteria.network/app/latest/hysteria-linux-amd64' ;;
+  unversioned-effective) effective='https://download.hysteria.network/app/hysteria-linux-amd64' ;;
+  *) effective='https://download.hysteria.network/app/v2.10.0/hysteria-linux-amd64' ;;
+esac
+[[ -z "$write_out" ]] || printf '%s\n' "$effective"
+EOF
+  chmod +x "$temp_dir/bin/curl"
+  : >"$temp_dir/curl.log"
+  : >"$temp_dir/binary.log"
+  export HY2_CURL_LOG="$temp_dir/curl.log" HY2_BINARY_LOG="$temp_dir/binary.log"
+  export HY2_DOWNLOADED_BINARY="$temp_dir/runtime/hysteria"
+  PATH="$temp_dir/bin:$PATH"
+  HY2_CURL_SCENARIO="success"
+  export HY2_CURL_SCENARIO
+  stage_hysteria_binary "$temp_dir/runtime/hysteria"
+  assert_eq "755" "$(stat -c '%a' "$temp_dir/runtime/hysteria")" \
+    "validated Hysteria2 staging binary mode"
+  assert_eq "2" "$(grep -Fc -- '--proto =https' "$temp_dir/curl.log")" \
+    "binary and checksum downloads require HTTPS"
+  assert_eq "2" "$(grep -Fc -- '--proto-redir =https' "$temp_dir/curl.log")" \
+    "binary and checksum redirects require HTTPS"
+  assert_eq "2" "$(grep -Fc -- '--connect-timeout 10' "$temp_dir/curl.log")" \
+    "binary and checksum curl connect timeouts"
+  assert_eq "2" "$(grep -Fc -- '--max-time 120' "$temp_dir/curl.log")" \
+    "binary and checksum curl total timeouts"
+  grep -Fq -- "$HYSTERIA_DOWNLOAD_URL" "$temp_dir/curl.log" || fail "Hysteria2 curl URL is wrong"
+  grep -Fq -- 'https://github.com/apernet/hysteria/releases/download/app/v2.10.0/hashes.txt' \
+    "$temp_dir/curl.log" || fail "Hysteria2 hashes URL did not use the exact binary release"
+  assert_eq "version mode=700" "$(cat "$temp_dir/binary.log")" \
+    "Hysteria2 binary must execute privately only after checksum validation"
+  [[ -z "$(find "$temp_dir/runtime" -maxdepth 1 -type f \
+    \( -name '.hysteria-effective.*' -o -name '.hysteria-hashes.*' \) -print -quit)" ]] ||
+    fail "successful Hysteria2 staging leaked checksum temporary files"
+
+  printf 'preserve-final\n' >"$temp_dir/final-hysteria"
+  HYSTERIA_BIN="$temp_dir/final-hysteria"
+  for scenario in \
+    http-effective wrong-owner latest-effective unversioned-effective \
+    mismatch malformed duplicate missing; do
+    : >"$temp_dir/binary.log"
+    : >"$temp_dir/curl.log"
+    HY2_CURL_SCENARIO="$scenario"
+    export HY2_CURL_SCENARIO
+    assert_fails "Hysteria2" stage_hysteria_binary "$temp_dir/runtime/fail-$scenario"
+    [[ ! -s "$temp_dir/binary.log" ]] ||
+      fail "Hysteria2 version executed before trust validation for $scenario"
+    assert_eq "preserve-final" "$(cat "$HYSTERIA_BIN")" \
+      "failed staging mutated the final binary for $scenario"
+    if [[ -e "$temp_dir/runtime/fail-$scenario" ]]; then
+      (( (8#$(stat -c '%a' "$temp_dir/runtime/fail-$scenario") & 0022) == 0 )) ||
+        fail "failed Hysteria2 binary became group/world executable for $scenario"
+    fi
+    [[ -z "$(find "$temp_dir/runtime" -maxdepth 1 -type f \
+      \( -name '.hysteria-effective.*' -o -name '.hysteria-hashes.*' \) -print -quit)" ]] ||
+      fail "failed Hysteria2 staging leaked checksum temporary files for $scenario"
+  done
+  PATH="$old_path"
+  unset HY2_CURL_LOG HY2_BINARY_LOG HY2_CURL_SCENARIO HY2_DOWNLOADED_BINARY
+
+  reset_options
+  MODE="direct"
+  HY2_PORT_RANGE="20000-20100"
+  HY2_AUTH="$HY2_TEST_AUTH"
+  HY2_OBFS_PASSWORD="$HY2_TEST_OBFS"
+  HY2_SNI="$HY2_TEST_SNI"
+  HY2_CERT_PIN=""
+  SS_PORT="8388"
+  SS_METHOD="2022-blake3-aes-128-gcm"
+  SS_KEY="$SS_TEST_KEY"
+  SERVER_ADDRESS="192.0.2.10"
+
+  real_openssl="$(command -v openssl)"
+  install -d "$temp_dir/openssl-bin"
+cat >"$temp_dir/openssl-bin/openssl" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\0' "$@" >>"$OPENSSL_ARGV_LOG"
+for name in HY2_AUTH HY2_OBFS_PASSWORD HY2_SNI HY2_CERT_PIN SS_KEY; do
+  [[ -z ${!name+x} ]] || printf '%s\n' "$name" >>"$OPENSSL_ENV_LOG"
+done
+if [[ "${OPENSSL_FAIL_X509:-0}" == "1" && "${1:-}" == "x509" ]]; then
+  exit 42
+fi
+exec "$REAL_OPENSSL" "$@"
+EOF
+  chmod +x "$temp_dir/openssl-bin/openssl"
+  : >"$temp_dir/openssl-argv.log"
+  : >"$temp_dir/openssl-env.log"
+  export OPENSSL_ARGV_LOG="$temp_dir/openssl-argv.log"
+  export OPENSSL_ENV_LOG="$temp_dir/openssl-env.log"
+  export REAL_OPENSSL="$real_openssl"
+  export HY2_AUTH HY2_OBFS_PASSWORD HY2_SNI HY2_CERT_PIN SS_KEY
+  PATH="$temp_dir/openssl-bin:$PATH"
+  generate_hysteria_certificate "$temp_dir/server.crt" "$temp_dir/server.key"
+  OPENSSL_FAIL_X509="1"
+  export OPENSSL_FAIL_X509
+  assert_fails "Unable to generate the Hysteria2 certificate" generate_hysteria_certificate \
+    "$temp_dir/failed-server.crt" "$temp_dir/failed-server.key"
+  unset OPENSSL_FAIL_X509
+  [[ ! -e "$temp_dir/failed-server.crt" && ! -e "$temp_dir/failed-server.key" ]] ||
+    fail "failed Hysteria2 certificate generation left staged certificate material"
+  [[ -z "$(find "$temp_dir" -maxdepth 1 -name '.openssl-hysteria.*' -print -quit)" ]] ||
+    fail "failed Hysteria2 certificate generation leaked an OpenSSL config"
+  PATH="$old_path"
+  unset OPENSSL_ARGV_LOG OPENSSL_ENV_LOG REAL_OPENSSL
+  assert_eq "400" "$(stat -c '%a' "$temp_dir/server.key")" "staged Hysteria2 key mode"
+  (( (8#$(stat -c '%a' "$temp_dir/server.crt") & 0004) == 0 )) ||
+    fail "staged Hysteria2 certificate is world-readable"
+  "$real_openssl" ec -in "$temp_dir/server.key" -noout -text 2>/dev/null |
+    grep -Fq 'ASN1 OID: prime256v1' || fail "Hysteria2 key is not ECDSA P-256"
+  "$real_openssl" x509 -in "$temp_dir/server.crt" -noout -text |
+    grep -Fq "DNS:$HY2_TEST_SNI" || fail "Hysteria2 certificate SAN is missing"
+  "$real_openssl" x509 -in "$temp_dir/server.crt" -noout -checkend 300000000 >/dev/null ||
+    fail "Hysteria2 certificate lifetime is shorter than ten years"
+  valid_hy2_cert_pin "$HY2_CERT_PIN" || fail "generated certificate pin has wrong format"
+  expected_pin="$(
+    "$real_openssl" x509 -noout -fingerprint -sha256 -in "$temp_dir/server.crt" |
+      cut -d= -f2 | tr -d '\r\n'
+  )"
+  assert_eq "$expected_pin" "$HY2_CERT_PIN" "Hysteria2 certificate pin content"
+  [[ ! -s "$temp_dir/openssl-env.log" ]] ||
+    fail "OpenSSL inherited sensitive values: $(paste -sd, "$temp_dir/openssl-env.log")"
+  for secret in "$HY2_TEST_AUTH" "$HY2_TEST_OBFS" "$HY2_TEST_SNI"; do
+    grep -aFq "$secret" "$temp_dir/openssl-argv.log" &&
+      fail "sensitive Hysteria2 value was exposed in OpenSSL argv"
+  done
+
+  HYSTERIA_CONFIG="/etc/hysteria/config.yaml"
+  HYSTERIA_ACL="/etc/hysteria/acl.txt"
+  HYSTERIA_CERT="/etc/hysteria/server.crt"
+  HYSTERIA_KEY="/etc/hysteria/server.key"
+  real_python="$(command -v python3)"
+  install -d "$temp_dir/render-python-bin"
+  cat >"$temp_dir/render-python-bin/python3" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\0' "$@" >>"$PYTHON_ARGV_LOG"
+for name in HY2_AUTH HY2_OBFS_PASSWORD HY2_SNI HY2_CERT_PIN; do
+  [[ -z ${!name+x} ]] || printf '%s\n' "$name" >>"$PYTHON_ENV_LOG"
+done
+exec "$REAL_PYTHON" "$@"
+EOF
+  chmod +x "$temp_dir/render-python-bin/python3"
+  : >"$temp_dir/render-python-argv.log"
+  : >"$temp_dir/render-python-env.log"
+  export REAL_PYTHON="$real_python"
+  export PYTHON_ARGV_LOG="$temp_dir/render-python-argv.log"
+  export PYTHON_ENV_LOG="$temp_dir/render-python-env.log"
+  export HY2_AUTH HY2_OBFS_PASSWORD HY2_SNI HY2_CERT_PIN
+  PATH="$temp_dir/render-python-bin:$PATH"
+  render_hysteria_config "$temp_dir/install.yaml" \
+    "$HYSTERIA_CERT" "$HYSTERIA_KEY" "$HYSTERIA_ACL"
+  render_hysteria_config "$temp_dir/staged.yaml" \
+    "$temp_dir/server.crt" "$temp_dir/server.key" "$temp_dir/staged-acl.txt"
+  PATH="$old_path"
+  unset REAL_PYTHON PYTHON_ARGV_LOG PYTHON_ENV_LOG
+  [[ ! -s "$temp_dir/render-python-env.log" ]] ||
+    fail "Hysteria renderer inherited sensitive values: $(paste -sd, "$temp_dir/render-python-env.log")"
+  for secret in "$HY2_TEST_AUTH" "$HY2_TEST_OBFS" "$HY2_TEST_SNI"; do
+    grep -aFq "$secret" "$temp_dir/render-python-argv.log" &&
+      fail "Hysteria renderer value was exposed in Python argv"
+  done
+  assert_eq "600" "$(stat -c '%a' "$temp_dir/install.yaml")" "Hysteria2 YAML mode"
+  grep -Fqx 'listen: ":20000-20100"' "$temp_dir/install.yaml" ||
+    fail "Hysteria2 YAML listen text is wrong"
+  grep -Fqx '  sniGuard: "strict"' "$temp_dir/install.yaml" ||
+    fail "Hysteria2 YAML sniGuard text is wrong"
+  python3 - "$temp_dir/install.yaml" "$temp_dir/staged.yaml" \
+    "$HY2_TEST_AUTH" "$HY2_TEST_OBFS" <<'PY'
+import json
+import sys
+
+
+def parse_yaml_subset(path):
+    result = {}
+    stack = [(-1, result)]
+    with open(path, encoding="utf-8") as handle:
+        for raw in handle:
+            if not raw.strip():
+                continue
+            indent = len(raw) - len(raw.lstrip(" "))
+            key, value = raw.strip().split(":", 1)
+            while stack[-1][0] >= indent:
+                stack.pop()
+            parent = stack[-1][1]
+            if value.strip():
+                parent[key] = json.loads(value.strip())
+            else:
+                parent[key] = {}
+                stack.append((indent, parent[key]))
+    return result
+
+
+install, staged = map(parse_yaml_subset, sys.argv[1:3])
+expected = {
+    "listen": ":20000-20100",
+    "tls": {
+        "cert": "/etc/hysteria/server.crt",
+        "key": "/etc/hysteria/server.key",
+        "sniGuard": "strict",
+    },
+    "auth": {"type": "password", "password": sys.argv[3]},
+    "obfs": {
+        "type": "salamander",
+        "salamander": {"password": sys.argv[4]},
+    },
+    "acl": {"file": "/etc/hysteria/acl.txt"},
+}
+assert install == expected
+assert staged["tls"]["cert"].endswith("/server.crt")
+assert staged["tls"]["key"].endswith("/server.key")
+assert staged["acl"]["file"].endswith("/staged-acl.txt")
+assert staged["auth"] == expected["auth"]
+assert staged["obfs"] == expected["obfs"]
+PY
+
+  printf 'direct(all)\n' >"$temp_dir/source-acl.txt"
+  ln -s "$temp_dir/server.crt" "$temp_dir/symlink-cert"
+  printf 'preserve-symlink-render\n' >"$temp_dir/symlink-render.yaml"
+  assert_fails "must not be a symlink" render_hysteria_config \
+    "$temp_dir/symlink-render.yaml" "$temp_dir/symlink-cert" \
+    "$temp_dir/server.key" "$temp_dir/source-acl.txt"
+  assert_eq "preserve-symlink-render" "$(cat "$temp_dir/symlink-render.yaml")" \
+    "symlink source rejection mutated the final config"
+  [[ -z "$(find "$temp_dir" -maxdepth 1 -type f -name '.hysteria-config.*' -print -quit)" ]] ||
+    fail "symlink source rejection leaked a private renderer temporary file"
+
+  install -d "$temp_dir/failing-tools"
+  cat >"$temp_dir/failing-tools/mv" <<'EOF'
+#!/usr/bin/env bash
+exit 73
+EOF
+  chmod +x "$temp_dir/failing-tools/mv"
+  printf 'preserve-config\n' >"$temp_dir/preserved.yaml"
+  printf 'preserve-acl\n' >"$temp_dir/preserved-acl.txt"
+  printf 'preserve-unit\n' >"$temp_dir/preserved.service"
+  PATH="$temp_dir/failing-tools:$PATH"
+  if render_hysteria_config "$temp_dir/preserved.yaml" \
+    "$HYSTERIA_CERT" "$HYSTERIA_KEY" "$HYSTERIA_ACL"; then
+    fail "Hysteria2 config renderer accepted a failed atomic replace"
+  fi
+  if render_hysteria_acl "$temp_dir/preserved-acl.txt"; then
+    fail "Hysteria2 ACL renderer accepted a failed atomic replace"
+  fi
+  if render_hysteria_unit "$temp_dir/preserved.service"; then
+    fail "Hysteria2 unit renderer accepted a failed atomic replace"
+  fi
+  PATH="$old_path"
+  assert_eq "preserve-config" "$(cat "$temp_dir/preserved.yaml")" \
+    "failed config render mutated its final file"
+  assert_eq "preserve-acl" "$(cat "$temp_dir/preserved-acl.txt")" \
+    "failed ACL render mutated its final file"
+  assert_eq "preserve-unit" "$(cat "$temp_dir/preserved.service")" \
+    "failed unit render mutated its final file"
+  [[ -z "$(find "$temp_dir" -maxdepth 1 -type f \
+    \( -name '.hysteria-config.*' -o -name '.hysteria-acl.*' -o -name '.hysteria-unit.*' \) \
+    -print -quit)" ]] || fail "failed Hysteria2 renderer leaked private temporary files"
+
+  expected_acl=$'reject(0.0.0.0/8)\nreject(10.0.0.0/8)\nreject(100.64.0.0/10)\nreject(127.0.0.0/8)\nreject(169.254.0.0/16)\nreject(172.16.0.0/12)\nreject(192.168.0.0/16)\nreject(224.0.0.0/4)\nreject(::1/128)\nreject(fc00::/7)\nreject(fe80::/10)\nreject(all, tcp/25)\nreject(all, tcp/465)\nreject(all, tcp/587)\ndirect(all)'
+  expected_acl_mail=$'reject(0.0.0.0/8)\nreject(10.0.0.0/8)\nreject(100.64.0.0/10)\nreject(127.0.0.0/8)\nreject(169.254.0.0/16)\nreject(172.16.0.0/12)\nreject(192.168.0.0/16)\nreject(224.0.0.0/4)\nreject(::1/128)\nreject(fc00::/7)\nreject(fe80::/10)\ndirect(all)'
+  ALLOW_MAIL="0"
+  render_hysteria_acl "$temp_dir/acl.txt"
+  assert_eq "$expected_acl" "$(cat "$temp_dir/acl.txt")" "Hysteria2 ACL order"
+  grep -Eiq 'torrent|bittorrent' "$temp_dir/acl.txt" && fail "invented Hysteria2 BitTorrent matcher"
+  ALLOW_MAIL="1"
+  render_hysteria_acl "$temp_dir/acl-mail.txt"
+  assert_eq "$expected_acl_mail" "$(cat "$temp_dir/acl-mail.txt")" \
+    "Hysteria2 allow-mail ACL"
+
+  expected_unit=$'[Unit]\nDescription=Hysteria2 Server\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nUser=hysteria\nGroup=hysteria\nExecStart=/usr/local/bin/hysteria server -c /etc/hysteria/config.yaml\nRestart=on-failure\nRestartSec=5s\nAmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE\nCapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE\nNoNewPrivileges=true\nLimitNOFILE=1048576\n\n[Install]\nWantedBy=multi-user.target'
+  render_hysteria_unit "$temp_dir/hysteria-server.service"
+  assert_eq "$expected_unit" "$(cat "$temp_dir/hysteria-server.service")" \
+    "Ubuntu 18 compatible Hysteria2 unit"
+  assert_eq "644" "$(stat -c '%a' "$temp_dir/hysteria-server.service")" \
+    "Hysteria2 unit mode"
+
+  cat >"$temp_dir/bin/install" <<'EOF'
+#!/usr/bin/env bash
+printf '<%s>\n' "$*" >>"$HY2_INSTALL_LOG"
+EOF
+  chmod +x "$temp_dir/bin/install"
+  : >"$temp_dir/install.log"
+  export HY2_INSTALL_LOG="$temp_dir/install.log"
+  HYSTERIA_BIN="/usr/local/bin/hysteria"
+  HYSTERIA_CONFIG="/etc/hysteria/config.yaml"
+  HYSTERIA_ACL="/etc/hysteria/acl.txt"
+  HYSTERIA_CERT="/etc/hysteria/server.crt"
+  HYSTERIA_KEY="/etc/hysteria/server.key"
+  HYSTERIA_UNIT="/etc/systemd/system/hysteria-server.service"
+  PATH="$temp_dir/bin:$PATH"
+  install_validated_hysteria_binary "$temp_dir/runtime/hysteria"
+  grep -Fqx "<-o root -g root -m 0755 $temp_dir/runtime/hysteria /usr/local/bin/hysteria>" \
+    "$temp_dir/install.log" || fail "validated Hysteria2 binary install mode/owner is wrong"
+  : >"$temp_dir/install.log"
+  ln -s "$temp_dir/server.key" "$temp_dir/symlink-key"
+  assert_fails "Invalid Hysteria2 staging file" install_hysteria_runtime_files \
+    "$temp_dir/install.yaml" "$temp_dir/acl.txt" "$temp_dir/server.crt" \
+    "$temp_dir/symlink-key" "$temp_dir/hysteria-server.service"
+  [[ ! -s "$temp_dir/install.log" ]] ||
+    fail "failing Hysteria2 install helper attempted to mutate final files"
+  install_hysteria_runtime_files "$temp_dir/install.yaml" "$temp_dir/acl.txt" \
+    "$temp_dir/server.crt" "$temp_dir/server.key" "$temp_dir/hysteria-server.service"
+  PATH="$old_path"
+  unset HY2_INSTALL_LOG
+  grep -Fqx "<-o root -g hysteria -m 0440 $temp_dir/install.yaml /etc/hysteria/config.yaml>" \
+    "$temp_dir/install.log" || fail "Hysteria2 config final ownership/mode is wrong"
+  grep -Fqx "<-o root -g hysteria -m 0440 $temp_dir/server.key /etc/hysteria/server.key>" \
+    "$temp_dir/install.log" || fail "Hysteria2 key final ownership/mode is wrong"
+  grep -Fqx "<-o root -g hysteria -m 0440 $temp_dir/server.crt /etc/hysteria/server.crt>" \
+    "$temp_dir/install.log" || fail "Hysteria2 certificate final ownership/mode is wrong"
+  grep -Fqx "<-o root -g root -m 0644 $temp_dir/hysteria-server.service /etc/systemd/system/hysteria-server.service>" \
+    "$temp_dir/install.log" || fail "Hysteria2 unit final ownership/mode is wrong"
+
+  install -d "$temp_dir/timeout-bin"
+  cat >"$temp_dir/timeout-bin/timeout" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$TIMEOUT_LOG"
+case "$TIMEOUT_BEHAVIOR" in
+  ready124) printf 'server up and running\n'; exit 124 ;;
+  ready143) printf 'server up and running\n'; exit 143 ;;
+  no-marker) printf 'starting\n'; exit 124 ;;
+  *) printf 'configuration rejected\n'; exit 1 ;;
+esac
+EOF
+  chmod +x "$temp_dir/timeout-bin/timeout"
+  : >"$temp_dir/timeout.log"
+  export TIMEOUT_LOG="$temp_dir/timeout.log"
+  PATH="$temp_dir/timeout-bin:$PATH"
+  TIMEOUT_BEHAVIOR="ready124" validate_hysteria_staged \
+    "$temp_dir/runtime/hysteria" "$temp_dir/staged.yaml" "$temp_dir/smoke.log"
+  TIMEOUT_BEHAVIOR="ready143" validate_hysteria_staged \
+    "$temp_dir/runtime/hysteria" "$temp_dir/staged.yaml" "$temp_dir/smoke.log"
+  assert_fails "Hysteria2 staged validation did not become ready" \
+    env TIMEOUT_BEHAVIOR="no-marker" bash -c \
+      'export V2RAY_ONEKEY_SOURCE_ONLY=1; source "$1"; PATH="$2:$PATH"; validate_hysteria_staged "$3" "$4" "$5"' \
+      bash "$SCRIPT" "$temp_dir/timeout-bin" "$temp_dir/runtime/hysteria" \
+      "$temp_dir/staged.yaml" "$temp_dir/smoke-fail.log"
+  grep -Fq -- '--signal=TERM --kill-after=2s 4s' "$temp_dir/timeout.log" ||
+    fail "Hysteria2 smoke timeout is not fully bounded"
+  assert_eq "600" "$(stat -c '%a' "$temp_dir/smoke.log")" "Hysteria2 smoke log mode"
+  PATH="$old_path"
+  unset TIMEOUT_LOG
+
+  HY2_CERT_PIN="$HY2_TEST_PIN"
+  real_python="$(command -v python3)"
+  install -d "$temp_dir/python-bin"
+  cat >"$temp_dir/python-bin/python3" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\0' "$@" >>"$PYTHON_ARGV_LOG"
+for name in HY2_AUTH HY2_OBFS_PASSWORD HY2_SNI HY2_CERT_PIN; do
+  [[ -z ${!name+x} ]] || printf '%s\n' "$name" >>"$PYTHON_ENV_LOG"
+done
+exec "$REAL_PYTHON" "$@"
+EOF
+  chmod +x "$temp_dir/python-bin/python3"
+  : >"$temp_dir/python-argv.log"
+  : >"$temp_dir/python-env.log"
+  export REAL_PYTHON="$real_python"
+  export PYTHON_ARGV_LOG="$temp_dir/python-argv.log"
+  export PYTHON_ENV_LOG="$temp_dir/python-env.log"
+  export HY2_AUTH HY2_OBFS_PASSWORD HY2_SNI HY2_CERT_PIN
+  PATH="$temp_dir/python-bin:$PATH"
+  SERVER_ADDRESS="192.0.2.10"
+  ipv4_link="$(make_hysteria_link)"
+  SERVER_ADDRESS="2001:db8::10"
+  ipv6_link="$(make_hysteria_link)"
+  SERVER_ADDRESS="vpn.example.net"
+  hostname_link="$(make_hysteria_link)"
+  SERVER_ADDRESS="VPN.Example.NET"
+  uppercase_link="$(make_hysteria_link)"
+  PATH="$old_path"
+  unset REAL_PYTHON PYTHON_ARGV_LOG PYTHON_ENV_LOG
+  [[ ! -s "$temp_dir/python-env.log" ]] ||
+    fail "Hysteria URI validator inherited sensitive values: $(paste -sd, "$temp_dir/python-env.log")"
+  for secret in "$HY2_TEST_AUTH" "$HY2_TEST_OBFS" "$HY2_TEST_SNI" "$HY2_TEST_PIN"; do
+    grep -aFq "$secret" "$temp_dir/python-argv.log" &&
+      fail "Hysteria URI value was exposed in Python argv"
+  done
+  printf '%s\0%s\0%s\0%s\0' "$ipv4_link" "$ipv6_link" "$hostname_link" "$uppercase_link" |
+    python3 - "$HY2_TEST_AUTH" "$HY2_TEST_OBFS" "$HY2_TEST_SNI" \
+      "$HY2_TEST_PIN" 3<&0 <<'PY'
+import os
+import sys
+import urllib.parse
+
+
+links = os.fdopen(3, "rb").read().decode("utf-8").split("\0")[:-1]
+expected_hosts = ["192.0.2.10", "2001:db8::10", "vpn.example.net", "vpn.example.net"]
+for link, host in zip(links, expected_hosts):
+    parsed = urllib.parse.urlsplit(link)
+    assert parsed.scheme == "hysteria2"
+    assert urllib.parse.unquote(parsed.username) == sys.argv[1]
+    assert parsed.hostname == host
+    assert parsed.netloc.endswith(":20000-20100")
+    query = urllib.parse.parse_qs(parsed.query, strict_parsing=True)
+    assert query == {
+        "obfs": ["salamander"],
+        "obfs-password": [sys.argv[2]],
+        "sni": [sys.argv[3]],
+        "insecure": ["1"],
+        "pinSHA256": [sys.argv[4]],
+    }
+    assert urllib.parse.unquote(parsed.fragment) == "Hysteria2-direct"
+assert "@[2001:db8::10]:20000-20100" in links[1]
+PY
+  SERVER_ADDRESS="bad address"
+  assert_fails "Invalid Hysteria2 link values" make_hysteria_link
+  SERVER_ADDRESS="vpn.example.net"
+  HY2_AUTH="short"
+  assert_fails "Invalid Hysteria2 link values" make_hysteria_link
+
+  for secret in "$HY2_TEST_AUTH" "$HY2_TEST_OBFS"; do
+    [[ "$ipv4_link" == *"$secret"* ]] || fail "share link omitted required Hysteria2 credential"
+  done
+)
+
+test_hysteria_validation_and_rendering
 
 assert_sensitive_runtime_not_exported() {
   bash -c '[[ -z ${SS_KEY+x} && -z ${HY2_AUTH+x} && -z ${HY2_OBFS_PASSWORD+x} && -z ${HY2_SNI+x} && -z ${HY2_CERT_PIN+x} && -z ${CLOUDFLARE_UUID+x} && -z ${WS_PATH+x} ]]' ||
@@ -392,10 +912,10 @@ test_sensitive_runtime_exports() (
   CLOUDFLARE_UUID="22222222-2222-4222-8222-222222222222"
   WS_PATH="/loaded-path"
   HY2_PORT_RANGE="20000-20100"
-  HY2_AUTH="loaded-hy2-auth"
-  HY2_OBFS_PASSWORD="loaded-hy2-obfs"
-  HY2_SNI="loaded.example.com"
-  HY2_CERT_PIN="loaded-pin"
+  HY2_AUTH="$HY2_TEST_AUTH"
+  HY2_OBFS_PASSWORD="$HY2_TEST_OBFS"
+  HY2_SNI="$HY2_TEST_SNI"
+  HY2_CERT_PIN="$HY2_TEST_PIN"
   SS_PORT="8388"
   SS_METHOD="2022-blake3-aes-128-gcm"
   SS_KEY="$SS_TEST_KEY"
@@ -411,7 +931,7 @@ test_sensitive_runtime_exports() (
   export WS_PATH="sentinel-ws-path"
   load_state
   assert_eq "$SS_TEST_KEY" "$SS_KEY" "loaded Shadowsocks key after export cleanup"
-  assert_eq "loaded-hy2-auth" "$HY2_AUTH" "loaded Hysteria2 auth after export cleanup"
+  assert_eq "$HY2_TEST_AUTH" "$HY2_AUTH" "loaded Hysteria2 auth after export cleanup"
   assert_eq "22222222-2222-4222-8222-222222222222" "$CLOUDFLARE_UUID" "loaded UUID after export cleanup"
   assert_sensitive_runtime_not_exported
 )
@@ -674,10 +1194,10 @@ test_state_round_trip() (
   CLOUDFLARE_UUID="22222222-2222-4222-8222-222222222222"
   WS_PATH="/state-path"
   HY2_PORT_RANGE="20000-20100"
-  HY2_AUTH="hy2-auth"
-  HY2_OBFS_PASSWORD="hy2-obfs"
-  HY2_SNI="hy2.example.com"
-  HY2_CERT_PIN="sha256:cert-pin"
+  HY2_AUTH="$HY2_TEST_AUTH"
+  HY2_OBFS_PASSWORD="$HY2_TEST_OBFS"
+  HY2_SNI="$HY2_TEST_SNI"
+  HY2_CERT_PIN="$HY2_TEST_PIN"
   SS_PORT="8388"
   SS_METHOD="2022-blake3-aes-128-gcm"
   SS_KEY="$SS_TEST_KEY"
@@ -719,10 +1239,10 @@ EOF
   assert_eq "22222222-2222-4222-8222-222222222222" "$CLOUDFLARE_UUID" "loaded Cloudflare UUID"
   assert_eq "/state-path" "$WS_PATH" "loaded WS path"
   assert_eq "20000-20100" "$HY2_PORT_RANGE" "loaded Hysteria2 range"
-  assert_eq "hy2-auth" "$HY2_AUTH" "loaded Hysteria2 auth"
-  assert_eq "hy2-obfs" "$HY2_OBFS_PASSWORD" "loaded Hysteria2 obfuscation password"
-  assert_eq "hy2.example.com" "$HY2_SNI" "loaded Hysteria2 SNI"
-  assert_eq "sha256:cert-pin" "$HY2_CERT_PIN" "loaded Hysteria2 certificate pin"
+  assert_eq "$HY2_TEST_AUTH" "$HY2_AUTH" "loaded Hysteria2 auth"
+  assert_eq "$HY2_TEST_OBFS" "$HY2_OBFS_PASSWORD" "loaded Hysteria2 obfuscation password"
+  assert_eq "$HY2_TEST_SNI" "$HY2_SNI" "loaded Hysteria2 SNI"
+  assert_eq "$HY2_TEST_PIN" "$HY2_CERT_PIN" "loaded Hysteria2 certificate pin"
   assert_eq "8388" "$SS_PORT" "loaded Shadowsocks port"
   assert_eq "2022-blake3-aes-128-gcm" "$SS_METHOD" "loaded Shadowsocks method"
   assert_eq "$SS_TEST_KEY" "$SS_KEY" "loaded Shadowsocks key"
@@ -733,8 +1253,10 @@ EOF
   for secret in \
     22222222-2222-4222-8222-222222222222 \
     /state-path \
-    hy2-auth \
-    hy2-obfs \
+    "$HY2_TEST_AUTH" \
+    "$HY2_TEST_OBFS" \
+    "$HY2_TEST_SNI" \
+    "$HY2_TEST_PIN" \
     "$SS_TEST_KEY"; do
     if grep -aFq "$secret" "$temp_dir/python-argv.log"; then
       fail "state secret was exposed in Python argv: $secret"
@@ -834,6 +1356,7 @@ WS_PATH=/legacy-ws
 ALLOW_BITTORRENT=1
 EOF
   cp "$STATE_FILE" "$temp_dir/reality-state.env"
+  cp "$STATE_FILE" "$temp_dir/prepare-state.env"
   sed -i 's/^MODE=dual$/MODE=reality/' "$temp_dir/reality-state.env"
   chmod 0600 "$STATE_FILE"
   reset_options
@@ -850,7 +1373,25 @@ EOF
   save_state
   grep -Fqx 'STATE_SCHEMA=2' "$STATE_FILE" || fail "legacy state was not upgraded to schema 2"
   grep -q 'REALITY' "$STATE_FILE" && fail "schema 2 state contains retired REALITY data"
-  :
+  reset_options
+  assert_fails "Invalid Hysteria2 certificate pin in state" load_state
+
+  STATE_FILE="$temp_dir/prepare-state.env"
+  chmod 0600 "$STATE_FILE"
+  HYSTERIA_CERT="$temp_dir/must-not-exist.crt"
+  HYSTERIA_KEY="$temp_dir/must-not-exist.key"
+  reset_options
+  parse_args
+  prepare_configuration
+  assert_eq "full" "$MODE" "legacy dual prepare mode"
+  assert_eq "vpn.example.com" "$DOMAIN" "legacy dual prepare Cloudflare domain"
+  valid_hy2_secret "$HY2_AUTH" || fail "legacy dual prepare did not bootstrap Hysteria2 auth"
+  valid_hy2_secret "$HY2_OBFS_PASSWORD" || fail "legacy dual prepare did not bootstrap Hysteria2 obfs"
+  valid_hy2_sni "$HY2_SNI" || fail "legacy dual prepare did not bootstrap Hysteria2 SNI"
+  assert_eq "" "$HY2_CERT_PIN" "legacy bootstrap pin remains deferred"
+  [[ ! -e "$HYSTERIA_CERT" && ! -e "$HYSTERIA_KEY" ]] ||
+    fail "legacy state read generated Hysteria2 certificate files"
+  assert_fails "Direct bundle is not available in this build yet" require_mode_ready
 
   STATE_FILE="$temp_dir/reality-state.env"
   chmod 0600 "$STATE_FILE"
@@ -885,7 +1426,19 @@ EOF
   cat >"$temp_dir/openssl" <<'EOF'
 #!/usr/bin/env bash
 [[ "$1 $2 $3" == 'rand -hex 12' ]] && { printf '0123456789abcdef01234567\n'; exit; }
+[[ "$1 $2 $3" == 'rand -hex 8' ]] && { printf '0123456789abcdef\n'; exit; }
 [[ "$1 $2 $3" == 'rand -base64 16' ]] && { printf 'YWJjZGVmZ2hpamtsbW5vcA==\n'; exit; }
+if [[ "$1 $2 $3" == 'rand -base64 32' ]]; then
+  count="$(cat "$OPENSSL_32_COUNT_FILE" 2>/dev/null || printf '0')"
+  count=$((count + 1))
+  printf '%s\n' "$count" >"$OPENSSL_32_COUNT_FILE"
+  if [[ "$count" -eq 1 ]]; then
+    printf 'MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=\n'
+  else
+    printf 'ZmVkY2JhOTg3NjU0MzIxMGZlZGNiYTk4NzY1NDMyMTA=\n'
+  fi
+  exit
+fi
 if [[ "$1 $2" == 'base64 -d' && "${3:-}" == '-A' ]]; then
   exec /usr/bin/openssl "$@"
 fi
@@ -900,6 +1453,7 @@ EOF
 printf '31001\n'
 EOF
   chmod +x "$temp_dir/xray" "$temp_dir/openssl" "$temp_dir/shuf"
+  export OPENSSL_32_COUNT_FILE="$temp_dir/openssl-32-count"
 
   reset_options
   MODE="direct"
@@ -909,6 +1463,12 @@ EOF
   assert_eq "" "$WS_PATH" "direct mode does not generate WS path"
   assert_eq "2022-blake3-aes-128-gcm" "$SS_METHOD" "generated Shadowsocks method"
   assert_eq "YWJjZGVmZ2hpamtsbW5vcA==" "$SS_KEY" "generated Shadowsocks key"
+  assert_eq "$HY2_TEST_AUTH" "$HY2_AUTH" "generated Hysteria2 auth"
+  assert_eq "$HY2_TEST_OBFS" "$HY2_OBFS_PASSWORD" "generated Hysteria2 obfs password"
+  [[ "$HY2_AUTH" != "$HY2_OBFS_PASSWORD" ]] ||
+    fail "Hysteria2 auth and obfuscation passwords were not generated separately"
+  assert_eq "$HY2_TEST_SNI" "$HY2_SNI" "generated Hysteria2 SNI"
+  assert_eq "" "$HY2_CERT_PIN" "runtime generation does not create a certificate pin"
 
   reset_options
   MODE="cloudflare"
@@ -925,11 +1485,17 @@ EOF
   CLOUDFLARE_UUID="existing-cloudflare"
   INTERNAL_WS_PORT="32001"
   WS_PATH="/existing"
+  HY2_AUTH="$HY2_TEST_AUTH"
+  HY2_OBFS_PASSWORD="$HY2_TEST_OBFS"
+  HY2_SNI="$HY2_TEST_SNI"
   SS_KEY="$SS_TEST_KEY"
   generate_runtime_values
   assert_eq "existing-cloudflare" "$CLOUDFLARE_UUID" "existing Cloudflare UUID reused"
   assert_eq "32001" "$INTERNAL_WS_PORT" "existing internal port reused"
   assert_eq "/existing" "$WS_PATH" "existing path reused"
+  assert_eq "$HY2_TEST_AUTH" "$HY2_AUTH" "existing Hysteria2 auth reused"
+  assert_eq "$HY2_TEST_OBFS" "$HY2_OBFS_PASSWORD" "existing Hysteria2 obfs reused"
+  assert_eq "$HY2_TEST_SNI" "$HY2_SNI" "existing Hysteria2 SNI reused"
   assert_eq "$SS_TEST_KEY" "$SS_KEY" "existing Shadowsocks key reused"
 
   reset_options
@@ -966,6 +1532,10 @@ EOF
   generate_runtime_values
   assert_eq "YWJjZGVmZ2hpamtsbW5vcA==" "$SS_KEY" "rotate generated a new Shadowsocks key"
   [[ "$SS_KEY" != "$SS_TEST_KEY" ]] || fail "rotate reused the old Shadowsocks key"
+  valid_hy2_secret "$HY2_AUTH" || fail "rotate did not regenerate Hysteria2 auth"
+  valid_hy2_secret "$HY2_OBFS_PASSWORD" || fail "rotate did not regenerate Hysteria2 obfs"
+  valid_hy2_sni "$HY2_SNI" || fail "rotate did not regenerate Hysteria2 SNI"
+  unset OPENSSL_32_COUNT_FILE
   PATH="$old_path"
 )
 
@@ -1082,6 +1652,12 @@ test_interim_bundle_readiness() (
   begin_transaction() { printf 'transaction\n' >>"$mutation_log"; }
   assert_fails "Direct bundle is not available in this build yet" deploy_services
   [[ ! -e "$mutation_log" ]] || fail "direct readiness gate ran after transaction start"
+
+  prepare_configuration() { MODE="direct"; }
+  validate_hysteria_staged() { printf 'staging-smoke\n' >>"$mutation_log"; }
+  assert_fails "Direct bundle is not available in this build yet" main --mode direct
+  [[ ! -e "$mutation_log" ]] ||
+    fail "production main reached the Task 4 Hysteria2 staging smoke before the readiness gate"
 
   MODE="full"
   assert_fails "Direct bundle is not available in this build yet" require_mode_ready
@@ -1882,10 +2458,10 @@ test_prepare_configuration_reuse_and_rotate() (
   CLOUDFLARE_UUID="22222222-2222-4222-8222-222222222222"
   WS_PATH="/saved-path"
   HY2_PORT_RANGE="20000-20100"
-  HY2_AUTH="saved-hy2-auth"
-  HY2_OBFS_PASSWORD="saved-hy2-obfs"
-  HY2_SNI="saved.example.com"
-  HY2_CERT_PIN="saved-pin"
+  HY2_AUTH="$HY2_TEST_AUTH"
+  HY2_OBFS_PASSWORD="$HY2_TEST_OBFS"
+  HY2_SNI="$HY2_TEST_SNI"
+  HY2_CERT_PIN="$HY2_TEST_PIN"
   SS_PORT="8388"
   SS_METHOD="2022-blake3-aes-128-gcm"
   SS_KEY="$SS_TEST_KEY"
@@ -1930,10 +2506,10 @@ test_prepare_configuration_reuse_and_rotate() (
   reset_options
   MODE="direct"
   HY2_PORT_RANGE="22000-22100"
-  HY2_AUTH="direct-auth"
-  HY2_OBFS_PASSWORD="direct-obfs"
-  HY2_SNI="direct.example.com"
-  HY2_CERT_PIN="direct-pin"
+  HY2_AUTH="$HY2_TEST_AUTH"
+  HY2_OBFS_PASSWORD="$HY2_TEST_OBFS"
+  HY2_SNI="$HY2_TEST_SNI"
+  HY2_CERT_PIN="$HY2_TEST_PIN"
   SS_PORT="18388"
   SS_METHOD="2022-blake3-aes-128-gcm"
   SS_KEY="$SS_TEST_KEY"
