@@ -148,7 +148,7 @@ All Xray entries use a direct outbound and a blocking outbound. The generated ro
 - BitTorrent by default.
 - Outbound SMTP submission and relay ports `25`, `465`, and `587` by default.
 
-Hysteria2 receives an equivalent ACL so users cannot bypass these restrictions by changing entries. Explicit opt-in flags may relax BitTorrent or mail restrictions, but defaults favor IP reputation and VPS-provider compliance.
+Hysteria2 receives equivalent private-address and mail-port ACL rules. Its official protocol sniffer does not identify BitTorrent, so the installer must document that BitTorrent blocking is enforceable on the Xray entries but cannot be guaranteed on the independent Hysteria2 path. Generated Hysteria2 credentials therefore remain root-readable and intended for the server owner only. Explicit opt-in flags may relax Xray BitTorrent or cross-protocol mail restrictions, but defaults favor IP reputation and VPS-provider compliance.
 
 Credentials are stored only in root-readable files. Configuration and state files use restrictive permissions, and diagnostics redact UUIDs, passwords, keys, certificate pins, and WebSocket paths. `--rotate` generates new Hysteria2 and Shadowsocks credentials. On the fresh installer it also rotates enabled Cloudflare credentials; on the upgrade installer Cloudflare rotation requires a separate explicit `--rotate-cloudflare` flag so an ordinary migration cannot invalidate the working node.
 
@@ -211,7 +211,7 @@ Automated tests cover:
 - Shadowsocks 2022 Xray inbound, TCP/UDP behavior, key length, and SIP002 URI fields.
 - Independent TCP/UDP port conflict handling and interactive replacement.
 - UFW and firewalld rules for single ports and UDP ranges.
-- Abuse routing parity between Xray and Hysteria2 ACLs.
+- Xray abuse routing, Hysteria2 private-address/mail ACLs, and the documented Hysteria2 BitTorrent-classification limitation.
 - Credential reuse, selective rotation, state schema migration, permissions, locking, backup, and rollback.
 - Readiness timeouts and useful diagnostics for Xray, Hysteria2, Nginx, certificates, and Cloudflare edge checks.
 - Native package and systemd behavior across the existing distribution matrix.
