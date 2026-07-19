@@ -10,7 +10,6 @@ NGINX_SITE="${NGINX_SITE:-/etc/nginx/conf.d/v2ray-onekey.conf}"
 RENEWAL_HOOK="${RENEWAL_HOOK:-/etc/letsencrypt/renewal-hooks/deploy/v2ray-onekey-nginx.sh}"
 LEGACY_V2RAY_CONFIG="${LEGACY_V2RAY_CONFIG:-/usr/local/etc/v2ray/config.json}"
 XRAY_INSTALL_URL="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
-DEFAULT_REALITY_TARGET="www.microsoft.com:443"
 CLOUDFLARE_CONNECT_TIMEOUT="${CLOUDFLARE_CONNECT_TIMEOUT:-10}"
 CLOUDFLARE_MAX_TIME="${CLOUDFLARE_MAX_TIME:-30}"
 LISTENER_WAIT_ATTEMPTS="${LISTENER_WAIT_ATTEMPTS:-15}"
@@ -23,31 +22,37 @@ warn() { printf '\033[1;33m[%s]\033[0m %s\n' "$APP_NAME" "$*"; }
 die() { printf '\033[1;31m[%s]\033[0m %s\n' "$APP_NAME" "$*" >&2; exit 1; }
 
 reset_options() {
+  STATE_SCHEMA=""
   MODE=""
   DOMAIN=""
   EMAIL=""
-  REALITY_PORT=""
   CLOUDFLARE_PORT=""
   INTERNAL_WS_PORT=""
-  REALITY_UUID=""
   CLOUDFLARE_UUID=""
-  REALITY_PRIVATE_KEY=""
-  REALITY_PUBLIC_KEY=""
-  REALITY_SHORT_ID=""
-  REALITY_TARGET="$DEFAULT_REALITY_TARGET"
   WS_PATH=""
+  HY2_PORT_RANGE=""
+  HY2_AUTH=""
+  HY2_OBFS_PASSWORD=""
+  HY2_SNI=""
+  HY2_CERT_PIN=""
+  SS_PORT=""
+  SS_METHOD=""
+  SS_KEY=""
+  SERVER_ADDRESS=""
   ROTATE="0"
   ALLOW_BITTORRENT="0"
+  ALLOW_MAIL="0"
   CLI_MODE_SET="0"
   CLI_DOMAIN_SET="0"
   CLI_EMAIL_SET="0"
-  CLI_REALITY_PORT_SET="0"
   CLI_CLOUDFLARE_PORT_SET="0"
-  CLI_REALITY_TARGET_SET="0"
-  CLI_REALITY_UUID_SET="0"
+  CLI_HY2_PORT_RANGE_SET="0"
+  CLI_SS_PORT_SET="0"
+  CLI_SERVER_ADDRESS_SET="0"
   CLI_CLOUDFLARE_UUID_SET="0"
   CLI_WS_PATH_SET="0"
   CLI_ALLOW_BITTORRENT_SET="0"
+  CLI_ALLOW_MAIL_SET="0"
 }
 
 valid_domain() {
@@ -83,70 +88,99 @@ normalize_domain() {
   printf '%s\n' "${1,,}"
 }
 
-valid_ipv4() {
-  local address="${1:-}"
-  local octet=""
-  local -a octets=()
-  [[ "$address" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)\.([0-9]+)$ ]] || return 1
-  octets=("${BASH_REMATCH[@]:1}")
-  for octet in "${octets[@]}"; do
-    octet="$(normalize_port "$octet")" || return 1
-    [[ ${#octet} -le 3 ]] || return 1
-    (( 10#$octet <= 255 )) || return 1
-  done
+valid_hy2_port_range() {
+  local range="${1:-}" start end
+  [[ "$range" =~ ^([0-9]+)-([0-9]+)$ ]] || return 1
+  start="$(normalize_port "${BASH_REMATCH[1]}")" || return 1
+  end="$(normalize_port "${BASH_REMATCH[2]}")" || return 1
+  valid_port "$start" && valid_port "$end" || return 1
+  (( 10#$start <= 10#$end && 10#$end - 10#$start + 1 <= 1000 ))
 }
 
-valid_reality_target() {
-  local target="${1:-}"
-  local hostname=""
-  local port=""
-  [[ "$target" == *:* ]] || return 1
-  hostname="${target%:*}"
-  port="${target##*:}"
-  valid_domain "$hostname" || valid_ipv4 "$hostname" || return 1
-  valid_port "$port"
+normalize_hy2_port_range() {
+  [[ "${1:-}" =~ ^([0-9]+)-([0-9]+)$ ]] || return 1
+  printf '%s-%s\n' "$(normalize_port "${BASH_REMATCH[1]}")" "$(normalize_port "${BASH_REMATCH[2]}")"
+}
+
+valid_server_address() {
+  local address="${1:-}"
+  if [[ "$address" == *:* || "$address" =~ ^[0-9.]+$ ]]; then
+    printf '%s' "$address" | python3 -c '
+import ipaddress
+import sys
+
+address = sys.stdin.read()
+try:
+    parsed = ipaddress.ip_address(address)
+except ValueError:
+    raise SystemExit(1)
+if parsed.version == 4 and str(parsed) != address:
+    raise SystemExit(1)
+'
+  else
+    valid_domain "$address"
+  fi
 }
 
 mode_needs_domain() {
-  [[ "$MODE" == "cloudflare" || "$MODE" == "dual" ]]
+  mode_has_cloudflare
 }
 
-mode_has_reality() {
-  [[ "$MODE" == "reality" || "$MODE" == "dual" ]]
+mode_has_hysteria() {
+  [[ "$MODE" == "direct" || "$MODE" == "full" ]]
+}
+
+mode_has_shadowsocks() {
+  [[ "$MODE" == "direct" || "$MODE" == "full" ]]
 }
 
 mode_has_cloudflare() {
-  [[ "$MODE" == "cloudflare" || "$MODE" == "dual" ]]
+  [[ "$MODE" == "cloudflare" || "$MODE" == "full" ]]
 }
 
 resolve_default_ports() {
   case "$MODE" in
-    reality)
-      REALITY_PORT="${REALITY_PORT:-443}"
+    direct)
+      DOMAIN=""
+      EMAIL=""
       CLOUDFLARE_PORT=""
+      INTERNAL_WS_PORT=""
+      CLOUDFLARE_UUID=""
+      WS_PATH=""
+      HY2_PORT_RANGE="${HY2_PORT_RANGE:-20000-20100}"
+      SS_PORT="${SS_PORT:-8388}"
       ;;
     cloudflare)
-      REALITY_PORT=""
       CLOUDFLARE_PORT="${CLOUDFLARE_PORT:-443}"
+      HY2_PORT_RANGE=""
+      HY2_AUTH=""
+      HY2_OBFS_PASSWORD=""
+      HY2_SNI=""
+      HY2_CERT_PIN=""
+      SS_PORT=""
+      SS_METHOD=""
+      SS_KEY=""
+      SERVER_ADDRESS=""
       ;;
-    dual)
-      REALITY_PORT="${REALITY_PORT:-443}"
-      CLOUDFLARE_PORT="${CLOUDFLARE_PORT:-8443}"
+    full)
+      CLOUDFLARE_PORT="${CLOUDFLARE_PORT:-443}"
+      HY2_PORT_RANGE="${HY2_PORT_RANGE:-20000-20100}"
+      SS_PORT="${SS_PORT:-8388}"
       ;;
-    *) die "Mode must be reality, cloudflare, or dual" ;;
+    *) die "Mode must be direct, cloudflare, or full" ;;
   esac
 }
 
 choose_mode() {
   local choice=""
-  printf '%s\n' "1) Direct only: VLESS + REALITY + XTLS Vision"
-  printf '%s\n' "2) Cloudflare only: VLESS + WebSocket + TLS"
-  printf '%s\n' "3) Dual entry (recommended)"
+  printf '%s\n' "1) Direct: Hysteria2 + Shadowsocks 2022 (no domain)"
+  printf '%s\n' "2) Cloudflare: VLESS + WebSocket + TLS"
+  printf '%s\n' "3) Full: Cloudflare + Hysteria2 + Shadowsocks 2022 (recommended)"
   read -r -p "Select mode [3]: " choice
   case "${choice:-3}" in
-    1) MODE="reality" ;;
+    1) MODE="direct" ;;
     2) MODE="cloudflare" ;;
-    3) MODE="dual" ;;
+    3) MODE="full" ;;
     *) die "Invalid menu choice: $choice" ;;
   esac
 }
@@ -168,17 +202,18 @@ Usage:
   sudo bash v2ray-onekey.sh [options]
 
 Options:
-  --mode reality|cloudflare|dual
+  --mode direct|cloudflare|full
   --domain DOMAIN
   --email EMAIL
-  --reality-port PORT
   --cloudflare-port PORT
-  --reality-target HOST:PORT
-  --reality-uuid UUID
+  --hy2-port-range START-END
+  --ss-port PORT
+  --server-address ADDRESS
   --cloudflare-uuid UUID
   --ws-path /PATH
   --rotate
   --allow-bittorrent
+  --allow-mail
   -h, --help
 USAGE
 }
@@ -190,8 +225,8 @@ parse_args() {
         [[ $# -ge 2 && -n "$2" ]] || die "--mode requires a value"
         MODE="$2"
         CLI_MODE_SET="1"
-        [[ "$MODE" == "reality" || "$MODE" == "cloudflare" || "$MODE" == "dual" ]] ||
-          die "--mode must be reality, cloudflare, or dual"
+        [[ "$MODE" == "direct" || "$MODE" == "cloudflare" || "$MODE" == "full" ]] ||
+          die "--mode must be direct, cloudflare, or full"
         shift 2
         ;;
       --domain)
@@ -206,28 +241,28 @@ parse_args() {
         CLI_EMAIL_SET="1"
         shift 2
         ;;
-      --reality-port)
-        [[ $# -ge 2 && -n "$2" ]] || die "--reality-port requires a value"
-        REALITY_PORT="$2"
-        CLI_REALITY_PORT_SET="1"
-        shift 2
-        ;;
       --cloudflare-port)
         [[ $# -ge 2 && -n "$2" ]] || die "--cloudflare-port requires a value"
         CLOUDFLARE_PORT="$2"
         CLI_CLOUDFLARE_PORT_SET="1"
         shift 2
         ;;
-      --reality-target)
-        [[ $# -ge 2 && -n "$2" ]] || die "--reality-target requires a value"
-        REALITY_TARGET="$2"
-        CLI_REALITY_TARGET_SET="1"
+      --hy2-port-range)
+        [[ $# -ge 2 && -n "$2" ]] || die "--hy2-port-range requires a value"
+        HY2_PORT_RANGE="$2"
+        CLI_HY2_PORT_RANGE_SET="1"
         shift 2
         ;;
-      --reality-uuid)
-        [[ $# -ge 2 && -n "$2" ]] || die "--reality-uuid requires a value"
-        REALITY_UUID="$2"
-        CLI_REALITY_UUID_SET="1"
+      --ss-port)
+        [[ $# -ge 2 && -n "$2" ]] || die "--ss-port requires a value"
+        SS_PORT="$2"
+        CLI_SS_PORT_SET="1"
+        shift 2
+        ;;
+      --server-address)
+        [[ $# -ge 2 && -n "$2" ]] || die "--server-address requires a value"
+        SERVER_ADDRESS="$2"
+        CLI_SERVER_ADDRESS_SET="1"
         shift 2
         ;;
       --cloudflare-uuid)
@@ -251,6 +286,11 @@ parse_args() {
         CLI_ALLOW_BITTORRENT_SET="1"
         shift
         ;;
+      --allow-mail)
+        ALLOW_MAIL="1"
+        CLI_ALLOW_MAIL_SET="1"
+        shift
+        ;;
       -h|--help)
         usage
         exit 0
@@ -268,7 +308,7 @@ select_mode() {
   if stdin_is_tty; then
     choose_mode
   else
-    die "--mode is required for non-interactive use. Example: sudo bash v2ray-onekey.sh --mode dual --domain vpn.example.com --email admin@example.com"
+    die "--mode is required for non-interactive use. Example: sudo bash v2ray-onekey.sh --mode full --domain vpn.example.com --email admin@example.com"
   fi
 }
 
@@ -276,7 +316,50 @@ valid_uuid() {
   [[ "$1" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]
 }
 
+validate_explicit_option_values() {
+  if [[ "$CLI_DOMAIN_SET" == "1" ]]; then
+    valid_domain "$DOMAIN" || die "Invalid domain: $DOMAIN"
+  fi
+  if [[ "$CLI_CLOUDFLARE_PORT_SET" == "1" ]]; then
+    valid_cloudflare_port "$CLOUDFLARE_PORT" || die "Unsupported Cloudflare port: $CLOUDFLARE_PORT"
+  fi
+  if [[ "$CLI_HY2_PORT_RANGE_SET" == "1" ]]; then
+    valid_hy2_port_range "$HY2_PORT_RANGE" || die "Invalid Hysteria2 port range: $HY2_PORT_RANGE"
+  fi
+  if [[ "$CLI_SS_PORT_SET" == "1" ]]; then
+    valid_port "$SS_PORT" || die "Invalid Shadowsocks port: $SS_PORT"
+  fi
+  if [[ "$CLI_SERVER_ADDRESS_SET" == "1" ]]; then
+    valid_server_address "$SERVER_ADDRESS" || die "Invalid server address: $SERVER_ADDRESS"
+  fi
+  if [[ "$CLI_CLOUDFLARE_UUID_SET" == "1" ]]; then
+    valid_uuid "$CLOUDFLARE_UUID" || die "Invalid Cloudflare UUID: $CLOUDFLARE_UUID"
+  fi
+  if [[ "$CLI_WS_PATH_SET" == "1" ]]; then
+    valid_ws_path "$WS_PATH" ||
+      die "WebSocket path must use / followed by A-Z, a-z, 0-9, ., _, ~, or -"
+  fi
+}
+
+validate_mode_option_compatibility() {
+  if [[ "$MODE" == "cloudflare" ]]; then
+    [[ "$CLI_HY2_PORT_RANGE_SET" != "1" ]] || die "--hy2-port-range cannot be used with cloudflare mode"
+    [[ "$CLI_SS_PORT_SET" != "1" ]] || die "--ss-port cannot be used with cloudflare mode"
+    [[ "$CLI_SERVER_ADDRESS_SET" != "1" ]] || die "--server-address cannot be used with cloudflare mode"
+  elif [[ "$MODE" == "direct" ]]; then
+    [[ "$CLI_CLOUDFLARE_PORT_SET" != "1" ]] || die "--cloudflare-port cannot be used with direct mode"
+    [[ "$CLI_DOMAIN_SET" != "1" ]] || die "--domain cannot be used with direct mode"
+    [[ "$CLI_EMAIL_SET" != "1" ]] || die "--email cannot be used with direct mode"
+    [[ "$CLI_CLOUDFLARE_UUID_SET" != "1" ]] || die "--cloudflare-uuid cannot be used with direct mode"
+    [[ "$CLI_WS_PATH_SET" != "1" ]] || die "--ws-path cannot be used with direct mode"
+  fi
+}
+
 validate_options() {
+  if [[ "${1:-}" != "state" ]]; then
+    validate_explicit_option_values
+    validate_mode_option_compatibility
+  fi
   resolve_default_ports
 
   if mode_needs_domain; then
@@ -287,27 +370,35 @@ validate_options() {
   [[ -z "$DOMAIN" ]] || valid_domain "$DOMAIN" || die "Invalid domain: $DOMAIN"
   [[ -z "$DOMAIN" ]] || DOMAIN="$(normalize_domain "$DOMAIN")"
 
-  if mode_has_reality; then
-    valid_port "$REALITY_PORT" || die "Invalid REALITY port: $REALITY_PORT"
-    REALITY_PORT="$(normalize_port "$REALITY_PORT")"
-    valid_reality_target "$REALITY_TARGET" || die "Invalid REALITY target: $REALITY_TARGET (expected HOST:PORT)"
-  fi
   if mode_has_cloudflare; then
     valid_cloudflare_port "$CLOUDFLARE_PORT" || die "Unsupported Cloudflare port: $CLOUDFLARE_PORT"
     CLOUDFLARE_PORT="$(normalize_port "$CLOUDFLARE_PORT")"
   fi
-  if [[ "$MODE" == "dual" && "$REALITY_PORT" == "$CLOUDFLARE_PORT" ]]; then
-    die "REALITY and Cloudflare public ports must be different in dual mode"
+  if mode_has_hysteria; then
+    valid_hy2_port_range "$HY2_PORT_RANGE" || die "Invalid Hysteria2 port range: $HY2_PORT_RANGE"
+    HY2_PORT_RANGE="$(normalize_hy2_port_range "$HY2_PORT_RANGE")"
+  fi
+  if mode_has_shadowsocks; then
+    valid_port "$SS_PORT" || die "Invalid Shadowsocks port: $SS_PORT"
+    SS_PORT="$(normalize_port "$SS_PORT")"
   fi
 
-  [[ -z "$REALITY_UUID" ]] || valid_uuid "$REALITY_UUID" || die "Invalid REALITY UUID: $REALITY_UUID"
+  [[ -z "$SERVER_ADDRESS" ]] || valid_server_address "$SERVER_ADDRESS" ||
+    die "Invalid server address: $SERVER_ADDRESS"
   [[ -z "$CLOUDFLARE_UUID" ]] || valid_uuid "$CLOUDFLARE_UUID" || die "Invalid Cloudflare UUID: $CLOUDFLARE_UUID"
   [[ -z "$WS_PATH" ]] || valid_ws_path "$WS_PATH" ||
     die "WebSocket path must use / followed by A-Z, a-z, 0-9, ., _, ~, or -"
 }
 
 STATE_KEYS=(
-  MODE DOMAIN EMAIL REALITY_PORT CLOUDFLARE_PORT INTERNAL_WS_PORT
+  STATE_SCHEMA MODE DOMAIN EMAIL CLOUDFLARE_PORT INTERNAL_WS_PORT
+  CLOUDFLARE_UUID WS_PATH HY2_PORT_RANGE HY2_AUTH HY2_OBFS_PASSWORD
+  HY2_SNI HY2_CERT_PIN SS_PORT SS_METHOD SS_KEY SERVER_ADDRESS
+  ALLOW_BITTORRENT ALLOW_MAIL
+)
+
+LEGACY_STATE_KEYS=(
+  STATE_SCHEMA MODE DOMAIN EMAIL REALITY_PORT CLOUDFLARE_PORT INTERNAL_WS_PORT
   REALITY_UUID CLOUDFLARE_UUID REALITY_PRIVATE_KEY REALITY_PUBLIC_KEY
   REALITY_SHORT_ID REALITY_TARGET WS_PATH ALLOW_BITTORRENT
 )
@@ -321,11 +412,26 @@ state_key_allowed() {
   return 1
 }
 
-state_value_is_shell_escaped() {
-  python3 - "$1" <<'PY'
+legacy_state_key_allowed() {
+  local key="$1"
+  local allowed=""
+  for allowed in "${LEGACY_STATE_KEYS[@]}"; do
+    [[ "$key" == "$allowed" ]] && return 0
+  done
+  return 1
+}
+
+state_record_is_shell_escaped() {
+  python3 -c '
 import sys
 
-value = sys.argv[1]
+record = sys.stdin.buffer.read().split(b"\0")
+if len(record) != 3 or record[2]:
+    raise SystemExit(1)
+key = record[0].decode("ascii")
+value = record[1].decode("utf-8")
+if not key:
+    raise SystemExit(1)
 safe = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_@%+=:,./-")
 index = 0
 while index < len(value):
@@ -334,14 +440,14 @@ while index < len(value):
         index += 1
     elif character == "\\":
         index += 2
-    elif value.startswith("''", index):
+    elif value.startswith(chr(39) * 2, index):
         index += 2
-    elif value.startswith("$'", index):
+    elif value.startswith("$" + chr(39), index):
         index += 2
         while index < len(value):
             if value[index] == "\\":
                 index += 2
-            elif value[index] == "'":
+            elif value[index] == chr(39):
                 index += 1
                 break
             else:
@@ -352,40 +458,29 @@ while index < len(value):
         raise SystemExit(1)
     if index > len(value):
         raise SystemExit(1)
-PY
+'
 }
 
 validate_loaded_runtime_values() {
-  if mode_has_reality; then
-    valid_uuid "$REALITY_UUID" || die "Invalid REALITY UUID in state"
-    valid_x25519_key "$REALITY_PRIVATE_KEY" ||
-      die "Invalid REALITY private key (length ${#REALITY_PRIVATE_KEY}; expected 43 URL-safe characters)"
-    valid_x25519_key "$REALITY_PUBLIC_KEY" ||
-      die "Invalid REALITY public key (length ${#REALITY_PUBLIC_KEY}; expected 43 URL-safe characters)"
-    valid_reality_short_id "$REALITY_SHORT_ID" || die "Invalid REALITY short ID in state"
-  else
-    [[ -z "$REALITY_UUID" && -z "$REALITY_PRIVATE_KEY" && -z "$REALITY_PUBLIC_KEY" && -z "$REALITY_SHORT_ID" ]] ||
-      die "Inactive REALITY state must not contain credentials"
-  fi
-
   if mode_has_cloudflare; then
     valid_uuid "$CLOUDFLARE_UUID" || die "Invalid Cloudflare UUID in state"
     valid_port "$INTERNAL_WS_PORT" || die "Invalid internal WebSocket port: $INTERNAL_WS_PORT"
-    [[ "$INTERNAL_WS_PORT" != "$REALITY_PORT" && "$INTERNAL_WS_PORT" != "$CLOUDFLARE_PORT" ]] ||
+    [[ "$INTERNAL_WS_PORT" != "$CLOUDFLARE_PORT" ]] ||
       die "Internal WebSocket port must not match a public port"
     valid_ws_path "$WS_PATH" || die "WebSocket path must start with / and contain no whitespace"
   else
     [[ -z "$CLOUDFLARE_UUID" && -z "$INTERNAL_WS_PORT" && -z "$WS_PATH" ]] ||
       die "Inactive Cloudflare state must not contain credentials"
   fi
-}
 
-valid_x25519_key() {
-  [[ "$1" =~ ^[A-Za-z0-9_-]{43}$ ]]
-}
-
-valid_reality_short_id() {
-  [[ "$1" =~ ^[A-Fa-f0-9]{2,16}$ ]] && (( ${#1} % 2 == 0 ))
+  if ! mode_has_hysteria; then
+    [[ -z "$HY2_AUTH$HY2_OBFS_PASSWORD$HY2_SNI$HY2_CERT_PIN" ]] ||
+      die "Inactive Hysteria2 state must not contain credentials"
+  fi
+  if ! mode_has_shadowsocks; then
+    [[ -z "$SS_METHOD$SS_KEY" ]] ||
+      die "Inactive Shadowsocks state must not contain settings or credentials"
+  fi
 }
 
 valid_ws_path() {
@@ -394,6 +489,7 @@ valid_ws_path() {
 
 save_state() (
   local state_dir state_name temp_state key
+  STATE_SCHEMA="2"
   state_dir="$(dirname "$STATE_FILE")"
   state_name="$(basename "$STATE_FILE")"
   install -d -m 700 "$state_dir"
@@ -408,7 +504,7 @@ save_state() (
 )
 
 load_state() {
-  local owner mode line key value
+  local owner mode line key value loaded_schema="1"
   local -A seen=()
   [[ -f "$STATE_FILE" ]] || die "State file does not exist: $STATE_FILE"
   owner="$(stat -c '%u' "$STATE_FILE")" || die "Unable to inspect state file: $STATE_FILE"
@@ -420,43 +516,88 @@ load_state() {
   fi
 
   while IFS= read -r line || [[ -n "$line" ]]; do
-    [[ "$line" =~ ^([A-Z_]+)=(.*)$ ]] || die "Malformed state assignment"
+    [[ "$line" =~ ^([A-Z][A-Z0-9_]*)=(.*)$ ]] || die "Malformed state assignment"
     key="${BASH_REMATCH[1]}"
     value="${BASH_REMATCH[2]}"
-    state_key_allowed "$key" || die "State contains unexpected assignment: $key"
+    if ! state_key_allowed "$key" && ! legacy_state_key_allowed "$key"; then
+      die "State contains unexpected assignment: $key"
+    fi
     [[ -z "${seen[$key]:-}" ]] || die "State contains duplicate assignment: $key"
-    state_value_is_shell_escaped "$value" || die "Malformed state value for $key"
+    printf '%s\0%s\0' "$key" "$value" | state_record_is_shell_escaped ||
+      die "Malformed state value for $key"
+    if [[ "$key" == "STATE_SCHEMA" ]]; then
+      [[ "$value" == "1" || "$value" == "2" ]] || die "Unsupported state schema: $value"
+      loaded_schema="$value"
+    fi
     seen["$key"]=1
   done <"$STATE_FILE"
-  for key in "${STATE_KEYS[@]}"; do
-    [[ "${seen[$key]:-}" == "1" ]] || die "State is missing assignment: $key"
-  done
 
-  # The allowlist and shell-escape parser above make these assignments inert data.
-  # shellcheck disable=SC1090
-  source "$STATE_FILE"
+  case "$loaded_schema" in
+    1)
+      for key in "${LEGACY_STATE_KEYS[@]}"; do
+        [[ "$key" == "STATE_SCHEMA" ]] && continue
+        [[ "${seen[$key]:-}" == "1" ]] || die "State is missing assignment: $key"
+      done
+      for key in "${!seen[@]}"; do
+        legacy_state_key_allowed "$key" || die "Schema 1 state contains unexpected assignment: $key"
+      done
+      ;;
+    2)
+      for key in "${STATE_KEYS[@]}"; do
+        [[ "${seen[$key]:-}" == "1" ]] || die "State is missing assignment: $key"
+      done
+      for key in "${!seen[@]}"; do
+        state_key_allowed "$key" || die "Schema 2 state contains unexpected assignment: $key"
+      done
+      ;;
+    *) die "Unsupported state schema: $loaded_schema" ;;
+  esac
+
+  if [[ "$loaded_schema" == "1" ]]; then
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      key="${line%%=*}"
+      case "$key" in
+        MODE|DOMAIN|EMAIL|CLOUDFLARE_PORT|INTERNAL_WS_PORT|CLOUDFLARE_UUID|WS_PATH|ALLOW_BITTORRENT)
+          # The allowlist and shell-escape parser above make this assignment inert data.
+          # shellcheck disable=SC1091
+          source /dev/stdin <<<"$line"
+          ;;
+      esac
+    done <"$STATE_FILE"
+    case "$MODE" in
+      reality)
+        die "Automatic REALITY-only migration is unsafe; use the dedicated migration path or choose a supported mode"
+        ;;
+      cloudflare) MODE="cloudflare" ;;
+      dual) MODE="full" ;;
+      *) die "Invalid legacy mode in state: $MODE" ;;
+    esac
+    STATE_SCHEMA="2"
+    HY2_PORT_RANGE=""
+    HY2_AUTH=""
+    HY2_OBFS_PASSWORD=""
+    HY2_SNI=""
+    HY2_CERT_PIN=""
+    SS_PORT=""
+    SS_METHOD=""
+    SS_KEY=""
+    SERVER_ADDRESS=""
+    ALLOW_MAIL="0"
+  else
+    # The allowlist and shell-escape parser above make these assignments inert data.
+    # shellcheck disable=SC1090
+    source "$STATE_FILE"
+  fi
   ROTATE="0"
-  validate_options
+  validate_options state
   validate_loaded_runtime_values
-}
-
-read_x25519_keypair() {
-  local output private_key public_key
-  output="$(xray x25519)" || die "Unable to generate REALITY x25519 key pair"
-  private_key="$(awk -F: '/^Private( key|Key):/{gsub(/\r/, "", $2); sub(/^[ \t]*/, "", $2); sub(/[ \t]*$/, "", $2); print $2; exit}' <<<"$output")"
-  public_key="$(awk -F: '/^Password( \(PublicKey\))?:/{gsub(/\r/, "", $2); sub(/^[ \t]*/, "", $2); sub(/[ \t]*$/, "", $2); print $2; exit}' <<<"$output")"
-  [[ -n "$public_key" ]] ||
-    public_key="$(awk -F: '/^Public key:/{gsub(/\r/, "", $2); sub(/^[ \t]*/, "", $2); sub(/[ \t]*$/, "", $2); print $2; exit}' <<<"$output")"
-  [[ -n "$private_key" && -n "$public_key" ]] || die "Unable to parse xray x25519 output"
-  REALITY_PRIVATE_KEY="$private_key"
-  REALITY_PUBLIC_KEY="$public_key"
 }
 
 random_internal_ws_port() {
   local candidate attempts=0
   while (( attempts < 32 )); do
     candidate="$(shuf -i 20000-50000 -n 1)" || die "Unable to select an internal WebSocket port"
-    if [[ "$candidate" != "$REALITY_PORT" && "$candidate" != "$CLOUDFLARE_PORT" ]]; then
+    if [[ "$candidate" != "$CLOUDFLARE_PORT" ]]; then
       printf '%s\n' "$candidate"
       return 0
     fi
@@ -466,13 +607,6 @@ random_internal_ws_port() {
 }
 
 generate_runtime_values() {
-  if mode_has_reality; then
-    [[ -n "$REALITY_UUID" ]] || REALITY_UUID="$(xray uuid)"
-    if [[ -z "$REALITY_PRIVATE_KEY" || -z "$REALITY_PUBLIC_KEY" ]]; then
-      read_x25519_keypair
-    fi
-    [[ -n "$REALITY_SHORT_ID" ]] || REALITY_SHORT_ID="$(openssl rand -hex 8)"
-  fi
   if mode_has_cloudflare; then
     [[ -n "$CLOUDFLARE_UUID" ]] || CLOUDFLARE_UUID="$(xray uuid)"
     [[ -n "$INTERNAL_WS_PORT" ]] || INTERNAL_WS_PORT="$(random_internal_ws_port)"
@@ -481,21 +615,23 @@ generate_runtime_values() {
 }
 
 rotate_runtime_values() {
-  REALITY_UUID=""
   CLOUDFLARE_UUID=""
-  REALITY_PRIVATE_KEY=""
-  REALITY_PUBLIC_KEY=""
-  REALITY_SHORT_ID=""
   INTERNAL_WS_PORT=""
   WS_PATH=""
+  HY2_AUTH=""
+  HY2_OBFS_PASSWORD=""
+  HY2_SNI=""
+  HY2_CERT_PIN=""
+  SS_KEY=""
 }
 
 prepare_configuration() {
   local cli_mode="$MODE" cli_domain="$DOMAIN" cli_email="$EMAIL"
-  local cli_reality_port="$REALITY_PORT" cli_cloudflare_port="$CLOUDFLARE_PORT"
-  local cli_reality_target="$REALITY_TARGET" cli_reality_uuid="$REALITY_UUID"
+  local cli_cloudflare_port="$CLOUDFLARE_PORT" cli_hy2_port_range="$HY2_PORT_RANGE"
+  local cli_ss_port="$SS_PORT" cli_server_address="$SERVER_ADDRESS"
   local cli_cloudflare_uuid="$CLOUDFLARE_UUID" cli_ws_path="$WS_PATH"
   local cli_rotate="$ROTATE" cli_allow_bittorrent="$ALLOW_BITTORRENT"
+  local cli_allow_mail="$ALLOW_MAIL"
   local saved_mode=""
 
   if [[ -f "$STATE_FILE" ]]; then
@@ -504,13 +640,14 @@ prepare_configuration() {
     if [[ "$CLI_MODE_SET" == "1" ]]; then MODE="$cli_mode"; fi
     if [[ "$CLI_DOMAIN_SET" == "1" ]]; then DOMAIN="$cli_domain"; fi
     if [[ "$CLI_EMAIL_SET" == "1" ]]; then EMAIL="$cli_email"; fi
-    if [[ "$CLI_REALITY_PORT_SET" == "1" ]]; then REALITY_PORT="$cli_reality_port"; fi
     if [[ "$CLI_CLOUDFLARE_PORT_SET" == "1" ]]; then CLOUDFLARE_PORT="$cli_cloudflare_port"; fi
-    if [[ "$CLI_REALITY_TARGET_SET" == "1" ]]; then REALITY_TARGET="$cli_reality_target"; fi
-    if [[ "$CLI_REALITY_UUID_SET" == "1" ]]; then REALITY_UUID="$cli_reality_uuid"; fi
+    if [[ "$CLI_HY2_PORT_RANGE_SET" == "1" ]]; then HY2_PORT_RANGE="$cli_hy2_port_range"; fi
+    if [[ "$CLI_SS_PORT_SET" == "1" ]]; then SS_PORT="$cli_ss_port"; fi
+    if [[ "$CLI_SERVER_ADDRESS_SET" == "1" ]]; then SERVER_ADDRESS="$cli_server_address"; fi
     if [[ "$CLI_CLOUDFLARE_UUID_SET" == "1" ]]; then CLOUDFLARE_UUID="$cli_cloudflare_uuid"; fi
     if [[ "$CLI_WS_PATH_SET" == "1" ]]; then WS_PATH="$cli_ws_path"; fi
     if [[ "$CLI_ALLOW_BITTORRENT_SET" == "1" ]]; then ALLOW_BITTORRENT="$cli_allow_bittorrent"; fi
+    if [[ "$CLI_ALLOW_MAIL_SET" == "1" ]]; then ALLOW_MAIL="$cli_allow_mail"; fi
     ROTATE="$cli_rotate"
     if [[ "$MODE" != "$saved_mode" && "$ROTATE" != "1" ]]; then
       die "Changing an existing deployment mode requires --rotate"
@@ -683,22 +820,6 @@ EOF
 
 valid_cloudflare_timeout() {
   [[ "$1" =~ ^[0-9]{1,3}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 300 ))
-}
-
-validate_reality_target() {
-  local target="$1" hostname
-  valid_reality_target "$target" || die "Invalid REALITY target: $target (expected HOST:PORT)"
-  hostname="${target%:*}"
-  host_resolves_to_cloudflare "$hostname" && die "REALITY target resolves to Cloudflare: $hostname"
-  timeout 15 xray tls ping "$target" >/dev/null || die "REALITY target TLS ping failed: $target"
-}
-
-validate_unique_public_ports() {
-  local -a ports=()
-  mode_has_reality && ports+=("$REALITY_PORT")
-  mode_has_cloudflare && ports+=("$CLOUDFLARE_PORT")
-  [[ ${#ports[@]} -lt 2 || "${ports[0]}" != "${ports[1]}" ]] ||
-    die "REALITY and Cloudflare public ports must be different in dual mode"
 }
 
 legacy_nginx_config_path() {
@@ -1382,13 +1503,7 @@ port_listener_conflicts() {
     if [[ "$listener" == *xray* || "$listener" == *v2ray* ]]; then
       continue
     fi
-    if [[ "$listener" == *nginx* ]]; then
-      if [[ "$role" == "reality" ]] &&
-        ! legacy_nginx_config_for_port_is_project_owned "$port"; then
-        return 0
-      fi
-      continue
-    fi
+    [[ "$listener" == *nginx* ]] && continue
     return 0
   done <<<"$PORT_CONFLICT_DETAILS"
   if [[ "$role" == "cloudflare" || "$role" == "acme" ]] &&
@@ -1407,51 +1522,36 @@ complete_listener_diagnostics() {
   printf '%s\n' "$output"
 }
 
-resolve_one_public_port() {
-  local role="$1" option_name="$2" attempt replacement current_port full_listeners
+resolve_cloudflare_port() {
+  local attempt replacement full_listeners
   for attempt in 1 2 3 4 5; do
-    if [[ "$role" == "reality" ]]; then current_port="$REALITY_PORT"; else current_port="$CLOUDFLARE_PORT"; fi
-    port_listener_conflicts "$role" "$current_port" || return 0
+    port_listener_conflicts cloudflare "$CLOUDFLARE_PORT" || return 0
     if ! stdin_is_tty; then
       full_listeners="$(complete_listener_diagnostics)"
-      die "TCP port $current_port is occupied. Rerun using $option_name PORT. Conflict: $PORT_CONFLICT_DETAILS
+      die "TCP port $CLOUDFLARE_PORT is occupied. Rerun using --cloudflare-port PORT. Conflict: $PORT_CONFLICT_DETAILS
 ss -lntp output:
 $full_listeners"
     fi
-    warn "TCP port $current_port is unavailable: $PORT_CONFLICT_DETAILS"
-    read -r -p "Enter a replacement port for $role (or q to cancel): " replacement ||
+    warn "TCP port $CLOUDFLARE_PORT is unavailable: $PORT_CONFLICT_DETAILS"
+    read -r -p "Enter a replacement Cloudflare port (or q to cancel): " replacement ||
       die "Port selection cancelled"
     [[ "$replacement" != "q" && "$replacement" != "Q" ]] || die "Port selection cancelled"
-    if [[ "$role" == "cloudflare" ]]; then
-      valid_cloudflare_port "$replacement" || {
-        warn "Cloudflare HTTPS ports: 443, 2053, 2083, 2087, 2096, 8443"
-        continue
-      }
-    else
-      valid_port "$replacement" || {
-        warn "Enter a valid TCP port from 1 to 65535"
-        continue
-      }
-    fi
-    replacement="$(normalize_port "$replacement")"
-    if [[ "$MODE" == "dual" &&
-      ( ( "$role" == "reality" && "$replacement" == "$CLOUDFLARE_PORT" ) ||
-        ( "$role" == "cloudflare" && "$replacement" == "$REALITY_PORT" ) ) ]]; then
-      warn "REALITY and Cloudflare public ports must be different"
+    valid_cloudflare_port "$replacement" || {
+      warn "Cloudflare HTTPS ports: 443, 2053, 2083, 2087, 2096, 8443"
       continue
-    fi
-    if [[ "$role" == "reality" ]]; then REALITY_PORT="$replacement"; else CLOUDFLARE_PORT="$replacement"; fi
-    port_listener_conflicts "$role" "$replacement" || return 0
+    }
+    replacement="$(normalize_port "$replacement")"
+    CLOUDFLARE_PORT="$replacement"
+    port_listener_conflicts cloudflare "$replacement" || return 0
   done
-  die "Unable to select an available $role port after 5 attempts"
+  die "Unable to select an available Cloudflare port after 5 attempts"
 }
 
 resolve_public_port_conflicts() {
   local full_listeners=""
-  mode_has_reality && resolve_one_public_port reality "--reality-port"
-  mode_has_cloudflare && resolve_one_public_port cloudflare "--cloudflare-port"
-  validate_unique_public_ports
-  if mode_has_cloudflare && port_listener_conflicts acme 80; then
+  mode_has_cloudflare || return 0
+  resolve_cloudflare_port
+  if port_listener_conflicts acme 80; then
     full_listeners="$(complete_listener_diagnostics)"
     die "TCP port 80 is unavailable for the ACME HTTP-01 challenge. Conflict: $PORT_CONFLICT_DETAILS
 ss -lntp output:
@@ -1491,12 +1591,22 @@ check_internal_ws_port_listener() {
   ensure_internal_ws_port_available
 }
 
+direct_bundle_ready() {
+  return 1
+}
+
+require_mode_ready() {
+  if mode_has_hysteria || mode_has_shadowsocks; then
+    direct_bundle_ready || die "Direct bundle is not available in this build yet"
+  fi
+}
+
 preflight_environment() {
+  require_mode_ready
   [[ "$(uname -s)" == "Linux" ]] || die "This script requires Linux"
   [[ "$(id -u)" -eq 0 ]] || die "Please run as root"
   command -v systemctl >/dev/null 2>&1 || die "systemd is required"
   detect_pkg_manager
-  validate_unique_public_ports
 }
 
 detect_pkg_manager() {
@@ -1590,28 +1700,6 @@ install_nginx_config_atomically() {
   mv -f -- "$temp" "$NGINX_SITE"
 }
 
-public_ip() {
-  local ip=""
-  ip="$(curl -4fsS --connect-timeout 3 --max-time 6 https://api.ipify.org || true)"
-  valid_public_ip "$ip" || ip="$(curl -4fsS --connect-timeout 3 --max-time 6 https://ifconfig.me || true)"
-  valid_public_ip "$ip" || return 1
-  printf '%s' "$ip"
-}
-
-valid_public_ip() {
-  python3 - "$1" <<'PY'
-import ipaddress
-import sys
-
-try:
-    address = ipaddress.ip_address(sys.argv[1])
-except ValueError:
-    raise SystemExit(1)
-if not address.is_global:
-    raise SystemExit(1)
-PY
-}
-
 render_xray_config() {
   local output_path="$1"
   local output_dir=""
@@ -1623,13 +1711,8 @@ render_xray_config() {
   python3 - \
     "$temp_path" \
     "$MODE" \
-    "$REALITY_PORT" \
     "$INTERNAL_WS_PORT" \
-    "$REALITY_UUID" \
     "$CLOUDFLARE_UUID" \
-    "$REALITY_PRIVATE_KEY" \
-    "$REALITY_SHORT_ID" \
-    "$REALITY_TARGET" \
     "$WS_PATH" \
     "$ALLOW_BITTORRENT" <<'PY' || render_status=$?
 import json
@@ -1639,13 +1722,8 @@ import sys
 (
     output_path,
     mode,
-    reality_port,
     internal_ws_port,
-    reality_uuid,
     cloudflare_uuid,
-    reality_private_key,
-    reality_short_id,
-    reality_target,
     ws_path,
     allow_bittorrent,
 ) = sys.argv[1:]
@@ -1657,39 +1735,7 @@ sniffing = {
 }
 inbounds = []
 
-if mode in ("reality", "dual"):
-    inbounds.append(
-        {
-            "tag": "reality-in",
-            "listen": "0.0.0.0",
-            "port": int(reality_port),
-            "protocol": "vless",
-            "settings": {
-                "clients": [
-                    {
-                        "id": reality_uuid,
-                        "flow": "xtls-rprx-vision",
-                        "email": "reality",
-                    }
-                ],
-                "decryption": "none",
-            },
-            "streamSettings": {
-                "network": "raw",
-                "security": "reality",
-                "realitySettings": {
-                    "show": False,
-                    "target": reality_target,
-                    "serverNames": [reality_target.rsplit(":", 1)[0]],
-                    "privateKey": reality_private_key,
-                    "shortIds": [reality_short_id],
-                },
-            },
-            "sniffing": sniffing,
-        }
-    )
-
-if mode in ("cloudflare", "dual"):
+if mode in ("cloudflare", "full"):
     inbounds.append(
         {
             "tag": "cloudflare-ws-in",
@@ -1754,24 +1800,6 @@ PY
 
 urlencode() {
   python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1"
-}
-
-format_uri_host() {
-  python3 - "$1" <<'PY'
-import ipaddress
-import sys
-
-
-try:
-    address = ipaddress.ip_address(sys.argv[1])
-except ValueError:
-    raise SystemExit(1)
-
-if address.version == 6:
-    print(f"[{address.compressed}]")
-else:
-    print(address.compressed)
-PY
 }
 
 open_firewall_port() {
@@ -2025,9 +2053,6 @@ wait_for_listener_owner() {
 
 verify_started_services() {
   systemctl is-active --quiet xray || die "Xray is not active after restart"
-  if mode_has_reality; then
-    wait_for_listener_owner "$REALITY_PORT" xray
-  fi
   if mode_has_cloudflare; then
     systemctl is-active --quiet nginx || die "Nginx is not active after reload"
     wait_for_listener_owner "$INTERNAL_WS_PORT" xray 127.0.0.1
@@ -2047,36 +2072,29 @@ configure_firewall() {
     open_firewall_port 80 tcp
     open_firewall_port "$CLOUDFLARE_PORT" tcp
   fi
-  if mode_has_reality; then
-    open_firewall_port "$REALITY_PORT" tcp
-  fi
 }
 
 required_public_ports() {
   local -a ports=()
   mode_has_cloudflare && ports+=(80 "$CLOUDFLARE_PORT")
-  mode_has_reality && ports+=("$REALITY_PORT")
-  printf '%s\n' "${ports[@]}"
+  ((${#ports[@]} > 0)) && printf '%s\n' "${ports[@]}"
 }
 
 print_deployment_summary() {
   local port_list=""
   port_list="$(required_public_ports | paste -sd, -)"
   printf '\n'
-  if mode_has_reality; then
-    printf 'Primary direct entry: VLESS + REALITY + XTLS Vision\n'
-    make_reality_link "$PUBLIC_ADDRESS"
-  fi
   if mode_has_cloudflare; then
-    printf 'Fallback entry: VLESS + WebSocket + TLS + Cloudflare\n'
+    printf 'Cloudflare entry: VLESS + WebSocket + TLS\n'
     make_cloudflare_link
   fi
   printf 'State file: %s\n' "$STATE_FILE"
   printf 'Backup: %s\n' "$BACKUP_DIR"
-  printf 'Open these TCP ports in the cloud security group: %s\n' "$port_list"
   if mode_has_cloudflare; then
+    printf 'Open these TCP ports in the cloud security group: %s\n' "$port_list"
     printf 'Diagnostics: systemctl status xray; journalctl -u xray -e; nginx -t\n'
   else
+    printf 'No public listeners are configured for direct mode in this installer stage.\n'
     printf 'Diagnostics: systemctl status xray; journalctl -u xray -e\n'
   fi
 }
@@ -2087,8 +2105,9 @@ prepare_runtime_directory() {
 }
 
 deploy_services() {
-  local staged_xray staged_nginx_initial staged_nginx_final formatted_address
+  local staged_xray staged_nginx_initial staged_nginx_final
 
+  require_mode_ready
   begin_transaction
   validate_managed_destination_ownership
   install_required_packages
@@ -2100,18 +2119,6 @@ deploy_services() {
   if mode_has_cloudflare; then
     download_cloudflare_ranges
     validate_cloudflare_domain
-  else
-    write_builtin_cloudflare_ranges
-  fi
-  if mode_has_reality; then
-    validate_reality_target "$REALITY_TARGET"
-    PUBLIC_ADDRESS="$(public_ip)"
-    [[ -n "$PUBLIC_ADDRESS" ]] || die "Unable to determine the public IP for the REALITY link"
-    valid_public_ip "$PUBLIC_ADDRESS" || die "Detected address is not a public IP: $PUBLIC_ADDRESS"
-    formatted_address="$(format_uri_host "$PUBLIC_ADDRESS")" || die "Invalid public IP detected: $PUBLIC_ADDRESS"
-    [[ -n "$formatted_address" ]] || die "Unable to format the public IP for the REALITY link"
-  else
-    PUBLIC_ADDRESS=""
   fi
 
   check_public_port_listeners
@@ -2184,17 +2191,6 @@ complete_transaction() {
   release_deployment_lock
   TRANSACTION_ACTIVE="0"
   trap - EXIT ERR INT TERM
-}
-
-make_reality_link() {
-  local address="$1"
-  local uri_host=""
-  uri_host="$(format_uri_host "$address")" || return 1
-  local server_name="${REALITY_TARGET%:*}"
-  printf 'vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp&headerType=none#%s\n' \
-    "$REALITY_UUID" "$uri_host" "$REALITY_PORT" \
-    "$(urlencode "$server_name")" "$(urlencode "$REALITY_PUBLIC_KEY")" \
-    "$(urlencode "$REALITY_SHORT_ID")" "$(urlencode "VLESS-REALITY-direct")"
 }
 
 make_cloudflare_link() {

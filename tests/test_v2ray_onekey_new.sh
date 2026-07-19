@@ -94,50 +94,59 @@ assert_fails() {
   [[ "$output" == *"$expected"* ]] || fail "failure did not contain '$expected': $output"
 }
 
-assert_invalid_uri_host() {
-  local address="$1"
-  local formatted=""
-  local link=""
-  if formatted="$(format_uri_host "$address" 2>/dev/null)"; then
-    fail "invalid URI host was accepted"
-  fi
-  [[ -z "$formatted" ]] || fail "invalid URI host produced output: $formatted"
-  if link="$(make_reality_link "$address" 2>&1)"; then
-    fail "REALITY link accepted an invalid address"
-  fi
-  [[ "$link" != *"vless://"* ]] || fail "invalid address produced a VLESS URI: $link"
+expected_state_keys="STATE_SCHEMA MODE DOMAIN EMAIL CLOUDFLARE_PORT INTERNAL_WS_PORT CLOUDFLARE_UUID WS_PATH HY2_PORT_RANGE HY2_AUTH HY2_OBFS_PASSWORD HY2_SNI HY2_CERT_PIN SS_PORT SS_METHOD SS_KEY SERVER_ADDRESS ALLOW_BITTORRENT ALLOW_MAIL"
+assert_state_keys() {
+  local actual
+  actual="$(printf '%s ' "${STATE_KEYS[@]}")"
+  assert_eq "$expected_state_keys" "${actual% }" "schema 2 state keys"
 }
 
+assert_state_keys
+
 reset_options
-MODE="reality"
+MODE="direct"
 resolve_default_ports
-assert_eq "443" "$REALITY_PORT" "reality port"
-assert_eq "" "$CLOUDFLARE_PORT" "reality cloudflare port"
-mode_needs_domain && fail "reality mode must not require a domain"
-mode_has_reality || fail "reality mode must include REALITY"
-mode_has_cloudflare && fail "reality mode must not include Cloudflare"
+assert_eq "" "$CLOUDFLARE_PORT" "direct Cloudflare port"
+assert_eq "20000-20100" "$HY2_PORT_RANGE" "direct Hysteria2 port range"
+assert_eq "8388" "$SS_PORT" "direct Shadowsocks port"
+mode_needs_domain && fail "direct mode must not require a domain"
+mode_has_cloudflare && fail "direct mode must not include Cloudflare"
+mode_has_hysteria || fail "direct mode must include Hysteria2"
+mode_has_shadowsocks || fail "direct mode must include Shadowsocks"
 
 reset_options
 MODE="cloudflare"
 resolve_default_ports
-assert_eq "" "$REALITY_PORT" "cloudflare reality port"
 assert_eq "443" "$CLOUDFLARE_PORT" "cloudflare port"
+assert_eq "" "$HY2_PORT_RANGE" "cloudflare Hysteria2 range"
+assert_eq "" "$SS_PORT" "cloudflare Shadowsocks port"
 mode_needs_domain || fail "cloudflare mode must require a domain"
-mode_has_reality && fail "cloudflare mode must not include REALITY"
 mode_has_cloudflare || fail "cloudflare mode must include Cloudflare"
+mode_has_hysteria && fail "cloudflare mode must not include Hysteria2"
+mode_has_shadowsocks && fail "cloudflare mode must not include Shadowsocks"
 
 reset_options
-MODE="dual"
+MODE="full"
 resolve_default_ports
-assert_eq "443" "$REALITY_PORT" "dual reality port"
-assert_eq "8443" "$CLOUDFLARE_PORT" "dual cloudflare port"
-mode_needs_domain || fail "dual mode must require a domain"
-mode_has_reality || fail "dual mode must include REALITY"
-mode_has_cloudflare || fail "dual mode must include Cloudflare"
+assert_eq "443" "$CLOUDFLARE_PORT" "full Cloudflare port"
+assert_eq "20000-20100" "$HY2_PORT_RANGE" "full Hysteria2 port range"
+assert_eq "8388" "$SS_PORT" "full Shadowsocks port"
+mode_needs_domain || fail "full mode must require a domain"
+mode_has_cloudflare || fail "full mode must include Cloudflare"
+mode_has_hysteria || fail "full mode must include Hysteria2"
+mode_has_shadowsocks || fail "full mode must include Shadowsocks"
 
 reset_options
+menu_output="$(choose_mode <<<"3")"
 choose_mode <<<"3" >/dev/null
-assert_eq "dual" "$MODE" "menu choice 3"
+assert_eq "full" "$MODE" "menu choice 3"
+assert_eq $'1) Direct: Hysteria2 + Shadowsocks 2022 (no domain)\n2) Cloudflare: VLESS + WebSocket + TLS\n3) Full: Cloudflare + Hysteria2 + Shadowsocks 2022 (recommended)' "$menu_output" "interactive menu text"
+reset_options
+choose_mode <<<"1" >/dev/null
+assert_eq "direct" "$MODE" "menu choice 1"
+reset_options
+choose_mode <<<"2" >/dev/null
+assert_eq "cloudflare" "$MODE" "menu choice 2"
 
 valid_domain "vpn.example.com" || fail "valid domain rejected"
 valid_domain "bad_domain" && fail "invalid domain accepted"
@@ -152,103 +161,177 @@ valid_port "00008" || fail "leading-zero decimal port rejected"
 assert_eq "8" "$(normalize_port 00008)" "normalized decimal port"
 assert_eq "0" "$(normalize_port 00000)" "normalized all-zero port"
 valid_port "00000" && fail "all-zero port accepted"
-valid_reality_target "example.net:443" || fail "valid REALITY target rejected"
-valid_reality_target "192.0.2.1:443" || fail "valid IPv4 REALITY target rejected"
-valid_reality_target "/path:443" && fail "path-like REALITY hostname accepted"
-valid_reality_target "*:443" && fail "wildcard REALITY hostname accepted"
-valid_reality_target "bad host:443" && fail "whitespace in REALITY hostname accepted"
-valid_reality_target "192.0.2.256:443" && fail "out-of-range IPv4 REALITY hostname accepted"
-valid_reality_target "example.net" && fail "REALITY target without a port accepted"
-valid_reality_target "example.net:65536" && fail "REALITY target with an invalid port accepted"
+valid_hy2_port_range "1-1000" || fail "valid Hysteria2 range rejected"
+valid_hy2_port_range "20000-20100" || fail "default Hysteria2 range rejected"
+valid_hy2_port_range "20000" && fail "single Hysteria2 port accepted as a range"
+valid_hy2_port_range "0-100" && fail "zero Hysteria2 range bound accepted"
+valid_hy2_port_range "100-99" && fail "reversed Hysteria2 range accepted"
+valid_hy2_port_range "1-1001" && fail "Hysteria2 range larger than 1000 ports accepted"
+valid_hy2_port_range "65000-65536" && fail "out-of-bounds Hysteria2 range accepted"
+valid_server_address "vpn.example.com" || fail "domain server address rejected"
+valid_server_address "192.0.2.1" || fail "IPv4 server address rejected"
+valid_server_address "2001:db8::1" || fail "IPv6 server address rejected"
+valid_server_address "203.0.113.999" && fail "malformed IPv4 server address accepted"
+valid_server_address "001.002.003.004" && fail "non-canonical IPv4 server address accepted"
+valid_server_address "bad address" && fail "server address containing whitespace accepted"
+valid_server_address "https://vpn.example.com" && fail "URL accepted as server address"
 
 reset_options
 parse_args \
-  --mode dual \
+  --mode full \
   --domain vpn.example.com \
   --email admin@example.com \
-  --reality-port 1443 \
   --cloudflare-port 2053 \
-  --reality-target example.net:443 \
-  --reality-uuid 11111111-1111-4111-8111-111111111111 \
+  --hy2-port-range 22000-22100 \
+  --ss-port 18388 \
+  --server-address edge.example.net \
   --cloudflare-uuid 22222222-2222-4222-8222-222222222222 \
   --ws-path /private \
   --rotate \
-  --allow-bittorrent
-assert_eq "dual" "$MODE" "parsed mode"
+  --allow-bittorrent \
+  --allow-mail
+assert_eq "full" "$MODE" "parsed mode"
 assert_eq "vpn.example.com" "$DOMAIN" "parsed domain"
 assert_eq "admin@example.com" "$EMAIL" "parsed email"
-assert_eq "1443" "$REALITY_PORT" "parsed REALITY port"
 assert_eq "2053" "$CLOUDFLARE_PORT" "parsed Cloudflare port"
-assert_eq "example.net:443" "$REALITY_TARGET" "parsed REALITY target"
-assert_eq "11111111-1111-4111-8111-111111111111" "$REALITY_UUID" "parsed REALITY UUID"
+assert_eq "22000-22100" "$HY2_PORT_RANGE" "parsed Hysteria2 range"
+assert_eq "18388" "$SS_PORT" "parsed Shadowsocks port"
+assert_eq "edge.example.net" "$SERVER_ADDRESS" "parsed server address"
 assert_eq "22222222-2222-4222-8222-222222222222" "$CLOUDFLARE_UUID" "parsed Cloudflare UUID"
 assert_eq "/private" "$WS_PATH" "parsed WebSocket path"
 assert_eq "1" "$ROTATE" "parsed rotate flag"
 assert_eq "1" "$ALLOW_BITTORRENT" "parsed BitTorrent flag"
+assert_eq "1" "$ALLOW_MAIL" "parsed mail flag"
 
 usage_output="$(usage)"
-for option in --mode --domain --email --reality-port --cloudflare-port --reality-target --reality-uuid --cloudflare-uuid --ws-path --rotate --allow-bittorrent --help; do
+for option in --mode --domain --email --cloudflare-port --hy2-port-range --ss-port --server-address --cloudflare-uuid --ws-path --rotate --allow-bittorrent --allow-mail --help; do
   [[ "$usage_output" == *"$option"* ]] || fail "usage is missing $option"
 done
+[[ "$usage_output" == *'direct|cloudflare|full'* ]] || fail "usage does not list the supported modes"
+[[ "$usage_output" != *"--reality-"* ]] || fail "usage still exposes REALITY options"
 [[ "$usage_output" != *$'\n  --port '* ]] || fail "usage still exposes legacy --port"
 [[ "$usage_output" != *"--tcp"* ]] || fail "usage still exposes legacy --tcp"
+assert_fails "--mode must be direct, cloudflare, or full" parse_args --mode reality
+assert_fails "--mode must be direct, cloudflare, or full" parse_args --mode dual
+for retired_option in --reality-port --reality-target --reality-uuid; do
+  assert_fails "Unknown option" parse_args "$retired_option" retired-value
+done
+
+validate_cli_options() {
+  reset_options
+  parse_args "$@"
+  validate_options
+}
+
+assert_fails "Invalid Hysteria2 port range" validate_cli_options \
+  --mode cloudflare --domain vpn.example.com --email admin@example.com --hy2-port-range invalid
+assert_fails "Invalid Shadowsocks port" validate_cli_options \
+  --mode cloudflare --domain vpn.example.com --email admin@example.com --ss-port 70000
+assert_fails "Invalid server address" validate_cli_options \
+  --mode cloudflare --domain vpn.example.com --email admin@example.com --server-address 'bad address'
+assert_fails "Unsupported Cloudflare port" validate_cli_options \
+  --mode direct --cloudflare-port 2443
+assert_fails "Invalid domain" validate_cli_options --mode direct --domain bad_domain
+assert_fails "Invalid Cloudflare UUID" validate_cli_options --mode direct --cloudflare-uuid bad-uuid
+assert_fails "WebSocket path" validate_cli_options --mode direct --ws-path invalid
+
+for direct_option in \
+  '--hy2-port-range 21000-21100' \
+  '--ss-port 18388' \
+  '--server-address edge.example.com'; do
+  read -r option value <<<"$direct_option"
+  assert_fails "$option cannot be used with cloudflare mode" validate_cli_options \
+    --mode cloudflare --domain vpn.example.com --email admin@example.com "$option" "$value"
+done
+for cloudflare_option in \
+  '--cloudflare-port 2053' \
+  '--domain vpn.example.com' \
+  '--email admin@example.com' \
+  '--cloudflare-uuid 22222222-2222-4222-8222-222222222222' \
+  '--ws-path /private'; do
+  read -r option value <<<"$cloudflare_option"
+  assert_fails "$option cannot be used with direct mode" validate_cli_options \
+    --mode direct "$option" "$value"
+done
 
 validate_values() {
   reset_options
   MODE="$1"
   DOMAIN="$2"
   EMAIL="$3"
-  REALITY_PORT="$4"
-  CLOUDFLARE_PORT="$5"
-  REALITY_UUID="${6:-}"
-  CLOUDFLARE_UUID="${7:-}"
-  WS_PATH="${8:-}"
+  CLOUDFLARE_PORT="$4"
+  HY2_PORT_RANGE="$5"
+  SS_PORT="$6"
+  SERVER_ADDRESS="$7"
+  CLOUDFLARE_UUID="${8:-}"
+  WS_PATH="${9:-}"
   validate_options
 }
 
-validate_reality_target_value() {
-  reset_options
-  MODE="reality"
-  REALITY_TARGET="$1"
-  validate_options
-}
-
-validate_values reality "" "" "" ""
-assert_eq "443" "$REALITY_PORT" "validated default REALITY port"
+validate_values direct "" "" "" "" "" "vpn.example.com"
 assert_eq "" "$CLOUDFLARE_PORT" "validated inactive Cloudflare port"
+assert_eq "20000-20100" "$HY2_PORT_RANGE" "validated default Hysteria2 range"
+assert_eq "8388" "$SS_PORT" "validated default Shadowsocks port"
 
-validate_values dual vpn.example.com admin@example.com 1443 2053
-assert_eq "1443" "$REALITY_PORT" "custom REALITY port"
+validate_values full vpn.example.com admin@example.com 2053 22000-22100 18388 edge.example.net
 assert_eq "2053" "$CLOUDFLARE_PORT" "custom Cloudflare port"
+assert_eq "22000-22100" "$HY2_PORT_RANGE" "custom Hysteria2 range"
+assert_eq "18388" "$SS_PORT" "custom Shadowsocks port"
 
-validate_values dual vpn.example.com admin@example.com 01443 02053
-assert_eq "1443" "$REALITY_PORT" "canonical REALITY port"
+validate_values full vpn.example.com admin@example.com 02053 02000-02010 08388 192.0.2.1
 assert_eq "2053" "$CLOUDFLARE_PORT" "canonical Cloudflare port"
+assert_eq "2000-2010" "$HY2_PORT_RANGE" "canonical Hysteria2 range"
+assert_eq "8388" "$SS_PORT" "canonical Shadowsocks port"
 
-validate_values cloudflare vpn.example.com admin@example.com "" "" "" "" "/valid._~-"
+validate_values cloudflare vpn.example.com admin@example.com "" "" "" "" "" "/valid._~-"
+
+reset_options
+MODE="cloudflare"
+DOMAIN="vpn.example.com"
+EMAIL="admin@example.com"
+HY2_PORT_RANGE="21000-21100"
+HY2_AUTH="inactive-auth"
+HY2_OBFS_PASSWORD="inactive-obfs"
+HY2_SNI="inactive.example.com"
+HY2_CERT_PIN="inactive-pin"
+SS_PORT="18388"
+SS_METHOD="2022-blake3-aes-128-gcm"
+SS_KEY="inactive-key"
+SERVER_ADDRESS="edge.example.com"
+resolve_default_ports
+assert_eq "" "$HY2_PORT_RANGE$HY2_AUTH$HY2_OBFS_PASSWORD$HY2_SNI$HY2_CERT_PIN" "inactive Hysteria2 fields"
+assert_eq "" "$SS_PORT$SS_METHOD$SS_KEY" "inactive Shadowsocks fields"
+assert_eq "" "$SERVER_ADDRESS" "inactive direct server address"
+
+reset_options
+MODE="direct"
+DOMAIN="vpn.example.com"
+EMAIL="admin@example.com"
+CLOUDFLARE_PORT="2053"
+INTERNAL_WS_PORT="31001"
+CLOUDFLARE_UUID="22222222-2222-4222-8222-222222222222"
+WS_PATH="/inactive"
+resolve_default_ports
+assert_eq "" "$DOMAIN$EMAIL$CLOUDFLARE_PORT$INTERNAL_WS_PORT$CLOUDFLARE_UUID$WS_PATH" "inactive Cloudflare fields"
 
 reset_options
 assert_fails "--mode is required" select_mode </dev/null
-for option in --mode --domain --email --reality-port --cloudflare-port --reality-target --reality-uuid --cloudflare-uuid --ws-path; do
+for option in --mode --domain --email --cloudflare-port --hy2-port-range --ss-port --server-address --cloudflare-uuid --ws-path; do
   assert_fails "$option requires a value" parse_args "$option"
 done
-assert_fails "--domain is required" validate_values cloudflare "" admin@example.com "" ""
-assert_fails "--email is required" validate_values cloudflare vpn.example.com "" "" ""
-assert_fails "Invalid domain" validate_values cloudflare bad_domain admin@example.com "" ""
-assert_fails "Invalid REALITY port" validate_values reality "" "" 65536 ""
-assert_fails "Unsupported Cloudflare port" validate_values dual vpn.example.com admin@example.com 1443 2443
-assert_fails "must be different" validate_values dual vpn.example.com admin@example.com 443 443
-assert_fails "must be different" validate_values dual vpn.example.com admin@example.com 0443 443
-validate_reality_target_value example.net:443
-assert_fails "Invalid REALITY target" validate_reality_target_value example.net
+assert_fails "--domain is required" validate_values cloudflare "" admin@example.com "" "" "" ""
+assert_fails "--email is required" validate_values cloudflare vpn.example.com "" "" "" "" ""
+assert_fails "Invalid domain" validate_values cloudflare bad_domain admin@example.com "" "" "" ""
+assert_fails "Unsupported Cloudflare port" validate_values full vpn.example.com admin@example.com 2443 20000-20100 8388 edge.example.net
+assert_fails "Invalid Hysteria2 port range" validate_values direct "" "" "" 20100-20000 8388 edge.example.net
+assert_fails "Invalid Shadowsocks port" validate_values direct "" "" "" 20000-20100 65536 edge.example.net
+assert_fails "Invalid server address" validate_values direct "" "" "" 20000-20100 8388 'bad address'
 
-validate_values cloudflare VPN.Example.COM admin@example.com "" 8443
+validate_values cloudflare VPN.Example.COM admin@example.com 8443 "" "" ""
 assert_eq "vpn.example.com" "$DOMAIN" "Cloudflare domain is normalized to lowercase"
-assert_fails "Invalid REALITY target" validate_reality_target_value example.net:65536
-assert_fails "Invalid REALITY UUID" validate_values reality "" "" "" "" bad-uuid
-assert_fails "Invalid Cloudflare UUID" validate_values cloudflare vpn.example.com admin@example.com "" "" "" bad-uuid
-assert_fails "WebSocket path" validate_values cloudflare vpn.example.com admin@example.com "" "" "" "" private
-assert_fails "WebSocket path" validate_values cloudflare vpn.example.com admin@example.com "" "" "" "" '/invalid;path'
+assert_fails "Invalid Cloudflare UUID" validate_values cloudflare vpn.example.com admin@example.com "" "" "" "" bad-uuid
+assert_fails "WebSocket path" validate_values cloudflare vpn.example.com admin@example.com "" "" "" "" "" private
+assert_fails "WebSocket path" validate_values cloudflare vpn.example.com admin@example.com "" "" "" "" "" '/invalid;path'
 
 test_renderers() (
   local temp_dir
@@ -256,17 +339,11 @@ test_renderers() (
   trap 'rm -rf "$temp_dir"' RETURN
 
   reset_options
-  MODE="dual"
+  MODE="full"
   DOMAIN="vpn.example.com"
-  REALITY_PORT="443"
-  CLOUDFLARE_PORT="8443"
+  CLOUDFLARE_PORT="443"
   INTERNAL_WS_PORT="31001"
-  REALITY_UUID="11111111-1111-4111-8111-111111111111"
   CLOUDFLARE_UUID="22222222-2222-4222-8222-222222222222"
-  REALITY_PRIVATE_KEY="private-key"
-  REALITY_PUBLIC_KEY="public-key"
-  REALITY_SHORT_ID="0123456789abcdef"
-  REALITY_TARGET="www.microsoft.com:443"
   WS_PATH="/6f4f5304d2e84dc8"
   ALLOW_BITTORRENT="0"
 
@@ -279,29 +356,29 @@ test_renderers() (
     "replacement config permissions"
   [[ "$(stat -c '%i' "$temp_dir/config.json")" != "$old_config_inode" ]] ||
     fail "renderer did not replace the existing config atomically"
-  MODE="reality"
-  render_xray_config "$temp_dir/reality.json"
-  assert_eq "600" "$(stat -c '%a' "$temp_dir/reality.json")" \
+  MODE="direct"
+  render_xray_config "$temp_dir/direct.json"
+  assert_eq "600" "$(stat -c '%a' "$temp_dir/direct.json")" \
     "new config permissions"
   MODE="cloudflare"
   render_xray_config "$temp_dir/cloudflare.json"
-  MODE="dual"
+  MODE="full"
   ALLOW_BITTORRENT="1"
   render_xray_config "$temp_dir/allow-bittorrent.json"
 
   mkdir "$temp_dir/failed-render"
-  MODE="reality"
-  REALITY_PORT="invalid"
+  MODE="cloudflare"
+  INTERNAL_WS_PORT="invalid"
   if render_xray_config "$temp_dir/failed-render/config.json" >/dev/null 2>&1; then
     fail "renderer accepted an invalid port"
   fi
   [[ -z "$(find "$temp_dir/failed-render" -mindepth 1 -maxdepth 1 -print -quit)" ]] ||
     fail "failed renderer left a temporary file behind"
-  REALITY_PORT="443"
+  INTERNAL_WS_PORT="31001"
 
   python3 - \
     "$temp_dir/config.json" \
-    "$temp_dir/reality.json" \
+    "$temp_dir/direct.json" \
     "$temp_dir/cloudflare.json" \
     "$temp_dir/allow-bittorrent.json" <<'PY'
 import json
@@ -313,40 +390,11 @@ def load(path):
         return json.load(handle)
 
 
-dual, reality_only, cloudflare_only, allow_bittorrent = map(load, sys.argv[1:])
-assert dual["log"] == {"loglevel": "warning"}
-assert [item["tag"] for item in dual["inbounds"]] == [
-    "reality-in",
-    "cloudflare-ws-in",
-]
+full, direct_only, cloudflare_only, allow_bittorrent = map(load, sys.argv[1:])
+assert full["log"] == {"loglevel": "warning"}
+assert [item["tag"] for item in full["inbounds"]] == ["cloudflare-ws-in"]
 
-reality, cloudflare = dual["inbounds"]
-assert reality["tag"] == "reality-in"
-assert reality["listen"] == "0.0.0.0"
-assert reality["port"] == 443
-assert reality["protocol"] == "vless"
-assert reality["settings"] == {
-    "clients": [
-        {
-            "id": "11111111-1111-4111-8111-111111111111",
-            "flow": "xtls-rprx-vision",
-            "email": "reality",
-        }
-    ],
-    "decryption": "none",
-}
-assert reality["streamSettings"]["network"] == "raw"
-assert reality["streamSettings"]["security"] == "reality"
-reality_settings = reality["streamSettings"]["realitySettings"]
-assert reality_settings["show"] is False
-assert reality_settings["target"] == "www.microsoft.com:443"
-assert reality_settings["serverNames"] == ["www.microsoft.com"]
-assert reality_settings["privateKey"] == "private-key"
-assert reality_settings["shortIds"] == ["0123456789abcdef"]
-assert "limitFallbackUpload" not in reality_settings
-assert "limitFallbackDownload" not in reality_settings
-
-assert cloudflare["tag"] == "cloudflare-ws-in"
+cloudflare = full["inbounds"][0]
 assert cloudflare["listen"] == "127.0.0.1"
 assert cloudflare["port"] == 31001
 assert cloudflare["protocol"] == "vless"
@@ -369,9 +417,8 @@ sniffing = {
     "destOverride": ["http", "tls", "quic"],
     "routeOnly": True,
 }
-assert reality["sniffing"] == sniffing
 assert cloudflare["sniffing"] == sniffing
-assert dual["outbounds"] == [
+assert full["outbounds"] == [
     {"tag": "direct", "protocol": "freedom"},
     {"tag": "block", "protocol": "blackhole"},
 ]
@@ -385,30 +432,22 @@ bittorrent_rule = {
     "protocol": ["bittorrent"],
     "outboundTag": "block",
 }
-assert dual["routing"] == {
+assert full["routing"] == {
     "domainStrategy": "IPIfNonMatch",
     "rules": [private_rule, bittorrent_rule],
 }
-assert all(item["protocol"] != "vmess" for item in dual["inbounds"])
-assert [item["tag"] for item in reality_only["inbounds"]] == ["reality-in"]
+assert all(item["protocol"] != "vmess" for item in full["inbounds"])
+assert direct_only["inbounds"] == []
 assert [item["tag"] for item in cloudflare_only["inbounds"]] == [
     "cloudflare-ws-in"
 ]
 assert allow_bittorrent["routing"]["rules"] == [private_rule]
 PY
 
-  local reality_link cloudflare_link ipv6_link
+  local cloudflare_link
   ALLOW_BITTORRENT="0"
-  assert_eq "203.0.113.10" "$(format_uri_host "203.0.113.10")" \
-    "formatted IPv4 host"
-  assert_eq "[2001:db8::1]" "$(format_uri_host "2001:db8::1")" \
-    "formatted IPv6 host"
-  reality_link="$(make_reality_link "203.0.113.10")"
-  ipv6_link="$(make_reality_link "2001:db8::1")"
-  [[ "$ipv6_link" == "vless://$REALITY_UUID@[2001:db8::1]:443"* ]] ||
-    fail "bad IPv6 REALITY URI: $ipv6_link"
   cloudflare_link="$(make_cloudflare_link)"
-  python3 - "$reality_link" "$cloudflare_link" "$ipv6_link" <<'PY'
+  python3 - "$cloudflare_link" <<'PY'
 import sys
 import urllib.parse
 
@@ -423,30 +462,10 @@ def parse_link(link):
     return parsed, {key: values[0] for key, values in query.items()}
 
 
-reality, reality_query = parse_link(sys.argv[1])
-assert reality.username == "11111111-1111-4111-8111-111111111111"
-assert reality.hostname == "203.0.113.10"
-assert reality.port == 443
-assert reality_query["encryption"] == "none"
-assert reality_query["flow"] == "xtls-rprx-vision"
-assert reality_query["security"] == "reality"
-assert reality_query["sni"] == "www.microsoft.com"
-assert reality_query["fp"] == "chrome"
-assert reality_query["pbk"] == "public-key"
-assert reality_query["sid"] == "0123456789abcdef"
-assert reality_query["type"] == "tcp"
-assert urllib.parse.unquote(reality.fragment) == "VLESS-REALITY-direct"
-
-ipv6, ipv6_query = parse_link(sys.argv[3])
-assert ipv6.username == "11111111-1111-4111-8111-111111111111"
-assert ipv6.hostname == "2001:db8::1"
-assert ipv6.port == 443
-assert ipv6_query == reality_query
-
-cloudflare, cloudflare_query = parse_link(sys.argv[2])
+cloudflare, cloudflare_query = parse_link(sys.argv[1])
 assert cloudflare.username == "22222222-2222-4222-8222-222222222222"
 assert cloudflare.hostname == "vpn.example.com"
-assert cloudflare.port == 8443
+assert cloudflare.port == 443
 assert cloudflare_query["encryption"] == "none"
 assert cloudflare_query["security"] == "tls"
 assert cloudflare_query["sni"] == "vpn.example.com"
@@ -458,65 +477,92 @@ assert "path=%2F6f4f5304d2e84dc8" in cloudflare.query
 assert urllib.parse.unquote(cloudflare.fragment) == "VLESS-Cloudflare-fallback"
 PY
 
-  local invalid_address
-  for invalid_address in \
-    "vpn.example.com" \
-    "203.0.113.999" \
-    "203.0.113.10 " \
-    "203.0.113.10/path" \
-    $'203.0.113.10\n@example.com'; do
-    assert_invalid_uri_host "$invalid_address"
-  done
 )
 
 test_renderers
 
 test_state_round_trip() (
-  local temp_dir old_inode malicious_value
+  local temp_dir old_inode malicious_value old_path real_python secret
   temp_dir="$(mktemp -d)"
   trap 'rm -rf "$temp_dir"' RETURN
   STATE_FILE="$temp_dir/private/state.env"
   malicious_value='$(touch SHOULD_NOT_EXIST); spaces and $dollar'
 
   reset_options
-  MODE="dual"
+  MODE="full"
   DOMAIN="vpn.example.com"
   EMAIL="$malicious_value"
-  REALITY_PORT="1443"
-  CLOUDFLARE_PORT="2053"
+  CLOUDFLARE_PORT="443"
   INTERNAL_WS_PORT="31001"
-  REALITY_UUID="11111111-1111-4111-8111-111111111111"
   CLOUDFLARE_UUID="22222222-2222-4222-8222-222222222222"
-  REALITY_PRIVATE_KEY="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-  REALITY_PUBLIC_KEY="BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
-  REALITY_SHORT_ID="0123456789abcdef"
-  REALITY_TARGET="www.microsoft.com:443"
   WS_PATH="/state-path"
+  HY2_PORT_RANGE="20000-20100"
+  HY2_AUTH="hy2-auth"
+  HY2_OBFS_PASSWORD="hy2-obfs"
+  HY2_SNI="hy2.example.com"
+  HY2_CERT_PIN="sha256:cert-pin"
+  SS_PORT="8388"
+  SS_METHOD="2022-blake3-aes-128-gcm"
+  SS_KEY="ss-key"
+  SERVER_ADDRESS="edge.example.com"
   ALLOW_BITTORRENT="1"
+  ALLOW_MAIL="1"
   save_state
   assert_eq "700" "$(stat -c '%a' "$temp_dir/private")" "state directory permissions"
   assert_eq "600" "$(stat -c '%a' "$STATE_FILE")" "state file permissions"
   [[ ! -e SHOULD_NOT_EXIST ]] || fail "state data was executed"
   grep -Fq 'EMAIL=\$\(touch\ SHOULD_NOT_EXIST\)\;\ spaces\ and\ \$dollar' "$STATE_FILE" ||
     fail "state data was not shell escaped"
+  grep -Fqx 'STATE_SCHEMA=2' "$STATE_FILE" || fail "state schema 2 was not written"
+  assert_eq "${#STATE_KEYS[@]}" "$(wc -l <"$STATE_FILE" | tr -d ' ')" "schema 2 key count"
 
+  real_python="$(command -v python3)"
+  old_path="$PATH"
+  install -d "$temp_dir/bin"
+  cat >"$temp_dir/bin/python3" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\0' "$@" >>"$PYTHON_ARGV_LOG"
+exec "$REAL_PYTHON" "$@"
+EOF
+  chmod +x "$temp_dir/bin/python3"
+  : >"$temp_dir/python-argv.log"
+  export PYTHON_ARGV_LOG="$temp_dir/python-argv.log"
+  export REAL_PYTHON="$real_python"
+  PATH="$temp_dir/bin:$PATH"
   reset_options
   load_state
-  assert_eq "dual" "$MODE" "loaded mode"
+  PATH="$old_path"
+  unset PYTHON_ARGV_LOG REAL_PYTHON
+  assert_eq "2" "$STATE_SCHEMA" "loaded state schema"
+  assert_eq "full" "$MODE" "loaded mode"
   assert_eq "vpn.example.com" "$DOMAIN" "loaded domain"
   assert_eq "$malicious_value" "$EMAIL" "loaded shell-metacharacter value"
-  assert_eq "1443" "$REALITY_PORT" "loaded REALITY port"
-  assert_eq "2053" "$CLOUDFLARE_PORT" "loaded Cloudflare port"
+  assert_eq "443" "$CLOUDFLARE_PORT" "loaded Cloudflare port"
   assert_eq "31001" "$INTERNAL_WS_PORT" "loaded internal WS port"
-  assert_eq "11111111-1111-4111-8111-111111111111" "$REALITY_UUID" "loaded REALITY UUID"
   assert_eq "22222222-2222-4222-8222-222222222222" "$CLOUDFLARE_UUID" "loaded Cloudflare UUID"
-  assert_eq "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" "$REALITY_PRIVATE_KEY" "loaded private key"
-  assert_eq "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB" "$REALITY_PUBLIC_KEY" "loaded public key"
-  assert_eq "0123456789abcdef" "$REALITY_SHORT_ID" "loaded short ID"
-  assert_eq "www.microsoft.com:443" "$REALITY_TARGET" "loaded target"
   assert_eq "/state-path" "$WS_PATH" "loaded WS path"
+  assert_eq "20000-20100" "$HY2_PORT_RANGE" "loaded Hysteria2 range"
+  assert_eq "hy2-auth" "$HY2_AUTH" "loaded Hysteria2 auth"
+  assert_eq "hy2-obfs" "$HY2_OBFS_PASSWORD" "loaded Hysteria2 obfuscation password"
+  assert_eq "hy2.example.com" "$HY2_SNI" "loaded Hysteria2 SNI"
+  assert_eq "sha256:cert-pin" "$HY2_CERT_PIN" "loaded Hysteria2 certificate pin"
+  assert_eq "8388" "$SS_PORT" "loaded Shadowsocks port"
+  assert_eq "2022-blake3-aes-128-gcm" "$SS_METHOD" "loaded Shadowsocks method"
+  assert_eq "ss-key" "$SS_KEY" "loaded Shadowsocks key"
+  assert_eq "edge.example.com" "$SERVER_ADDRESS" "loaded server address"
   assert_eq "1" "$ALLOW_BITTORRENT" "loaded BitTorrent setting"
+  assert_eq "1" "$ALLOW_MAIL" "loaded mail setting"
   assert_eq "0" "$ROTATE" "rotate is not persisted"
+  for secret in \
+    22222222-2222-4222-8222-222222222222 \
+    /state-path \
+    hy2-auth \
+    hy2-obfs \
+    ss-key; do
+    if grep -aFq "$secret" "$temp_dir/python-argv.log"; then
+      fail "state secret was exposed in Python argv: $secret"
+    fi
+  done
 
   printf 'old permissive state\n' >"$STATE_FILE"
   chmod 0666 "$STATE_FILE"
@@ -535,20 +581,25 @@ test_state_security() (
   trap 'rm -rf "$temp_dir"' RETURN
   STATE_FILE="$temp_dir/state.env"
   cat >"$STATE_FILE" <<'EOF'
-MODE=reality
-DOMAIN=''
-EMAIL=''
-REALITY_PORT=443
-CLOUDFLARE_PORT=''
-INTERNAL_WS_PORT=''
-REALITY_UUID=11111111-1111-4111-8111-111111111111
-CLOUDFLARE_UUID=''
-REALITY_PRIVATE_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
-REALITY_PUBLIC_KEY=BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB
-REALITY_SHORT_ID=0123456789abcdef
-REALITY_TARGET=www.microsoft.com:443
-WS_PATH=''
+STATE_SCHEMA=2
+MODE=cloudflare
+DOMAIN=vpn.example.com
+EMAIL=admin@example.com
+CLOUDFLARE_PORT=443
+INTERNAL_WS_PORT=31001
+CLOUDFLARE_UUID=22222222-2222-4222-8222-222222222222
+WS_PATH=/ws
+HY2_PORT_RANGE=''
+HY2_AUTH=''
+HY2_OBFS_PASSWORD=''
+HY2_SNI=''
+HY2_CERT_PIN=''
+SS_PORT=''
+SS_METHOD=''
+SS_KEY=''
+SERVER_ADDRESS=edge.example.com
 ALLOW_BITTORRENT=0
+ALLOW_MAIL=0
 EOF
   chmod 0660 "$STATE_FILE"
   assert_fails "group or world writable" load_state
@@ -561,39 +612,6 @@ EOF
     chown 0 "$STATE_FILE"
     load_state_as_source_only
   fi
-  sed -i "s/^REALITY_UUID=.*/REALITY_UUID=''/" "$STATE_FILE"
-  assert_fails "Invalid REALITY UUID" load_state
-  sed -i 's/^REALITY_UUID=.*/REALITY_UUID=11111111-1111-4111-8111-111111111111/' "$STATE_FILE"
-  sed -i 's/^REALITY_PRIVATE_KEY=.*/REALITY_PRIVATE_KEY=not-a-key/' "$STATE_FILE"
-  assert_fails "Invalid REALITY private key" load_state
-  sed -i 's/^REALITY_PRIVATE_KEY=.*/REALITY_PRIVATE_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/' "$STATE_FILE"
-  sed -i 's/^REALITY_SHORT_ID=.*/REALITY_SHORT_ID=not-hex/' "$STATE_FILE"
-  assert_fails "Invalid REALITY short ID" load_state
-  sed -i 's/^REALITY_SHORT_ID=.*/REALITY_SHORT_ID=0123456789abcdef/' "$STATE_FILE"
-  sed -i 's/^REALITY_SHORT_ID=.*/REALITY_SHORT_ID=0123456789abcde/' "$STATE_FILE"
-  assert_fails "Invalid REALITY short ID" load_state
-  sed -i 's/^REALITY_SHORT_ID=.*/REALITY_SHORT_ID=0123456789abcdef/' "$STATE_FILE"
-  sed -i 's/^CLOUDFLARE_UUID=.*/CLOUDFLARE_UUID=22222222-2222-4222-8222-222222222222/' "$STATE_FILE"
-  assert_fails "Inactive Cloudflare state" load_state
-
-  cat >"$STATE_FILE" <<'EOF'
-MODE=cloudflare
-DOMAIN=vpn.example.com
-EMAIL=admin@example.com
-REALITY_PORT=''
-CLOUDFLARE_PORT=443
-INTERNAL_WS_PORT=31001
-REALITY_UUID=''
-CLOUDFLARE_UUID=22222222-2222-4222-8222-222222222222
-REALITY_PRIVATE_KEY=''
-REALITY_PUBLIC_KEY=''
-REALITY_SHORT_ID=''
-REALITY_TARGET=www.microsoft.com:443
-WS_PATH=/ws
-ALLOW_BITTORRENT=0
-EOF
-  chmod 0600 "$STATE_FILE"
-  load_state
   sed -i "s/^CLOUDFLARE_UUID=.*/CLOUDFLARE_UUID=''/" "$STATE_FILE"
   assert_fails "Invalid Cloudflare UUID" load_state
   sed -i 's/^CLOUDFLARE_UUID=.*/CLOUDFLARE_UUID=22222222-2222-4222-8222-222222222222/' "$STATE_FILE"
@@ -604,34 +622,75 @@ EOF
   assert_fails "WebSocket path" load_state
   [[ ! -e SHOULD_NOT_EXIST ]] || fail "invalid WebSocket path executed state data"
   sed -i 's|^WS_PATH=.*|WS_PATH=/ws|' "$STATE_FILE"
-  sed -i 's/^REALITY_UUID=.*/REALITY_UUID=11111111-1111-4111-8111-111111111111/' "$STATE_FILE"
-  assert_fails "Inactive REALITY state" load_state
-
-  cat >"$STATE_FILE" <<'EOF'
-MODE=cloudflare
-DOMAIN=bad_domain
-EMAIL=admin@example.com
-REALITY_PORT=''
-CLOUDFLARE_PORT=99999
-INTERNAL_WS_PORT=31001
-REALITY_UUID=''
-CLOUDFLARE_UUID=''
-REALITY_PRIVATE_KEY=''
-REALITY_PUBLIC_KEY=''
-REALITY_SHORT_ID=''
-REALITY_TARGET=www.microsoft.com:443
-WS_PATH=/ws
-ALLOW_BITTORRENT=0
-EOF
-  chmod 0600 "$STATE_FILE"
+  sed -i 's/^DOMAIN=.*/DOMAIN=bad_domain/' "$STATE_FILE"
   assert_fails "Invalid domain" load_state
-  printf 'MODE=reality\nEVIL=$(touch SHOULD_NOT_EXIST)\n' >"$STATE_FILE"
+  sed -i 's/^DOMAIN=.*/DOMAIN=vpn.example.com/' "$STATE_FILE"
+  sed -i 's/^STATE_SCHEMA=.*/STATE_SCHEMA=3/' "$STATE_FILE"
+  assert_fails "Unsupported state schema" load_state
+  sed -i 's/^STATE_SCHEMA=.*/STATE_SCHEMA=2/' "$STATE_FILE"
+  printf 'REALITY_UUID=11111111-1111-4111-8111-111111111111\n' >>"$STATE_FILE"
+  assert_fails "Schema 2 state contains unexpected assignment: REALITY_UUID" load_state
+  printf 'STATE_SCHEMA=2\nMODE=direct\nEVIL=$(touch SHOULD_NOT_EXIST)\n' >"$STATE_FILE"
   assert_fails "unexpected assignment" load_state
   [[ ! -e SHOULD_NOT_EXIST ]] || fail "untrusted state line was executed"
 )
 
+test_legacy_state_migration() (
+  local temp_dir mutation_log
+  temp_dir="$(mktemp -d)"
+  trap 'rm -rf "$temp_dir"' RETURN
+  STATE_FILE="$temp_dir/state.env"
+  cat >"$STATE_FILE" <<'EOF'
+MODE=dual
+DOMAIN=vpn.example.com
+EMAIL=admin@example.com
+REALITY_PORT=1443
+CLOUDFLARE_PORT=2053
+INTERNAL_WS_PORT=31001
+REALITY_UUID=11111111-1111-4111-8111-111111111111
+CLOUDFLARE_UUID=22222222-2222-4222-8222-222222222222
+REALITY_PRIVATE_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+REALITY_PUBLIC_KEY=BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB
+REALITY_SHORT_ID=0123456789abcdef
+REALITY_TARGET=www.microsoft.com:443
+WS_PATH=/legacy-ws
+ALLOW_BITTORRENT=1
+EOF
+  cp "$STATE_FILE" "$temp_dir/reality-state.env"
+  sed -i 's/^MODE=dual$/MODE=reality/' "$temp_dir/reality-state.env"
+  chmod 0600 "$STATE_FILE"
+  reset_options
+  load_state
+  assert_eq "full" "$MODE" "legacy dual mode migration"
+  assert_eq "vpn.example.com" "$DOMAIN" "legacy Cloudflare domain"
+  assert_eq "admin@example.com" "$EMAIL" "legacy Cloudflare email"
+  assert_eq "2053" "$CLOUDFLARE_PORT" "legacy Cloudflare port"
+  assert_eq "31001" "$INTERNAL_WS_PORT" "legacy internal WebSocket port"
+  assert_eq "22222222-2222-4222-8222-222222222222" "$CLOUDFLARE_UUID" "legacy Cloudflare UUID"
+  assert_eq "/legacy-ws" "$WS_PATH" "legacy WebSocket path"
+  assert_eq "" "${REALITY_UUID-}" "legacy REALITY UUID discarded"
+  assert_eq "" "${REALITY_PRIVATE_KEY-}" "legacy REALITY private key discarded"
+  save_state
+  grep -Fqx 'STATE_SCHEMA=2' "$STATE_FILE" || fail "legacy state was not upgraded to schema 2"
+  grep -q 'REALITY' "$STATE_FILE" && fail "schema 2 state contains retired REALITY data"
+  :
+
+  STATE_FILE="$temp_dir/reality-state.env"
+  chmod 0600 "$STATE_FILE"
+  mutation_log="$temp_dir/mutations.log"
+  reset_options
+  deploy_services() { printf 'deploy\n' >>"$mutation_log"; }
+  attempt_reality_only_migration() {
+    prepare_configuration
+    deploy_services
+  }
+  assert_fails "Automatic REALITY-only migration is unsafe" attempt_reality_only_migration
+  [[ ! -e "$mutation_log" ]] || fail "legacy REALITY-only state reached deployment"
+)
+
 test_state_round_trip
 test_state_security
+test_legacy_state_migration
 
 test_runtime_generation() (
   local temp_dir old_path
@@ -643,13 +702,11 @@ test_runtime_generation() (
 #!/usr/bin/env bash
 case "$1 ${2:-}" in
   'uuid ') printf '%s\n' 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa' ;;
-  'x25519 ') printf '%s\n' 'Private key: generated-private' 'Password: generated-public' ;;
   *) exit 1 ;;
 esac
 EOF
   cat >"$temp_dir/openssl" <<'EOF'
 #!/usr/bin/env bash
-[[ "$1 $2 $3" == 'rand -hex 8' ]] && { printf '0123456789abcdef\n'; exit; }
 [[ "$1 $2 $3" == 'rand -hex 12' ]] && { printf '0123456789abcdef01234567\n'; exit; }
 exit 1
 EOF
@@ -661,94 +718,62 @@ EOF
   chmod +x "$temp_dir/xray" "$temp_dir/openssl" "$temp_dir/shuf"
 
   reset_options
-  MODE="reality"
+  MODE="direct"
   generate_runtime_values
-  assert_eq "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" "$REALITY_UUID" "generated REALITY UUID"
-  assert_eq "generated-private" "$REALITY_PRIVATE_KEY" "generated REALITY private key"
-  assert_eq "generated-public" "$REALITY_PUBLIC_KEY" "generated REALITY public key"
-  assert_eq "0123456789abcdef" "$REALITY_SHORT_ID" "generated REALITY short ID"
-  assert_eq "" "$CLOUDFLARE_UUID" "reality does not generate Cloudflare UUID"
-  assert_eq "" "$INTERNAL_WS_PORT" "reality does not generate internal port"
-  assert_eq "" "$WS_PATH" "reality does not generate WS path"
+  assert_eq "" "$CLOUDFLARE_UUID" "direct mode does not generate Cloudflare UUID"
+  assert_eq "" "$INTERNAL_WS_PORT" "direct mode does not generate internal port"
+  assert_eq "" "$WS_PATH" "direct mode does not generate WS path"
 
   reset_options
   MODE="cloudflare"
   generate_runtime_values
-  assert_eq "" "$REALITY_UUID" "Cloudflare does not generate REALITY UUID"
   assert_eq "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" "$CLOUDFLARE_UUID" "generated Cloudflare UUID"
   assert_eq "31001" "$INTERNAL_WS_PORT" "generated internal port"
   assert_eq "/0123456789abcdef01234567" "$WS_PATH" "generated WS path"
 
   reset_options
-  MODE="dual"
-  REALITY_PORT="443"
-  CLOUDFLARE_PORT="8443"
+  MODE="full"
+  CLOUDFLARE_PORT="443"
   generate_runtime_values
-  [[ -n "$REALITY_UUID" && -n "$CLOUDFLARE_UUID" && -n "$REALITY_PRIVATE_KEY" ]] ||
-    fail "dual mode did not generate both credential sets"
-  REALITY_UUID="existing-reality"
+  [[ -n "$CLOUDFLARE_UUID" ]] || fail "full mode did not generate Cloudflare credentials"
   CLOUDFLARE_UUID="existing-cloudflare"
-  REALITY_PRIVATE_KEY="existing-private"
-  REALITY_PUBLIC_KEY="existing-public"
-  REALITY_SHORT_ID="existing-short"
   INTERNAL_WS_PORT="32001"
   WS_PATH="/existing"
   generate_runtime_values
-  assert_eq "existing-reality" "$REALITY_UUID" "existing REALITY UUID reused"
   assert_eq "existing-cloudflare" "$CLOUDFLARE_UUID" "existing Cloudflare UUID reused"
-  assert_eq "existing-private" "$REALITY_PRIVATE_KEY" "existing private key reused"
-  assert_eq "existing-public" "$REALITY_PUBLIC_KEY" "existing public key reused"
-  assert_eq "existing-short" "$REALITY_SHORT_ID" "existing short ID reused"
   assert_eq "32001" "$INTERNAL_WS_PORT" "existing internal port reused"
   assert_eq "/existing" "$WS_PATH" "existing path reused"
 
   reset_options
-  MODE="dual"
+  MODE="full"
   DOMAIN="vpn.example.com"
   EMAIL="admin@example.com"
-  REALITY_PORT="443"
-  CLOUDFLARE_PORT="8443"
-  REALITY_TARGET="www.microsoft.com:443"
+  CLOUDFLARE_PORT="443"
+  HY2_PORT_RANGE="20000-20100"
+  SS_PORT="8388"
+  SERVER_ADDRESS="edge.example.com"
   ALLOW_BITTORRENT="1"
-  REALITY_UUID="one"
+  ALLOW_MAIL="1"
   CLOUDFLARE_UUID="two"
-  REALITY_PRIVATE_KEY="three"
-  REALITY_PUBLIC_KEY="four"
-  REALITY_SHORT_ID="five"
   INTERNAL_WS_PORT="31001"
   WS_PATH="/six"
+  HY2_AUTH="seven"
+  HY2_OBFS_PASSWORD="eight"
+  HY2_SNI="nine"
+  HY2_CERT_PIN="ten"
+  SS_KEY="eleven"
   rotate_runtime_values
-  [[ -z "$REALITY_UUID$CLOUDFLARE_UUID$REALITY_PRIVATE_KEY$REALITY_PUBLIC_KEY$REALITY_SHORT_ID$INTERNAL_WS_PORT$WS_PATH" ]] ||
+  [[ -z "$CLOUDFLARE_UUID$INTERNAL_WS_PORT$WS_PATH$HY2_AUTH$HY2_OBFS_PASSWORD$HY2_SNI$HY2_CERT_PIN$SS_KEY" ]] ||
     fail "rotate did not clear generated runtime values"
-  assert_eq "dual" "$MODE" "rotate retains mode"
+  assert_eq "full" "$MODE" "rotate retains mode"
   assert_eq "vpn.example.com" "$DOMAIN" "rotate retains domain"
-  assert_eq "443" "$REALITY_PORT" "rotate retains public ports"
-  assert_eq "www.microsoft.com:443" "$REALITY_TARGET" "rotate retains target"
+  assert_eq "admin@example.com" "$EMAIL" "rotate retains email"
+  assert_eq "443" "$CLOUDFLARE_PORT" "rotate retains Cloudflare port"
+  assert_eq "20000-20100" "$HY2_PORT_RANGE" "rotate retains Hysteria2 range"
+  assert_eq "8388" "$SS_PORT" "rotate retains Shadowsocks port"
+  assert_eq "edge.example.com" "$SERVER_ADDRESS" "rotate retains server address"
   assert_eq "1" "$ALLOW_BITTORRENT" "rotate retains BitTorrent setting"
-
-  xray() { printf '%s\n' 'Private key: private-from-public-label' 'Public key: public-fallback'; }
-  read_x25519_keypair
-  assert_eq "private-from-public-label" "$REALITY_PRIVATE_KEY" "parsed Private key label"
-  assert_eq "public-fallback" "$REALITY_PUBLIC_KEY" "parsed Public key fallback"
-  xray() {
-    printf '%s\n' \
-      'PrivateKey: private-from-current-xray' \
-      'Password (PublicKey): public-from-current-xray' \
-      'Hash32: ignored-current-xray-hash'
-  }
-  read_x25519_keypair
-  assert_eq "private-from-current-xray" "$REALITY_PRIVATE_KEY" "parsed current Xray private key label"
-  assert_eq "public-from-current-xray" "$REALITY_PUBLIC_KEY" "parsed current Xray Password (PublicKey) label"
-  xray() {
-    printf 'PrivateKey: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\r\n'
-    printf 'Password (PublicKey): BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\r\n'
-    printf 'Hash32: CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC\r\n'
-  }
-  read_x25519_keypair
-  assert_eq "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" "$REALITY_PRIVATE_KEY" "trimmed CRLF private key"
-  assert_eq "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB" "$REALITY_PUBLIC_KEY" "trimmed CRLF public key"
-  xray() { printf '%s\n' 'unparseable output'; }
-  assert_fails "Unable to parse" read_x25519_keypair
+  assert_eq "1" "$ALLOW_MAIL" "rotate retains mail setting"
   PATH="$old_path"
 )
 
@@ -806,20 +831,6 @@ test_cloudflare_preflight() (
   host_resolves_to_cloudflare outside.example.com && fail "outside hostname accepted as Cloudflare"
   assert_fails "does not resolve to Cloudflare" validate_cloudflare_domain outside.example.com
 
-  getent() { printf '%s\n' '104.16.1.1 STREAM www.microsoft.com'; }
-  local tls_ping_target=""
-  xray() {
-    [[ "$1 $2" == 'tls ping' ]] || return 1
-    tls_ping_target="$3"
-  }
-  timeout() { shift; "$@"; }
-  assert_fails "resolves to Cloudflare" validate_reality_target www.microsoft.com:443
-  getent() { printf '%s\n' '203.0.113.2 STREAM example.net'; }
-  validate_reality_target example.net:443
-  assert_eq "example.net:443" "$tls_ping_target" "REALITY TLS ping target includes port"
-  xray() { return 1; }
-  assert_fails "TLS ping failed" validate_reality_target example.net:443
-
   unset CLOUDFLARE_IPV4_FILE CLOUDFLARE_IPV6_FILE
   RUNTIME_DIR="$temp_dir/run"
   curl_log="$temp_dir/curl.log"
@@ -864,14 +875,36 @@ test_cloudflare_preflight() (
 
 test_cloudflare_preflight
 
+test_interim_bundle_readiness() (
+  local temp_dir mutation_log
+  temp_dir="$(mktemp -d)"
+  trap 'rm -rf "$temp_dir"' RETURN
+  mutation_log="$temp_dir/mutations.log"
+
+  reset_options
+  MODE="direct"
+  uname() { printf 'environment-probe\n' >>"$mutation_log"; printf 'Linux\n'; }
+  assert_fails "Direct bundle is not available in this build yet" preflight_environment
+  [[ ! -e "$mutation_log" ]] || fail "direct readiness gate ran after environment preflight"
+
+  begin_transaction() { printf 'transaction\n' >>"$mutation_log"; }
+  assert_fails "Direct bundle is not available in this build yet" deploy_services
+  [[ ! -e "$mutation_log" ]] || fail "direct readiness gate ran after transaction start"
+
+  MODE="full"
+  assert_fails "Direct bundle is not available in this build yet" require_mode_ready
+
+  MODE="cloudflare"
+  require_mode_ready
+)
+
+test_interim_bundle_readiness
+printf 'PASS: interim bundle readiness tests\n'
+
 test_environment_preflight() (
   reset_options
-  MODE="dual"
-  REALITY_PORT="443"
+  MODE="cloudflare"
   CLOUDFLARE_PORT="8443"
-  validate_unique_public_ports
-  CLOUDFLARE_PORT="443"
-  assert_fails "must be different" validate_unique_public_ports
   legacy_nginx_config_path /etc/nginx/conf.d/v2ray-vpn.example.com.conf || fail "legacy Nginx path rejected"
   legacy_nginx_config_path /tmp/v2ray-vpn.example.com.conf && fail "non-project Nginx path accepted"
 
@@ -1114,17 +1147,9 @@ NGINX
       return 1
     fi
   }
-  REALITY_PORT="443"
   CLOUDFLARE_PORT="8443"
   stdin_is_tty() { return 1; }
   local conflict_output=""
-  if conflict_output="$(check_public_port_listeners 2>&1)"; then
-    fail "noninteractive REALITY conflict unexpectedly passed"
-  fi
-  [[ "$conflict_output" == *'--reality-port PORT'* ]] ||
-    fail "REALITY conflict lacks rerun advice: $conflict_output"
-  [[ "$conflict_output" == *'ss -lntp output:'* && "$conflict_output" == *'State Recv-Q Send-Q'* ]] ||
-    fail "REALITY conflict lacks complete ss output: $conflict_output"
 
   nginx() {
     [[ "$1" == '-T' ]] || return 1
@@ -1141,7 +1166,6 @@ NGINX
   check_public_port_listeners
 
   MODE="cloudflare"
-  REALITY_PORT=""
   CLOUDFLARE_PORT="8443"
   nginx() {
     [[ "$1" == '-T' ]] || return 1
@@ -1211,7 +1235,7 @@ test_nginx_and_acme() (
   INTERNAL_WS_PORT="31001"
   WS_PATH="/6f4f5304d2e84dc8"
   ACME_WEBROOT="$temp_dir/acme-webroot"
-  REALITY_PRIVATE_KEY="private-proxy-secret"
+  SS_KEY="private-proxy-secret"
   CLOUDFLARE_UUID="22222222-2222-4222-8222-222222222222"
 
   printf 'old site\n' >"$temp_dir/site.conf"
@@ -1248,7 +1272,7 @@ test_nginx_and_acme() (
   grep -Fq 'proxy_send_timeout 3600s;' "$temp_dir/site.conf" || fail "WebSocket send timeout missing"
   grep -Fq 'proxy_buffering off;' "$temp_dir/site.conf" || fail "WebSocket buffering not disabled"
   grep -Fq 'return 200 "ok\n";' "$temp_dir/site.conf" || fail "final ordinary response missing"
-  grep -Fq "$REALITY_PRIVATE_KEY" "$temp_dir/site.conf" && fail "Nginx config contains proxy credentials"
+  grep -Fq "$SS_KEY" "$temp_dir/site.conf" && fail "Nginx config contains proxy credentials"
   grep -Fq "$CLOUDFLARE_UUID" "$temp_dir/site.conf" && fail "Nginx config contains proxy credentials"
   current_nginx_config_is_project_owned "$NGINX_SITE" ||
     fail "installer-generated final Nginx site was not recognized"
@@ -1552,11 +1576,11 @@ EOF
 test_mixed_legacy_nginx_file_is_never_disabled
 printf 'PASS: mixed legacy Nginx ownership tests\n'
 
-test_reality_mode_removes_owned_cloudflare_files_transactionally() (
+test_direct_mode_removes_owned_cloudflare_files_transactionally() (
   local temp_dir service_log
   temp_dir="$(mktemp -d)"
   trap 'rm -rf "$temp_dir"' RETURN
-  MODE="reality"
+  MODE="direct"
   NGINX_SITE="$temp_dir/nginx/v2ray-onekey.conf"
   RENEWAL_HOOK="$temp_dir/hooks/v2ray-onekey-nginx.sh"
   XRAY_CONFIG="$temp_dir/xray/config.json"
@@ -1587,9 +1611,9 @@ EOF
   }
   nginx() { printf 'nginx %s\n' "$*" >>"$service_log"; }
   release_legacy_nginx_listeners
-  [[ ! -e "$NGINX_SITE" && ! -e "$RENEWAL_HOOK" ]] || fail "owned Cloudflare files remained in reality mode"
-  grep -Fq 'nginx -t' "$service_log" || fail "Nginx was not validated after reality-mode cleanup"
-  grep -Fq 'systemctl reload nginx' "$service_log" || fail "Nginx was not reloaded after reality-mode cleanup"
+  [[ ! -e "$NGINX_SITE" && ! -e "$RENEWAL_HOOK" ]] || fail "owned Cloudflare files remained in direct mode"
+  grep -Fq 'nginx -t' "$service_log" || fail "Nginx was not validated after direct-mode cleanup"
+  grep -Fq 'systemctl reload nginx' "$service_log" || fail "Nginx was not reloaded after direct-mode cleanup"
   rollback_current_run
   [[ -f "$NGINX_SITE" && -f "$RENEWAL_HOOK" ]] || fail "rollback did not restore Cloudflare files"
 
@@ -1604,13 +1628,13 @@ EOF
   mixed_site_content="$(cat "$NGINX_SITE")"
   printf 'echo unrelated\n' >>"$RENEWAL_HOOK"
   release_legacy_nginx_listeners >/dev/null
-  [[ -f "$NGINX_SITE" ]] || fail "reality transition removed a mixed current Nginx site"
+  [[ -f "$NGINX_SITE" ]] || fail "direct transition removed a mixed current Nginx site"
   assert_eq "$mixed_site_content" "$(cat "$NGINX_SITE")" "mixed current Nginx site preservation"
   grep -Fqx 'echo unrelated' "$RENEWAL_HOOK" || fail "extra-command renewal hook was modified"
 )
 
-test_reality_mode_removes_owned_cloudflare_files_transactionally
-printf 'PASS: reality mode Cloudflare-file transition tests\n'
+test_direct_mode_removes_owned_cloudflare_files_transactionally
+printf 'PASS: direct mode Cloudflare-file transition tests\n'
 
 test_deployment_lock_and_backup_collision() (
   local temp_dir base first_lock_owner
@@ -1658,42 +1682,87 @@ test_prepare_configuration_reuse_and_rotate() (
   trap 'rm -rf "$temp_dir"' RETURN
   STATE_FILE="$temp_dir/state/state.env"
   reset_options
-  MODE="dual"
+  MODE="full"
   DOMAIN="vpn.example.com"
   EMAIL="admin@example.com"
-  REALITY_PORT="443"
-  CLOUDFLARE_PORT="8443"
+  CLOUDFLARE_PORT="443"
   INTERNAL_WS_PORT="31001"
-  REALITY_UUID="11111111-1111-4111-8111-111111111111"
   CLOUDFLARE_UUID="22222222-2222-4222-8222-222222222222"
-  REALITY_PRIVATE_KEY="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-  REALITY_PUBLIC_KEY="BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
-  REALITY_SHORT_ID="0123456789abcdef"
-  REALITY_TARGET="www.microsoft.com:443"
   WS_PATH="/saved-path"
+  HY2_PORT_RANGE="20000-20100"
+  HY2_AUTH="saved-hy2-auth"
+  HY2_OBFS_PASSWORD="saved-hy2-obfs"
+  HY2_SNI="saved.example.com"
+  HY2_CERT_PIN="saved-pin"
+  SS_PORT="8388"
+  SS_METHOD="2022-blake3-aes-128-gcm"
+  SS_KEY="saved-ss-key"
+  SERVER_ADDRESS="edge.example.com"
+  ALLOW_MAIL="1"
   save_state
 
   reset_options
   parse_args
   prepare_configuration
-  assert_eq "dual" "$MODE" "existing state mode reused without prompt"
+  assert_eq "full" "$MODE" "existing state mode reused without prompt"
   assert_eq "/saved-path" "$WS_PATH" "existing credentials reused"
 
   reset_options
   parse_args --rotate
   prepare_configuration
-  assert_eq "dual" "$MODE" "rotate retained saved mode"
+  assert_eq "full" "$MODE" "rotate retained saved mode"
   assert_eq "vpn.example.com" "$DOMAIN" "rotate retained saved domain"
-  assert_eq "443" "$REALITY_PORT" "rotate retained saved public port"
-  assert_eq "" "$REALITY_UUID" "rotate cleared REALITY UUID"
+  assert_eq "admin@example.com" "$EMAIL" "rotate retained saved email"
+  assert_eq "443" "$CLOUDFLARE_PORT" "rotate retained Cloudflare port"
+  assert_eq "20000-20100" "$HY2_PORT_RANGE" "rotate retained Hysteria2 range"
+  assert_eq "8388" "$SS_PORT" "rotate retained Shadowsocks port"
+  assert_eq "edge.example.com" "$SERVER_ADDRESS" "rotate retained server address"
   assert_eq "" "$CLOUDFLARE_UUID" "rotate cleared Cloudflare UUID"
+  assert_eq "" "$INTERNAL_WS_PORT" "rotate cleared internal WebSocket port"
   assert_eq "" "$WS_PATH" "rotate cleared WebSocket path"
+  assert_eq "" "$HY2_AUTH$HY2_OBFS_PASSWORD$HY2_SNI$HY2_CERT_PIN" "rotate cleared Hysteria2 credentials"
+  assert_eq "" "$SS_KEY" "rotate cleared Shadowsocks credentials"
+  assert_eq "2022-blake3-aes-128-gcm" "$SS_METHOD" "rotate retained Shadowsocks method"
+  assert_eq "1" "$ALLOW_MAIL" "rotate retained mail setting"
+
+  reset_options
+  parse_args --mode cloudflare --rotate
+  prepare_configuration
+  assert_eq "cloudflare" "$MODE" "full state rotated to Cloudflare mode"
+  assert_eq "vpn.example.com" "$DOMAIN" "full-to-Cloudflare domain"
+  assert_eq "admin@example.com" "$EMAIL" "full-to-Cloudflare email"
+  assert_eq "" "$HY2_PORT_RANGE$HY2_AUTH$HY2_OBFS_PASSWORD$HY2_SNI$HY2_CERT_PIN" "full-to-Cloudflare Hysteria2 cleanup"
+  assert_eq "" "$SS_PORT$SS_METHOD$SS_KEY" "full-to-Cloudflare Shadowsocks cleanup"
+  assert_eq "" "$SERVER_ADDRESS" "full-to-Cloudflare server address cleanup"
+
+  reset_options
+  MODE="direct"
+  HY2_PORT_RANGE="22000-22100"
+  HY2_AUTH="direct-auth"
+  HY2_OBFS_PASSWORD="direct-obfs"
+  HY2_SNI="direct.example.com"
+  HY2_CERT_PIN="direct-pin"
+  SS_PORT="18388"
+  SS_METHOD="2022-blake3-aes-128-gcm"
+  SS_KEY="direct-key"
+  SERVER_ADDRESS="198.51.100.10"
+  save_state
+
+  reset_options
+  parse_args --mode cloudflare --domain vpn.example.com --email admin@example.com --rotate
+  prepare_configuration
+  assert_eq "cloudflare" "$MODE" "direct state rotated to Cloudflare mode"
+  assert_eq "vpn.example.com" "$DOMAIN" "direct-to-Cloudflare domain"
+  assert_eq "admin@example.com" "$EMAIL" "direct-to-Cloudflare email"
+  assert_eq "" "$HY2_PORT_RANGE$HY2_AUTH$HY2_OBFS_PASSWORD$HY2_SNI$HY2_CERT_PIN" "direct-to-Cloudflare Hysteria2 cleanup"
+  assert_eq "" "$SS_PORT$SS_METHOD$SS_KEY" "direct-to-Cloudflare Shadowsocks cleanup"
+  assert_eq "" "$SERVER_ADDRESS" "direct-to-Cloudflare server address cleanup"
 )
 
 test_prepare_configuration_reuse_and_rotate
 printf 'PASS: state reuse and rotation tests\n'
 
-test_interactive_dual_mode_collects_domain_and_email() (
+test_interactive_full_mode_collects_domain_and_email() (
   local temp_dir
   temp_dir="$(mktemp -d)"
   trap 'rm -rf "$temp_dir"' RETURN
@@ -1704,44 +1773,46 @@ test_interactive_dual_mode_collects_domain_and_email() (
   parse_args
   prepare_configuration <<< $'3\nVPN.Example.COM\nadmin@example.com\n'
 
-  assert_eq "dual" "$MODE" "interactive mode selection"
+  assert_eq "full" "$MODE" "interactive mode selection"
   assert_eq "vpn.example.com" "$DOMAIN" "interactive Cloudflare domain"
   assert_eq "admin@example.com" "$EMAIL" "interactive certificate email"
-  assert_eq "443" "$REALITY_PORT" "interactive REALITY default port"
-  assert_eq "8443" "$CLOUDFLARE_PORT" "interactive Cloudflare default port"
+  assert_eq "443" "$CLOUDFLARE_PORT" "interactive Cloudflare default port"
+  assert_eq "20000-20100" "$HY2_PORT_RANGE" "interactive Hysteria2 default range"
+  assert_eq "8388" "$SS_PORT" "interactive Shadowsocks default port"
 )
 
-test_interactive_dual_mode_collects_domain_and_email
+test_interactive_full_mode_collects_domain_and_email
 printf 'PASS: interactive Cloudflare identity tests\n'
 
 test_port_resolution() (
   reset_options
-  MODE="dual"
+  MODE="full"
   DOMAIN="vpn.example.com"
-  REALITY_PORT="443"
   CLOUDFLARE_PORT="8443"
   stdin_is_tty() { return 0; }
   port_listener_conflicts() {
     local role="$1" port="$2"
     PORT_CONFLICT_DETAILS="mock conflict"
-    [[ "$role:$port" == "reality:443" || "$role:$port" == "cloudflare:8443" ]]
+    [[ "$role:$port" == "cloudflare:8443" ]]
   }
   resolve_public_port_conflicts <<'EOF'
-8443
-4443
 2443
 2053
 EOF
-  assert_eq "4443" "$REALITY_PORT" "interactive REALITY replacement"
   assert_eq "2053" "$CLOUDFLARE_PORT" "Cloudflare allowlisted replacement"
-  validate_unique_public_ports
 
   reset_options
-  MODE="reality"
-  REALITY_PORT="443"
+  MODE="cloudflare"
+  DOMAIN="vpn.example.com"
+  CLOUDFLARE_PORT="443"
   stdin_is_tty() { return 1; }
   port_listener_conflicts() { PORT_CONFLICT_DETAILS="occupied by other"; return 0; }
-  assert_fails "--reality-port PORT" resolve_public_port_conflicts
+  assert_fails "--cloudflare-port PORT" resolve_public_port_conflicts
+
+  reset_options
+  MODE="direct"
+  port_listener_conflicts() { fail "direct mode checked a public TCP listener"; }
+  resolve_public_port_conflicts
 )
 
 test_port_resolution
@@ -1757,12 +1828,12 @@ test_packages_permissions_and_firewall() (
     [[ "$*" != "python3-certbot-nginx" ]]
   }
   reset_options
-  MODE="reality"
+  MODE="direct"
   PKG_MANAGER="apt"
   install_required_packages
   grep -Fq 'curl ca-certificates openssl python3 coreutils gawk iproute2' "$package_log" ||
     fail "APT base package set is incomplete"
-  grep -Eq 'nginx|certbot' "$package_log" && fail "reality-only installed Cloudflare packages"
+  grep -Eq 'nginx|certbot' "$package_log" && fail "direct-only installed Cloudflare packages"
   : >"$package_log"
   PKG_MANAGER="dnf"
   install_required_packages
@@ -1883,9 +1954,10 @@ test_deployment_order_and_failure_trap() (
   order_log="$temp_dir/order.log"
   event() { printf '%s\n' "$1" >>"$order_log"; }
   reset_options
-  MODE="reality"
-  REALITY_PORT="443"
-  REALITY_TARGET="example.net:443"
+  MODE="direct"
+  direct_bundle_ready() { return 0; }
+  HY2_PORT_RANGE="20000-20100"
+  SS_PORT="8388"
   RUNTIME_DIR="$temp_dir/run"
   ACME_WEBROOT="$temp_dir/acme"
   begin_transaction() { RUN_TIMESTAMP="test"; BACKUP_DIR="$temp_dir/backup"; install -d "$BACKUP_DIR"; event backup; }
@@ -1895,11 +1967,6 @@ test_deployment_order_and_failure_trap() (
   generate_runtime_values() { event generate; }
   validate_loaded_runtime_values() { event runtime-validate; }
   download_cloudflare_ranges() { event cf-download; }
-  write_builtin_cloudflare_ranges() { event cf-builtin; }
-  validate_reality_target() { event target; }
-  public_ip() { printf '1.1.1.1'; }
-  valid_public_ip() { [[ "$1" == "1.1.1.1" ]]; }
-  format_uri_host() { printf '%s\n' "$1"; }
   check_public_port_listeners() { event public-ports; }
   check_internal_ws_port_listener() { event internal-port; }
   render_xray_config() { printf '{}\n' >"$1"; event render; }
@@ -1918,7 +1985,7 @@ test_deployment_order_and_failure_trap() (
   status=$?
   set -e
   [[ "$status" -eq 0 ]] || fail "mock deployment failed unexpectedly: $(tr '\n' ',' <"$order_log")"
-  grep -Fq 'cf-download' "$order_log" && fail "reality-only downloaded Cloudflare ranges"
+  grep -Fq 'cf-download' "$order_log" && fail "direct-only downloaded Cloudflare ranges"
   [[ "$(grep -n '^xray-test$' "$order_log" | cut -d: -f1)" -lt "$(grep -n '^config-install$' "$order_log" | cut -d: -f1)" ]] ||
     fail "Xray test did not precede config installation"
   [[ "$(grep -n '^listeners-ok$' "$order_log" | cut -d: -f1)" -lt "$(grep -n '^v2ray-disable$' "$order_log" | cut -d: -f1)" ]] ||
@@ -2023,34 +2090,26 @@ test_transaction_exit_trap
 printf 'PASS: transaction EXIT trap tests\n'
 
 test_mode_specific_output() (
-  valid_public_ip "1.1.1.1" || fail "public IP validator rejected a global address"
-  valid_public_ip "203.0.113.10" && fail "documentation-only address was accepted as public"
-  valid_public_ip "10.0.0.1" && fail "private address was accepted as public"
   reset_options
-  MODE="dual"
+  MODE="full"
   DOMAIN="vpn.example.com"
-  REALITY_PORT="4443"
   CLOUDFLARE_PORT="2053"
-  REALITY_TARGET="www.microsoft.com:443"
-  REALITY_UUID="11111111-1111-4111-8111-111111111111"
   CLOUDFLARE_UUID="22222222-2222-4222-8222-222222222222"
-  REALITY_PUBLIC_KEY="BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
-  REALITY_SHORT_ID="0123456789abcdef"
   WS_PATH="/saved-path"
-  PUBLIC_ADDRESS="1.1.1.1"
   STATE_FILE="/etc/v2ray-onekey/state.env"
   BACKUP_DIR="/var/backups/v2ray-onekey/test"
   local output
   output="$(print_deployment_summary)"
-  [[ "$output" == *'Primary direct entry: VLESS + REALITY + XTLS Vision'* ]] || fail "dual output lacks direct label"
-  [[ "$output" == *'Fallback entry: VLESS + WebSocket + TLS + Cloudflare'* ]] || fail "dual output lacks CF label"
-  [[ "$output" == *'@1.1.1.1:4443'* && "$output" == *'@vpn.example.com:2053'* ]] || fail "final selected ports not printed"
-  MODE="reality"
+  [[ "$output" == *'Cloudflare entry: VLESS + WebSocket + TLS'* ]] || fail "full output lacks Cloudflare label"
+  [[ "$output" == *'@vpn.example.com:2053'* ]] || fail "full output omits the Cloudflare link"
+  [[ "$output" != *'REALITY'* ]] || fail "full output exposes retired protocol behavior"
+  MODE="direct"
   output="$(print_deployment_summary)"
-  [[ "$output" == *'Primary direct entry:'* && "$output" != *'Fallback entry:'* ]] || fail "reality output labels are wrong"
+  [[ "$output" != *'vless://'* ]] || fail "direct output contains an unimplemented public link"
+  [[ "$output" == *'No public listeners are configured for direct mode'* ]] || fail "direct output does not explain the interim listener state"
   MODE="cloudflare"
   output="$(print_deployment_summary)"
-  [[ "$output" != *'Primary direct entry:'* && "$output" == *'Fallback entry:'* ]] || fail "Cloudflare output labels are wrong"
+  [[ "$output" == *'Cloudflare entry:'* && "$output" == *'@vpn.example.com:2053'* ]] || fail "Cloudflare output labels are wrong"
 )
 
 test_mode_specific_output
