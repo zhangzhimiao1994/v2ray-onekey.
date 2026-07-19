@@ -198,7 +198,8 @@ valid_hy2_port_range "20000-20100" || fail "default Hysteria2 range rejected"
 valid_hy2_port_range "20000" && fail "single Hysteria2 port accepted as a range"
 valid_hy2_port_range "0-100" && fail "zero Hysteria2 range bound accepted"
 valid_hy2_port_range "100-99" && fail "reversed Hysteria2 range accepted"
-valid_hy2_port_range "1-1001" && fail "Hysteria2 range larger than 1000 ports accepted"
+valid_hy2_port_range "1-1001" || fail "Hysteria2 range with span 1000 rejected"
+valid_hy2_port_range "1-1002" && fail "Hysteria2 range with span larger than 1000 accepted"
 valid_hy2_port_range "65000-65536" && fail "out-of-bounds Hysteria2 range accepted"
 valid_server_address "vpn.example.com" || fail "domain server address rejected"
 valid_server_address "192.0.2.1" || fail "IPv4 server address rejected"
@@ -638,6 +639,8 @@ def parse_yaml_subset(path):
         for raw in handle:
             if not raw.strip():
                 continue
+            if raw.lstrip().startswith("#"):
+                continue
             indent = len(raw) - len(raw.lstrip(" "))
             key, value = raw.strip().split(":", 1)
             while stack[-1][0] >= indent:
@@ -716,8 +719,8 @@ EOF
     \( -name '.hysteria-config.*' -o -name '.hysteria-acl.*' -o -name '.hysteria-unit.*' \) \
     -print -quit)" ]] || fail "failed Hysteria2 renderer leaked private temporary files"
 
-  expected_acl=$'reject(0.0.0.0/8)\nreject(10.0.0.0/8)\nreject(100.64.0.0/10)\nreject(127.0.0.0/8)\nreject(169.254.0.0/16)\nreject(172.16.0.0/12)\nreject(192.168.0.0/16)\nreject(224.0.0.0/4)\nreject(::1/128)\nreject(fc00::/7)\nreject(fe80::/10)\nreject(all, tcp/25)\nreject(all, tcp/465)\nreject(all, tcp/587)\ndirect(all)'
-  expected_acl_mail=$'reject(0.0.0.0/8)\nreject(10.0.0.0/8)\nreject(100.64.0.0/10)\nreject(127.0.0.0/8)\nreject(169.254.0.0/16)\nreject(172.16.0.0/12)\nreject(192.168.0.0/16)\nreject(224.0.0.0/4)\nreject(::1/128)\nreject(fc00::/7)\nreject(fe80::/10)\ndirect(all)'
+  expected_acl=$'# Managed by v2ray-onekey: Hysteria2 ACL v1\nreject(0.0.0.0/8)\nreject(10.0.0.0/8)\nreject(100.64.0.0/10)\nreject(127.0.0.0/8)\nreject(169.254.0.0/16)\nreject(172.16.0.0/12)\nreject(192.168.0.0/16)\nreject(224.0.0.0/4)\nreject(::1/128)\nreject(fc00::/7)\nreject(fe80::/10)\nreject(all, tcp/25)\nreject(all, tcp/465)\nreject(all, tcp/587)\ndirect(all)'
+  expected_acl_mail=$'# Managed by v2ray-onekey: Hysteria2 ACL v1\nreject(0.0.0.0/8)\nreject(10.0.0.0/8)\nreject(100.64.0.0/10)\nreject(127.0.0.0/8)\nreject(169.254.0.0/16)\nreject(172.16.0.0/12)\nreject(192.168.0.0/16)\nreject(224.0.0.0/4)\nreject(::1/128)\nreject(fc00::/7)\nreject(fe80::/10)\ndirect(all)'
   ALLOW_MAIL="0"
   render_hysteria_acl "$temp_dir/acl.txt"
   assert_eq "$expected_acl" "$(cat "$temp_dir/acl.txt")" "Hysteria2 ACL order"
@@ -727,7 +730,7 @@ EOF
   assert_eq "$expected_acl_mail" "$(cat "$temp_dir/acl-mail.txt")" \
     "Hysteria2 allow-mail ACL"
 
-  expected_unit=$'[Unit]\nDescription=Hysteria2 Server\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nUser=hysteria\nGroup=hysteria\nExecStart=/usr/local/bin/hysteria server -c /etc/hysteria/config.yaml\nRestart=on-failure\nRestartSec=5s\nAmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE\nCapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE\nNoNewPrivileges=true\nLimitNOFILE=1048576\n\n[Install]\nWantedBy=multi-user.target'
+  expected_unit=$'# Managed by v2ray-onekey: Hysteria2 unit v1\n[Unit]\nDescription=Hysteria2 Server\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nUser=hysteria\nGroup=hysteria\nExecStart=/usr/local/bin/hysteria server -c /etc/hysteria/config.yaml\nRestart=on-failure\nRestartSec=5s\nAmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE\nCapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE\nNoNewPrivileges=true\nLimitNOFILE=1048576\n\n[Install]\nWantedBy=multi-user.target'
   render_hysteria_unit "$temp_dir/hysteria-server.service"
   assert_eq "$expected_unit" "$(cat "$temp_dir/hysteria-server.service")" \
     "Ubuntu 18 compatible Hysteria2 unit"
@@ -1637,37 +1640,18 @@ test_cloudflare_preflight() (
 
 test_cloudflare_preflight
 
-test_interim_bundle_readiness() (
-  local temp_dir mutation_log
-  temp_dir="$(mktemp -d)"
-  trap 'rm -rf "$temp_dir"' RETURN
-  mutation_log="$temp_dir/mutations.log"
-
+test_task5_direct_bundle_gate_remains_closed() (
   reset_options
   MODE="direct"
-  uname() { printf 'environment-probe\n' >>"$mutation_log"; printf 'Linux\n'; }
-  assert_fails "Direct bundle is not available in this build yet" preflight_environment
-  [[ ! -e "$mutation_log" ]] || fail "direct readiness gate ran after environment preflight"
-
-  begin_transaction() { printf 'transaction\n' >>"$mutation_log"; }
-  assert_fails "Direct bundle is not available in this build yet" deploy_services
-  [[ ! -e "$mutation_log" ]] || fail "direct readiness gate ran after transaction start"
-
-  prepare_configuration() { MODE="direct"; }
-  validate_hysteria_staged() { printf 'staging-smoke\n' >>"$mutation_log"; }
-  assert_fails "Direct bundle is not available in this build yet" main --mode direct
-  [[ ! -e "$mutation_log" ]] ||
-    fail "production main reached the Task 4 Hysteria2 staging smoke before the readiness gate"
-
+  assert_fails "Direct bundle is not available in this build yet" require_mode_ready
   MODE="full"
   assert_fails "Direct bundle is not available in this build yet" require_mode_ready
-
   MODE="cloudflare"
   require_mode_ready
 )
 
-test_interim_bundle_readiness
-printf 'PASS: interim bundle readiness tests\n'
+test_task5_direct_bundle_gate_remains_closed
+printf 'PASS: Task 5 direct bundle gate boundary tests\n'
 
 test_environment_preflight() (
   reset_options
@@ -2076,6 +2060,9 @@ EOF
   assert_eq $'#!/usr/bin/env bash\nset -e\nnginx -t\nsystemctl reload nginx' "$(cat "$hook_path")" "renewal hook content"
 
   local service_log="$temp_dir/nginx-service.log"
+  BACKUP_DIR="$temp_dir/nginx-backup"
+  init_backup_metadata
+  printf 'nginx\tactive\tenabled\n' >"$BACKUP_DIR/services"
   nginx() { printf 'nginx %s\n' "$*" >>"$service_log"; }
   systemctl() {
     if [[ "$*" == 'is-active --quiet nginx' ]]; then return 0; fi
@@ -2198,6 +2185,8 @@ v2ray	active	enabled
 xray	active	disabled
 nginx	active	enabled
 EOF
+  printf '%s\n' v2ray xray nginx >"$BACKUP_DIR/services-touched"
+  chmod 0600 "$BACKUP_DIR/services-touched"
   systemctl() { printf '%s\n' "$*" >>"$service_log"; }
   rollback_current_run
   assert_eq "old-config" "$(cat "$XRAY_CONFIG")" "rollback restored config"
@@ -2371,7 +2360,7 @@ EOF
   init_backup_metadata
   backup_file "$NGINX_SITE"
   backup_file "$RENEWAL_HOOK"
-  : >"$BACKUP_DIR/services"
+  printf 'nginx\tactive\tenabled\n' >"$BACKUP_DIR/services"
   service_log="$temp_dir/service.log"
   systemctl() {
     if [[ "$*" == 'is-active --quiet nginx' ]]; then return 0; fi
@@ -2558,6 +2547,7 @@ test_port_resolution() (
   DOMAIN="vpn.example.com"
   CLOUDFLARE_PORT="8443"
   stdin_is_tty() { return 0; }
+  resolve_direct_port_conflicts() { :; }
   port_listener_conflicts() {
     local role="$1" port="$2"
     PORT_CONFLICT_DETAILS="mock conflict"
@@ -2586,6 +2576,1889 @@ EOF
 test_port_resolution
 printf 'PASS: port resolution tests\n'
 
+test_task5_direct_port_conflicts() (
+  local temp_dir ss_log output
+  temp_dir="$(mktemp -d)"
+  trap 'rm -rf "$temp_dir"' RETURN
+  ss_log="$temp_dir/ss.log"
+
+  reset_options
+  MODE="direct"
+  HY2_PORT_RANGE="20000-20100"
+  SS_PORT="8388"
+  parse_port_range "$HY2_PORT_RANGE"
+  assert_eq "20000" "$HY2_PORT_START" "Hysteria2 range start"
+  assert_eq "20100" "$HY2_PORT_END" "Hysteria2 range end"
+  parse_port_range "1-1001"
+  assert_fails "" parse_port_range "1-1002"
+  assert_fails "" parse_port_range "20000"
+  assert_fails "" parse_port_range "20100-20000"
+
+  ss() {
+    printf '%s\n' "$*" >>"$ss_log"
+    if [[ "$*" == *'-H -lnup'* && "$*" == *':20005'* ]]; then
+      printf 'UNCONN 0 0 0.0.0.0:20005 0.0.0.0:* users:(("other",pid=9,fd=3))\n'
+    elif [[ "$*" == *'-H -lntup'* && "$*" == *':8388'* ]]; then
+      printf 'LISTEN 0 128 0.0.0.0:8388 0.0.0.0:* users:(("other",pid=10,fd=4))\n'
+    fi
+  }
+  stdin_is_tty() { return 1; }
+  output="$(resolve_direct_port_conflicts 2>&1)" &&
+    fail "non-interactive direct conflicts unexpectedly passed"
+  [[ "$output" == *'--hy2-port-range START-END'* && "$output" == *'20005'* ]] ||
+    fail "Hysteria2 conflict diagnostics are incomplete: $output"
+  [[ "$output" == *'--ss-port PORT'* && "$output" == *'8388'* ]] ||
+    fail "Shadowsocks conflict diagnostics are incomplete: $output"
+  grep -Fq -- '-H -lnup sport = :20005' "$ss_log" ||
+    fail "Hysteria2 did not inspect UDP 20005"
+  grep -Fq -- '-H -lntup sport = :8388' "$ss_log" ||
+    fail "Shadowsocks did not inspect TCP and UDP together"
+
+  : >"$ss_log"
+  HY2_PORT_RANGE="443-443"
+  ss() {
+    printf '%s\n' "$*" >>"$ss_log"
+    if [[ "$*" == *'-H -lntp'* && "$*" == *':443'* ]]; then
+      printf 'LISTEN 0 128 0.0.0.0:443 0.0.0.0:* users:(("nginx",pid=11,fd=5))\n'
+    fi
+  }
+  hysteria_range_conflicts && fail "TCP 443 was misclassified as a UDP 443 conflict"
+  grep -Fq -- '-H -lnup sport = :443' "$ss_log" ||
+    fail "Hysteria2 did not use UDP-only listener inspection"
+
+)
+
+test_task5_direct_port_conflicts
+
+test_task5_interactive_direct_port_replacement() (
+  MODE="direct"
+  HY2_PORT_RANGE="20000-20100"
+  SS_PORT="8388"
+  stdin_is_tty() { return 0; }
+  hysteria_range_conflicts() {
+    HY2_PORT_START="${HY2_PORT_RANGE%-*}"
+    HY2_PORT_END="${HY2_PORT_RANGE#*-}"
+    HY2_CONFLICT_DETAILS="UDP 20005 occupied"
+    [[ "$HY2_PORT_RANGE" == "20000-20100" ]]
+  }
+  shadowsocks_port_conflicts() {
+    SS_CONFLICT_DETAILS="TCP 8388 occupied"
+    [[ "$SS_PORT" == "8388" ]]
+  }
+  resolve_direct_port_conflicts <<'EOF'
+21000-21100
+8488
+EOF
+  assert_eq "21000-21100" "$HY2_PORT_RANGE" "interactive Hysteria2 replacement"
+  assert_eq "8488" "$SS_PORT" "interactive Shadowsocks replacement"
+)
+
+test_task5_interactive_direct_port_replacement
+
+test_task5_fifth_interactive_replacement_succeeds() (
+  local hy2_checks=0 ss_checks=0
+  MODE="direct"
+  stdin_is_tty() { return 0; }
+
+  HY2_PORT_RANGE="20000-20100"
+  hysteria_range_conflicts() {
+    hy2_checks=$((hy2_checks + 1))
+    HY2_CONFLICT_DETAILS="occupied attempt $hy2_checks"
+    ((hy2_checks <= 5))
+  }
+  resolve_hysteria_port_range <<'EOF'
+21000-21000
+21001-21001
+21002-21002
+21003-21003
+21004-21004
+EOF
+  assert_eq "21004-21004" "$HY2_PORT_RANGE" "fifth Hysteria2 replacement"
+  assert_eq "6" "$hy2_checks" "Hysteria2 replacement availability checks"
+
+  SS_PORT="8388"
+  shadowsocks_port_conflicts() {
+    ss_checks=$((ss_checks + 1))
+    SS_CONFLICT_DETAILS="occupied attempt $ss_checks"
+    ((ss_checks <= 5))
+  }
+  resolve_shadowsocks_port <<'EOF'
+8481
+8482
+8483
+8484
+8485
+EOF
+  assert_eq "8485" "$SS_PORT" "fifth Shadowsocks replacement"
+  assert_eq "6" "$ss_checks" "Shadowsocks replacement availability checks"
+)
+
+test_task5_fifth_interactive_replacement_succeeds
+
+test_task5_strict_project_listener_ownership() (
+  local temp_dir path listener_mode="owned" runtime_mode="valid" xray_runtime_mode="valid" stop_log
+  temp_dir="$(mktemp -d)"
+  trap 'rm -rf "$temp_dir"' RETURN
+
+  HYSTERIA_BIN="$temp_dir/usr/local/bin/hysteria"
+  HYSTERIA_CONFIG="$temp_dir/etc/hysteria/config.yaml"
+  HYSTERIA_ACL="$temp_dir/etc/hysteria/acl.txt"
+  HYSTERIA_CERT="$temp_dir/etc/hysteria/server.crt"
+  HYSTERIA_KEY="$temp_dir/etc/hysteria/server.key"
+  HYSTERIA_UNIT="$temp_dir/etc/systemd/system/hysteria-server.service"
+  HYSTERIA_OWNERSHIP_MANIFEST="$temp_dir/etc/v2ray-onekey/hysteria.manifest"
+  XRAY_BIN="$temp_dir/usr/local/bin/xray"
+  XRAY_CONFIG="$temp_dir/usr/local/etc/xray/config.json"
+  STATE_FILE="$temp_dir/etc/v2ray-onekey/state.env"
+  SERVICE_PROC_ROOT="$temp_dir/proc"
+  LOGIN_DEFS_FILE="$temp_dir/login.defs"
+  stop_log="$temp_dir/stops.log"
+  printf 'SYS_UID_MAX 999\nSYS_GID_MAX 999\n' >"$LOGIN_DEFS_FILE"
+  getent() {
+    case "$1 $2" in
+      'passwd hysteria') printf 'hysteria:x:500:500::/nonexistent:/usr/sbin/nologin\n' ;;
+      'group hysteria') printf 'hysteria:x:500:\n' ;;
+      *) return 2 ;;
+    esac
+  }
+  id() {
+    case "$*" in
+      '-u hysteria') printf '500\n' ;;
+      '-g hysteria') printf '500\n' ;;
+      '-gn hysteria') printf 'hysteria\n' ;;
+      '-G hysteria') printf '500\n' ;;
+      *) command id "$@" ;;
+    esac
+  }
+
+  for path in "$HYSTERIA_BIN" "$HYSTERIA_CONFIG" "$HYSTERIA_ACL" "$HYSTERIA_CERT" \
+    "$HYSTERIA_KEY" "$HYSTERIA_UNIT" "$XRAY_BIN"; do
+    install -d "$(dirname "$path")"
+    case "$path" in
+      "$HYSTERIA_CONFIG") printf '%s\n' "$HYSTERIA_CONFIG_MARKER" >"$path" ;;
+      "$HYSTERIA_ACL") printf '%s\n' "$HYSTERIA_ACL_MARKER" >"$path" ;;
+      "$HYSTERIA_UNIT") printf '%s\n' "$HYSTERIA_UNIT_MARKER" >"$path" ;;
+      *) printf 'project binary or credential\n' >"$path" ;;
+    esac
+  done
+  write_hysteria_ownership_manifest
+
+  reset_options
+  MODE="direct"
+  HY2_PORT_RANGE="20000-20000"
+  HY2_AUTH="$HY2_TEST_AUTH"
+  HY2_OBFS_PASSWORD="$HY2_TEST_OBFS"
+  HY2_SNI="$HY2_TEST_SNI"
+  HY2_CERT_PIN="$HY2_TEST_PIN"
+  SS_PORT="8388"
+  SS_METHOD="2022-blake3-aes-128-gcm"
+  SS_KEY="$SS_TEST_KEY"
+  SERVER_ADDRESS="192.0.2.10"
+  ALLOW_BITTORRENT="0"
+  ALLOW_MAIL="0"
+  save_state
+  render_xray_config "$XRAY_CONFIG"
+
+  install -d "$SERVICE_PROC_ROOT/4242" "$SERVICE_PROC_ROOT/5151"
+  ln -s "$HYSTERIA_BIN" "$SERVICE_PROC_ROOT/4242/exe"
+  printf '%s\0%s\0%s\0%s\0' "$HYSTERIA_BIN" server -c "$HYSTERIA_CONFIG" \
+    >"$SERVICE_PROC_ROOT/4242/cmdline"
+  cat >"$SERVICE_PROC_ROOT/4242/status" <<'EOF'
+Name:	hysteria
+Uid:	500	500	500	500
+Gid:	500	500	500	500
+Groups:	500
+CapEff:	0000000000001400
+CapBnd:	0000000000001400
+CapAmb:	0000000000001400
+NoNewPrivs:	1
+EOF
+  ln -s "$XRAY_BIN" "$SERVICE_PROC_ROOT/5151/exe"
+  printf '%s\0%s\0%s\0%s\0' "$XRAY_BIN" run -config "$XRAY_CONFIG" \
+    >"$SERVICE_PROC_ROOT/5151/cmdline"
+
+  systemctl() {
+    case "$*" in
+      'show -p FragmentPath --value hysteria-server') printf '%s\n' "$HYSTERIA_UNIT" ;;
+      'show -p DropInPaths --value hysteria-server') printf '\n' ;;
+      'show -p User --value hysteria-server')
+        [[ "$runtime_mode" == "root" ]] && printf 'root\n' || printf 'hysteria\n'
+        ;;
+      'show -p Group --value hysteria-server')
+        [[ "$runtime_mode" == "root" ]] && printf 'root\n' || printf 'hysteria\n'
+        ;;
+      'show -p MainPID --value hysteria-server') printf '4242\n' ;;
+      'show -p MainPID --value xray') printf '5151\n' ;;
+      'show -p User --value xray')
+        printf 'xray\n'
+        ;;
+      'show -p Group --value xray')
+        printf 'xray\n'
+        ;;
+      'stop hysteria-server') printf 'stop\n' >>"$stop_log" ;;
+      *) return 1 ;;
+    esac
+  }
+  stat() {
+    local path="${*: -1}"
+    if [[ "$*" == *"%U:%G"* && "$path" == "$SERVICE_PROC_ROOT/4242" ]]; then
+      [[ "$runtime_mode" == "root" ]] && printf 'root:root\n' || printf 'hysteria:hysteria\n'
+    elif [[ "$*" == *"%U:%G"* && "$path" == "$SERVICE_PROC_ROOT/5151" ]]; then
+      [[ "$xray_runtime_mode" == "mismatch" ]] && printf 'root:root\n' || printf 'xray:xray\n'
+    else
+      command stat "$@"
+    fi
+  }
+  ss() {
+    case "$*:$listener_mode" in
+      *'-H -lnup'*':20000:owned')
+        printf 'UNCONN 0 0 0.0.0.0:20000 0.0.0.0:* users:(("hysteria",pid=4242,fd=7))\n'
+        ;;
+      *'-H -lntup'*':8388:owned')
+        printf 'LISTEN 0 128 0.0.0.0:8388 0.0.0.0:* users:(("xray",pid=5151,fd=8))\n'
+        ;;
+      *'-H -lnup'*':20000:third-party')
+        printf 'UNCONN 0 0 0.0.0.0:20000 0.0.0.0:* users:(("hysteria",pid=9999,fd=7))\n'
+        ;;
+      *'-H -lntup'*':8388:third-party')
+        printf 'LISTEN 0 128 0.0.0.0:8388 0.0.0.0:* users:(("xray",pid=9998,fd=8))\n'
+        ;;
+    esac
+  }
+
+  hysteria_range_conflicts && fail "strictly owned Hysteria2 listener blocked a rerun"
+  shadowsocks_port_conflicts && fail "strictly owned Xray listener blocked a rerun"
+
+  MODE="full"
+  ROTATE="1"
+  DOMAIN="new.example.com"
+  EMAIL="new@example.com"
+  CLOUDFLARE_PORT="8443"
+  INTERNAL_WS_PORT="32001"
+  CLOUDFLARE_UUID="22222222-2222-4222-8222-222222222222"
+  WS_PATH="/new-path"
+  SS_KEY="QUJDREVGR0hJSktMTU5PUA=="
+  shadowsocks_port_conflicts && fail "owned old Xray listener blocked rotate or mode change"
+  assert_eq "full" "$MODE" "Xray disk ownership check polluted desired mode"
+  assert_eq "QUJDREVGR0hJSktMTU5PUA==" "$SS_KEY" "Xray disk ownership check polluted desired key"
+
+  xray_runtime_mode="mismatch"
+  shadowsocks_port_conflicts || fail "Xray process with mismatched runtime identity was treated as project-owned"
+  xray_runtime_mode="valid"
+
+  listener_mode="third-party"
+  hysteria_range_conflicts || fail "same-name third-party Hysteria2 listener was ignored"
+  shadowsocks_port_conflicts || fail "same-name third-party Xray listener was ignored"
+  [[ "$HY2_CONFLICT_DETAILS" == *'pid=9999'* ]] || fail "third-party Hysteria2 diagnostics were lost"
+  [[ "$SS_CONFLICT_DETAILS" == *'pid=9998'* ]] || fail "third-party Xray diagnostics were lost"
+
+  listener_mode="owned"
+  BACKUP_DIR="$temp_dir/backup"
+  init_backup_metadata
+  printf 'hysteria-server\tactive\tenabled\n' >"$BACKUP_DIR/services"
+
+  runtime_mode="root"
+  hysteria_range_conflicts || fail "root Hysteria2 process was treated as project-owned"
+  assert_fails "Refusing to stop" stop_project_hysteria_for_cutover
+  [[ ! -e "$stop_log" ]] || fail "root Hysteria2 process was stopped"
+
+  runtime_mode="valid"
+  sed -i 's/CapEff:\t0000000000001400/CapEff:\t0000000000001c00/' \
+    "$SERVICE_PROC_ROOT/4242/status"
+  hysteria_range_conflicts || fail "extra Hysteria2 capability was treated as project-owned"
+  assert_fails "Refusing to stop" stop_project_hysteria_for_cutover
+  [[ ! -e "$stop_log" ]] || fail "Hysteria2 process with an extra capability was stopped"
+  sed -i 's/CapEff:\t0000000000001c00/CapEff:\t0000000000001400/' \
+    "$SERVICE_PROC_ROOT/4242/status"
+
+  sed -i 's/NoNewPrivs:\t1/NoNewPrivs:\t0/' "$SERVICE_PROC_ROOT/4242/status"
+  hysteria_range_conflicts || fail "Hysteria2 without NoNewPrivileges was treated as project-owned"
+  assert_fails "Refusing to stop" stop_project_hysteria_for_cutover
+  [[ ! -e "$stop_log" ]] || fail "Hysteria2 process without NoNewPrivileges was stopped"
+  sed -i 's/NoNewPrivs:\t0/NoNewPrivs:\t1/' "$SERVICE_PROC_ROOT/4242/status"
+
+  hysteria_range_conflicts && fail "fully valid old Hysteria2 process blocked a rerun"
+  stop_project_hysteria_for_cutover
+  grep -Fqx 'stop' "$stop_log" || fail "fully valid old Hysteria2 process was not stopped for cutover"
+
+  rm -f "$HYSTERIA_OWNERSHIP_MANIFEST"
+  hysteria_range_conflicts || fail "unproved Hysteria2 ownership was ignored"
+  rm -f "$STATE_FILE"
+  shadowsocks_port_conflicts || fail "unproved Xray ownership was ignored"
+)
+
+test_task5_strict_project_listener_ownership
+printf 'PASS: Task 5 direct port conflict tests\n'
+
+test_task5_untouched_identity_conflict_rollback() (
+  local temp_dir service_log status
+  temp_dir="$(mktemp -d)"
+  trap 'rm -rf "$temp_dir"' RETURN
+  service_log="$temp_dir/systemctl.log"
+  : >"$service_log"
+  BACKUP_ROOT="$temp_dir/backups"
+  XRAY_CONFIG="$temp_dir/xray/config.json"
+  STATE_FILE="$temp_dir/state/state.env"
+  NGINX_SITE="$temp_dir/nginx/site.conf"
+  RENEWAL_HOOK="$temp_dir/hooks/hook.sh"
+  LEGACY_V2RAY_CONFIG="$temp_dir/v2ray/config.json"
+  HYSTERIA_BIN="$temp_dir/usr/local/bin/hysteria"
+  HYSTERIA_CONFIG="$temp_dir/etc/hysteria/config.yaml"
+  HYSTERIA_ACL="$temp_dir/etc/hysteria/acl.txt"
+  HYSTERIA_CERT="$temp_dir/etc/hysteria/server.crt"
+  HYSTERIA_KEY="$temp_dir/etc/hysteria/server.key"
+  HYSTERIA_UNIT="$temp_dir/etc/systemd/system/hysteria-server.service"
+  HYSTERIA_OWNERSHIP_MANIFEST="$temp_dir/etc/v2ray-onekey/hysteria.manifest"
+  RUNTIME_DIR=""
+  MODE="direct"
+  HY2_PORT_RANGE="20000-20000"
+  SS_PORT="8388"
+  SS_METHOD="2022-blake3-aes-128-gcm"
+
+  direct_bundle_ready() { return 0; }
+  validate_managed_destination_ownership() { :; }
+  install_required_packages() { :; }
+  install_xray_core() { :; }
+  generate_runtime_values() { :; }
+  validate_loaded_runtime_values() { :; }
+  check_internal_ws_port_listener() { :; }
+  project_hysteria_listener_pid() { return 1; }
+  stdin_is_tty() { return 1; }
+  ss() {
+    if [[ "$*" == *'-H -lnup'* && "$*" == *':20000'* ]]; then
+      printf 'UNCONN 0 0 0.0.0.0:20000 0.0.0.0:* users:(("hysteria",pid=4242,fd=7))\n'
+    fi
+  }
+  systemctl() {
+    printf '%s\n' "$*" >>"$service_log"
+    case "$*" in
+      'show -p LoadState --value '*) printf 'loaded\n' ;;
+      'show -p ActiveState --value hysteria-server') printf 'active\n' ;;
+      'show -p ActiveState --value '*) printf 'inactive\n' ;;
+      'show -p UnitFileState --value hysteria-server') printf 'enabled\n' ;;
+      'show -p UnitFileState --value '*) printf 'disabled\n' ;;
+      'is-active --quiet hysteria-server'|'is-enabled --quiet hysteria-server') return 0 ;;
+      'is-active --quiet '*|'is-enabled --quiet '*) return 1 ;;
+      *) return 0 ;;
+    esac
+  }
+
+  set +e
+  (
+    set -Eeuo pipefail
+    activate_transaction_traps
+    deploy_services
+  ) >/dev/null 2>&1
+  status=$?
+  set -e
+  [[ "$status" -ne 0 ]] || fail "identity-conflict deployment unexpectedly succeeded"
+  if awk '$1 ~ /^(stop|start|restart|enable|disable)$/ {
+      for (field = 2; field <= NF; field += 1) if ($field == "hysteria-server") found = 1
+    } END { exit !found }' "$service_log"; then
+    fail "untouched identity-conflict rollback mutated Hysteria2: $(tr '\n' ',' <"$service_log")"
+  fi
+  return 0
+)
+
+test_task5_untouched_identity_conflict_rollback
+
+test_task5_staged_hysteria_failure_restores_service() (
+  local temp_dir service_log stage_log status
+  temp_dir="$(mktemp -d)"
+  trap 'rm -rf "$temp_dir"' RETURN
+  service_log="$temp_dir/systemctl.log"
+  stage_log="$temp_dir/stage.log"
+  : >"$service_log"
+  BACKUP_ROOT="$temp_dir/backups"
+  XRAY_CONFIG="$temp_dir/xray/config.json"
+  STATE_FILE="$temp_dir/state/state.env"
+  NGINX_SITE="$temp_dir/nginx/site.conf"
+  RENEWAL_HOOK="$temp_dir/hooks/hook.sh"
+  LEGACY_V2RAY_CONFIG="$temp_dir/v2ray/config.json"
+  HYSTERIA_BIN="$temp_dir/usr/local/bin/hysteria"
+  HYSTERIA_CONFIG="$temp_dir/etc/hysteria/config.yaml"
+  HYSTERIA_ACL="$temp_dir/etc/hysteria/acl.txt"
+  HYSTERIA_CERT="$temp_dir/etc/hysteria/server.crt"
+  HYSTERIA_KEY="$temp_dir/etc/hysteria/server.key"
+  HYSTERIA_UNIT="$temp_dir/etc/systemd/system/hysteria-server.service"
+  HYSTERIA_OWNERSHIP_MANIFEST="$temp_dir/etc/v2ray-onekey/hysteria.manifest"
+  RUNTIME_DIR=""
+  MODE="direct"
+  HY2_PORT_RANGE="20000-20000"
+  SS_PORT="8388"
+  SS_METHOD="2022-blake3-aes-128-gcm"
+
+  direct_bundle_ready() { return 0; }
+  validate_managed_destination_ownership() { :; }
+  install_required_packages() { :; }
+  install_xray_core() { :; }
+  generate_runtime_values() { :; }
+  validate_loaded_runtime_values() { :; }
+  check_internal_ws_port_listener() { :; }
+  render_xray_config() { printf '{}\n' >"$1"; }
+  xray() { :; }
+  project_hysteria_listener_pid() { printf '4242\n'; }
+  stage_hysteria_bundle() {
+    grep -Eq '^(stop|restart|disable) hysteria-server$' "$service_log" &&
+      fail "existing Hysteria2 was stopped before staged validation"
+    printf 'entered stage\n' >"$stage_log"
+    return 1
+  }
+  ss() {
+    if [[ "$*" == *'-H -lnup'* && "$*" == *':20000'* ]]; then
+      printf 'UNCONN 0 0 0.0.0.0:20000 0.0.0.0:* users:(("hysteria",pid=4242,fd=7))\n'
+    fi
+  }
+  systemctl() {
+    printf '%s\n' "$*" >>"$service_log"
+    case "$*" in
+      'show -p LoadState --value '*) printf 'loaded\n' ;;
+      'show -p ActiveState --value hysteria-server') printf 'active\n' ;;
+      'show -p ActiveState --value '*) printf 'inactive\n' ;;
+      'show -p UnitFileState --value hysteria-server') printf 'enabled\n' ;;
+      'show -p UnitFileState --value '*) printf 'disabled\n' ;;
+      'is-active --quiet hysteria-server'|'is-enabled --quiet hysteria-server') return 0 ;;
+      'is-active --quiet '*|'is-enabled --quiet '*) return 1 ;;
+      *) return 0 ;;
+    esac
+  }
+
+  set +e
+  (
+    set -Eeuo pipefail
+    activate_transaction_traps
+    deploy_services
+  ) >/dev/null 2>&1
+  status=$?
+  set -e
+  [[ "$status" -ne 0 ]] || fail "staged Hysteria2 failure unexpectedly succeeded"
+  [[ -s "$stage_log" ]] || fail "staged Hysteria2 failure test did not reach staging"
+  [[ -z "$(awk '$1 ~ /^(stop|start|restart|enable|disable)$/ && $NF == "hysteria-server"' "$service_log")" ]] ||
+    fail "staged Hysteria2 failure interrupted the existing service"
+  [[ -z "$(awk '$1 ~ /^(stop|start|restart|enable|disable)$/ && $NF == "xray"' "$service_log")" ]] ||
+    fail "unchanged Xray installer caused rollback service actions"
+  if awk '$1 ~ /^(stop|start|restart|enable|disable)$/ &&
+      $NF != "hysteria-server" && $NF != "xray" { found = 1 }
+      END { exit !found }' "$service_log"; then
+    fail "staged Hysteria2 rollback disturbed another service: $(tr '\n' ',' <"$service_log")"
+  fi
+  return 0
+)
+
+test_task5_staged_hysteria_failure_restores_service
+
+test_task5_partial_service_touch_rollback() (
+  local temp_dir service_log
+  temp_dir="$(mktemp -d)"
+  trap 'rm -rf "$temp_dir"' RETURN
+  BACKUP_DIR="$temp_dir/backup"
+  service_log="$temp_dir/systemctl.log"
+  RUNTIME_DIR=""
+  init_backup_metadata
+  cat >"$BACKUP_DIR/services" <<'EOF'
+v2ray	active	enabled
+xray	inactive	disabled
+nginx	active	enabled
+hysteria-server	active	enabled
+EOF
+  systemctl() {
+    local service="${*: -1}"
+    case "$1" in
+      stop|start|restart|enable|disable|reload)
+        grep -Fqx "$service" "$BACKUP_DIR/services-touched" ||
+          fail "service action was not journaled before systemctl: $*"
+        ;;
+    esac
+    printf '%s\n' "$*" >>"$service_log"
+  }
+
+  run_service_mutation xray restart
+  run_service_mutation nginx reload
+  run_service_mutation xray enable
+  assert_eq "600" "$(stat -c '%a' "$BACKUP_DIR/services-touched")" "service touch journal mode"
+  assert_eq $'xray\nnginx' "$(cat "$BACKUP_DIR/services-touched")" "deduplicated service touch journal"
+  rollback_current_run
+
+  grep -Fqx 'stop xray' "$service_log" || fail "touched Xray was not stopped during rollback"
+  grep -Fqx 'stop nginx' "$service_log" || fail "touched Nginx was not stopped during rollback"
+  grep -Fqx 'restart nginx' "$service_log" || fail "active Nginx was not restored"
+  grep -Fqx 'disable xray' "$service_log" || fail "inactive Xray enablement was not restored"
+  grep -Fqx 'enable nginx' "$service_log" || fail "Nginx enablement was not restored"
+  grep -Eq '^(stop|start|restart|enable|disable|reload)( --now)? (v2ray|hysteria-server)$' "$service_log" &&
+    fail "rollback disturbed an untouched service: $(tr '\n' ',' <"$service_log")"
+  return 0
+)
+
+test_task5_partial_service_touch_rollback
+printf 'PASS: Task 5 precise service mutation journal tests\n'
+
+test_task5_precise_unit_states_and_external_guards() (
+  local temp_dir service_log status
+  temp_dir="$(mktemp -d)"
+  trap 'rm -rf "$temp_dir"' RETURN
+  BACKUP_DIR="$temp_dir/backup"
+  service_log="$temp_dir/systemctl.log"
+  RUNTIME_DIR=""
+  init_backup_metadata
+  printf 'inactive\n' >"$temp_dir/v2ray-active"
+  printf 'enabled-runtime\n' >"$temp_dir/v2ray-unit"
+  printf 'active\n' >"$temp_dir/xray-active"
+  printf 'masked\n' >"$temp_dir/xray-unit"
+  printf 'inactive\n' >"$temp_dir/nginx-active"
+  printf 'masked-runtime\n' >"$temp_dir/nginx-unit"
+  printf 'active\n' >"$temp_dir/hysteria-server-active"
+  printf 'disabled\n' >"$temp_dir/hysteria-server-unit"
+  systemctl() {
+    local action="$1" service="${*: -1}" state_file
+    case "$*" in
+      'show -p LoadState --value '*) printf 'loaded\n' ;;
+      'show -p ActiveState --value '*) cat "$temp_dir/$service-active" ;;
+      'show -p UnitFileState --value '*) cat "$temp_dir/$service-unit" ;;
+      'is-active --quiet '*) [[ "$(cat "$temp_dir/$service-active")" == "active" ]] ;;
+      'is-enabled --quiet '*)
+        [[ "$(cat "$temp_dir/$service-unit")" == "enabled" ||
+          "$(cat "$temp_dir/$service-unit")" == "enabled-runtime" ]]
+        ;;
+      stop\ *) printf 'inactive\n' >"$temp_dir/$service-active" ;;
+      start\ *|restart\ *) printf 'active\n' >"$temp_dir/$service-active" ;;
+      enable\ *)
+        [[ "$*" == *' --runtime '* ]] && state_file="enabled-runtime" || state_file="enabled"
+        printf '%s\n' "$state_file" >"$temp_dir/$service-unit"
+        ;;
+      disable\ *) printf 'disabled\n' >"$temp_dir/$service-unit" ;;
+      unmask\ *) printf 'disabled\n' >"$temp_dir/$service-unit" ;;
+      mask\ *)
+        [[ "$*" == *' --runtime '* ]] && state_file="masked-runtime" || state_file="masked"
+        printf '%s\n' "$state_file" >"$temp_dir/$service-unit"
+        ;;
+      *) return 1 ;;
+    esac
+    printf '%s\n' "$*" >>"$service_log"
+  }
+
+  record_service_states
+  printf '%s\n' v2ray xray nginx hysteria-server >"$BACKUP_DIR/services-touched"
+  printf 'active\n' >"$temp_dir/v2ray-active"
+  printf 'enabled\n' >"$temp_dir/v2ray-unit"
+  printf 'inactive\n' >"$temp_dir/xray-active"
+  printf 'enabled\n' >"$temp_dir/xray-unit"
+  printf 'active\n' >"$temp_dir/nginx-active"
+  printf 'enabled\n' >"$temp_dir/nginx-unit"
+  printf 'inactive\n' >"$temp_dir/hysteria-server-active"
+  printf 'enabled\n' >"$temp_dir/hysteria-server-unit"
+  rollback_current_run
+  assert_eq "inactive" "$(cat "$temp_dir/v2ray-active")" "enabled-runtime service activity"
+  assert_eq "enabled-runtime" "$(cat "$temp_dir/v2ray-unit")" "enabled-runtime restoration"
+  assert_eq "active" "$(cat "$temp_dir/xray-active")" "masked active service restoration"
+  assert_eq "masked" "$(cat "$temp_dir/xray-unit")" "masked restoration"
+  assert_eq "inactive" "$(cat "$temp_dir/nginx-active")" "masked-runtime service activity"
+  assert_eq "masked-runtime" "$(cat "$temp_dir/nginx-unit")" "masked-runtime restoration"
+  assert_eq "active" "$(cat "$temp_dir/hysteria-server-active")" "disabled active service restoration"
+  assert_eq "disabled" "$(cat "$temp_dir/hysteria-server-unit")" "disabled restoration"
+
+  BACKUP_DIR="$temp_dir/guard-backup"
+  init_backup_metadata
+  : >"$service_log"
+  printf 'active\n' >"$temp_dir/xray-active"
+  printf 'enabled-runtime\n' >"$temp_dir/xray-unit"
+  record_service_states
+  unchanged_external_failure() { return 73; }
+  set +e
+  run_guarded_service_action xray unchanged_external_failure
+  status=$?
+  set -e
+  assert_eq "73" "$status" "guarded external failure status"
+  [[ ! -s "$BACKUP_DIR/services-touched" ]] || fail "unchanged failed external action touched Xray"
+  grep -Eq '^(stop|start|restart) ' "$service_log" &&
+    fail "unchanged failed external action caused a service interruption"
+
+  unchanged_external_restart() {
+    printf 'inactive\n' >"$temp_dir/xray-active"
+    printf 'active\n' >"$temp_dir/xray-active"
+  }
+  run_guarded_service_action xray unchanged_external_restart
+  [[ ! -s "$BACKUP_DIR/services-touched" ]] ||
+    fail "external restart with an unchanged final state was journaled"
+
+  changed_external_failure() {
+    printf 'inactive\n' >"$temp_dir/xray-active"
+    printf 'disabled\n' >"$temp_dir/xray-unit"
+    return 74
+  }
+  set +e
+  run_guarded_service_action xray changed_external_failure
+  status=$?
+  set -e
+  assert_eq "74" "$status" "changed guarded external failure status"
+  grep -Fqx xray "$BACKUP_DIR/services-touched" || fail "changed external action was not journaled"
+  cat >"$BACKUP_DIR/services" <<'EOF'
+xray	active	enabled-runtime
+EOF
+  rollback_current_run
+  assert_eq "active" "$(cat "$temp_dir/xray-active")" "changed external activity rollback"
+  assert_eq "enabled-runtime" "$(cat "$temp_dir/xray-unit")" "changed external unit state rollback"
+
+  BACKUP_DIR="$temp_dir/unsupported-backup"
+  init_backup_metadata
+  cat >"$BACKUP_DIR/services" <<'EOF'
+xray	inactive	static
+EOF
+  assert_fails "unsupported original service state" record_service_touch xray
+  [[ ! -s "$BACKUP_DIR/services-touched" ]] || fail "unsupported unit state was touched"
+)
+
+test_task5_precise_unit_states_and_external_guards
+printf 'PASS: Task 5 precise unit state and external guard tests\n'
+
+test_task5_external_installer_service_mutations_are_transactional() (
+  local temp_dir violation_log package_log status package_call_count=0
+  temp_dir="$(mktemp -d)"
+  trap 'rm -rf "$temp_dir"' RETURN
+  violation_log="$temp_dir/violations.log"
+  package_log="$temp_dir/packages.log"
+  BACKUP_ROOT="$temp_dir/backups"
+  XRAY_CONFIG="$temp_dir/xray/config.json"
+  STATE_FILE="$temp_dir/state/state.env"
+  NGINX_SITE="$temp_dir/nginx/site.conf"
+  RENEWAL_HOOK="$temp_dir/hooks/hook.sh"
+  LEGACY_V2RAY_CONFIG="$temp_dir/v2ray/config.json"
+  HYSTERIA_BIN="$temp_dir/usr/local/bin/hysteria"
+  HYSTERIA_CONFIG="$temp_dir/etc/hysteria/config.yaml"
+  HYSTERIA_ACL="$temp_dir/etc/hysteria/acl.txt"
+  HYSTERIA_CERT="$temp_dir/etc/hysteria/server.crt"
+  HYSTERIA_KEY="$temp_dir/etc/hysteria/server.key"
+  HYSTERIA_UNIT="$temp_dir/etc/systemd/system/hysteria-server.service"
+  HYSTERIA_OWNERSHIP_MANIFEST="$temp_dir/etc/v2ray-onekey/hysteria.manifest"
+  RUNTIME_DIR=""
+  MODE="cloudflare"
+  PKG_MANAGER="apt"
+  printf 'active\n' >"$temp_dir/xray-active"
+  printf 'enabled\n' >"$temp_dir/xray-enabled"
+  printf 'inactive\n' >"$temp_dir/nginx-active"
+  printf 'disabled\n' >"$temp_dir/nginx-enabled"
+
+  legacy_nginx_config_paths() { :; }
+  apt-get() {
+    printf '%s\n' "$*" >>"$package_log"
+    if (( package_call_count == 0 )) && grep -Fqx nginx "$BACKUP_DIR/services-touched"; then
+      printf 'nginx package action was touched before a state change\n' >>"$violation_log"
+    fi
+    package_call_count=$((package_call_count + 1))
+    printf 'active\n' >"$temp_dir/nginx-active"
+    printf 'enabled\n' >"$temp_dir/nginx-enabled"
+  }
+  install_xray_core() {
+    if grep -Fqx xray "$BACKUP_DIR/services-touched"; then
+      printf 'xray installer was touched before a state change\n' >>"$violation_log"
+    fi
+    printf 'inactive\n' >"$temp_dir/xray-active"
+    printf 'disabled\n' >"$temp_dir/xray-enabled"
+  }
+  systemctl() {
+    local action="$1" service="${*: -1}"
+    case "$*" in
+      'show -p LoadState --value '*) printf 'loaded\n' ;;
+      'show -p ActiveState --value '*)
+        case "$service" in
+          xray|nginx) cat "$temp_dir/$service-active" ;;
+          *) printf 'inactive\n' ;;
+        esac
+        ;;
+      'show -p UnitFileState --value '*)
+        case "$service" in
+          xray|nginx) cat "$temp_dir/$service-enabled" ;;
+          *) printf 'disabled\n' ;;
+        esac
+        ;;
+      *) case "$action" in
+      is-active)
+        case "$service" in
+          xray) [[ "$(cat "$temp_dir/xray-active")" == "active" ]] ;;
+          nginx) [[ "$(cat "$temp_dir/nginx-active")" == "active" ]] ;;
+          *) return 1 ;;
+        esac
+        ;;
+      is-enabled)
+        case "$service" in
+          xray) [[ "$(cat "$temp_dir/xray-enabled")" == "enabled" ]] ;;
+          nginx) [[ "$(cat "$temp_dir/nginx-enabled")" == "enabled" ]] ;;
+          *) return 1 ;;
+        esac
+        ;;
+      stop)
+        [[ "$service" == "xray" || "$service" == "nginx" ]] &&
+          printf 'inactive\n' >"$temp_dir/$service-active"
+        ;;
+      start|restart)
+        [[ "$service" == "xray" || "$service" == "nginx" ]] &&
+          printf 'active\n' >"$temp_dir/$service-active"
+        ;;
+      enable)
+        [[ "$service" == "xray" || "$service" == "nginx" ]] &&
+          printf 'enabled\n' >"$temp_dir/$service-enabled"
+        ;;
+      disable)
+        [[ "$service" == "xray" || "$service" == "nginx" ]] &&
+          printf 'disabled\n' >"$temp_dir/$service-enabled"
+        ;;
+      daemon-reload) : ;;
+      *) return 1 ;;
+      esac ;;
+    esac
+  }
+  generate_runtime_values() { return 1; }
+
+  set +e
+  (
+    set -Eeuo pipefail
+    activate_transaction_traps
+    deploy_services
+  ) >/dev/null 2>&1
+  status=$?
+  set -e
+  [[ "$status" -ne 0 ]] || fail "external service mutation deployment unexpectedly succeeded"
+  [[ ! -s "$violation_log" ]] || fail "$(tr '\n' ',' <"$violation_log")"
+  assert_eq "active" "$(cat "$temp_dir/xray-active")" "Xray active state after installer rollback"
+  assert_eq "enabled" "$(cat "$temp_dir/xray-enabled")" "Xray enabled state after installer rollback"
+  assert_eq "inactive" "$(cat "$temp_dir/nginx-active")" "Nginx active state after package rollback"
+  assert_eq "disabled" "$(cat "$temp_dir/nginx-enabled")" "Nginx enabled state after package rollback"
+  grep -Fq 'install -y --no-install-recommends nginx certbot' "$package_log" ||
+    fail "Cloudflare transaction did not exercise Nginx package installation"
+
+  BACKUP_DIR="$temp_dir/direct-backup"
+  init_backup_metadata
+  : >"$package_log"
+  MODE="direct"
+  apt-get() {
+    printf '%s\n' "$*" >>"$package_log"
+    grep -Fqx nginx "$BACKUP_DIR/services-touched" &&
+      fail "direct package installation marked Nginx as touched"
+    return 0
+  }
+  install_required_packages
+  grep -Eq '(^|[[:space:]])nginx([[:space:]]|$)' "$package_log" &&
+    fail "direct package installation requested Nginx"
+  grep -Fqx nginx "$BACKUP_DIR/services-touched" &&
+    fail "direct package installation retained an Nginx touch"
+  return 0
+)
+
+test_task5_external_installer_service_mutations_are_transactional
+printf 'PASS: Task 5 external installer service transaction tests\n'
+
+test_task5_xray_paths_and_installer_environment_are_fixed() (
+  local inherited installer_environment managed path
+  inherited="$(
+    XRAY_CONFIG=/tmp/injected-config.json \
+    XRAY_BIN=/tmp/injected-bin \
+    XRAY_DATA_DIR=/tmp/injected-data \
+    XRAY_LOG_DIR=/tmp/injected-log \
+    XRAY_SYSTEMD_DIR=/tmp/injected-systemd \
+    V2RAY_ONEKEY_SOURCE_ONLY=1 bash -c '
+      source "$1"
+      printf "%s|%s|%s|%s|%s\n" "$XRAY_CONFIG" "$XRAY_BIN" "$XRAY_DATA_DIR" "$XRAY_LOG_DIR" "$XRAY_SYSTEMD_DIR"
+    ' _ "$SCRIPT"
+  )"
+  assert_eq '/usr/local/etc/xray/config.json|/usr/local/bin/xray|/usr/local/share/xray|/var/log/xray|/etc/systemd/system' \
+    "$inherited" "fixed Xray installer paths"
+  managed="$(xray_installer_managed_paths)"
+  for path in /usr/local/bin/xray /usr/local/share/xray/geoip.dat \
+    /usr/local/share/xray/geosite.dat /usr/local/etc/xray/config.json \
+    /var/log/xray/access.log /var/log/xray/error.log \
+    /etc/systemd/system/xray.service /etc/systemd/system/xray@.service; do
+    grep -Fqx "$path" <<<"$managed" || fail "fixed Xray path is outside the transaction manifest: $path"
+  done
+  [[ "$managed" != *'/tmp/injected-'* ]] || fail "injected Xray path entered the transaction manifest"
+
+  export DAT_PATH=/tmp/injected-dat
+  export JSON_PATH=/tmp/injected-json
+  export JSONS_PATH=/tmp/injected-jsons
+  export BASH_ENV=/tmp/injected-bash-env
+  export ENV=/tmp/injected-env
+  export check_all_service_files=yes
+  export XRAY_CUSTOMIZE=xray@foreign.service
+  curl() { printf 'official-installer-body'; }
+  bash() {
+    printf '%s|%s|%s|%s|%s|%s|%s\n' \
+      "${DAT_PATH-unset}" "${JSON_PATH-unset}" "${JSONS_PATH-unset}" \
+      "${BASH_ENV-unset}" "${ENV-unset}" "${check_all_service_files-unset}" \
+      "${XRAY_CUSTOMIZE-unset}"
+  }
+  installer_environment="$(install_xray_core)"
+  installer_environment="${installer_environment##*$'\n'}"
+  assert_eq '/usr/local/share/xray|/usr/local/etc/xray|unset|unset|unset|unset|unset' \
+    "$installer_environment" "isolated Xray installer environment"
+)
+
+test_task5_xray_paths_and_installer_environment_are_fixed
+printf 'PASS: Task 5 fixed Xray installer environment tests\n'
+
+test_task5_xray_first_install_not_found_rollback() (
+  local temp_dir service_log status state path foreign_root foreign_dropin
+  local enablement_link enablement_directory
+  temp_dir="$(mktemp -d)"
+  trap 'rm -rf "$temp_dir"' RETURN
+  BACKUP_DIR="$temp_dir/backup"
+  RUNTIME_DIR=""
+  XRAY_BIN="$temp_dir/usr/local/bin/xray"
+  XRAY_CONFIG="$temp_dir/usr/local/etc/xray/config.json"
+  XRAY_DATA_DIR="$temp_dir/usr/local/share/xray"
+  XRAY_LOG_DIR="$temp_dir/var/log/xray"
+  XRAY_SYSTEMD_DIR="$temp_dir/etc/systemd/system"
+  enablement_link="$XRAY_SYSTEMD_DIR/multi-user.target.wants/xray.service"
+  enablement_directory="$(dirname "$enablement_link")"
+  service_log="$temp_dir/systemctl.log"
+  install -d "$(dirname "$XRAY_BIN")" "$XRAY_DATA_DIR" "$XRAY_SYSTEMD_DIR"
+  printf 'preexisting binary\n' >"$XRAY_BIN"
+  printf 'preexisting geoip\n' >"$XRAY_DATA_DIR/geoip.dat"
+  chmod 0711 "$XRAY_DATA_DIR"
+  init_backup_metadata
+  cat >"$BACKUP_DIR/services" <<'EOF'
+xray	inactive	not-found
+EOF
+  systemctl() {
+    local unit="$XRAY_SYSTEMD_DIR/xray.service"
+    printf '%s\n' "$*" >>"$service_log"
+    case "$*" in
+      'show -p LoadState --value xray') [[ -f "$unit" ]] && printf 'loaded\n' || printf 'not-found\n' ;;
+      'show -p ActiveState --value xray') printf 'inactive\n' ;;
+      'show -p UnitFileState --value xray') [[ -f "$unit" ]] && printf 'disabled\n' ;;
+      *) return 0 ;;
+    esac
+  }
+  record_xray_installer_state
+  fake_xray_first_installer() {
+    local managed
+    while IFS= read -r managed; do
+      install -d "$(dirname "$managed")"
+      printf 'installer-created %s\n' "$(basename "$managed")" >"$managed"
+    done < <(xray_installer_managed_paths)
+    install -d "$enablement_directory"
+    ln -s ../xray.service "$enablement_link"
+    return 73
+  }
+  set +e
+  run_guarded_service_action xray fake_xray_first_installer
+  status=$?
+  set -e
+  assert_eq "73" "$status" "first Xray installer failure status"
+  grep -Fqx xray "$BACKUP_DIR/services-touched" || fail "first Xray install service change was not journaled"
+  rollback_current_run
+  assert_eq "preexisting binary" "$(cat "$XRAY_BIN")" "preexisting Xray binary restoration"
+  assert_eq "preexisting geoip" "$(cat "$XRAY_DATA_DIR/geoip.dat")" "preexisting Xray geoip restoration"
+  assert_eq "711" "$(stat -c '%a' "$XRAY_DATA_DIR")" "preexisting Xray data directory mode"
+  for path in "$XRAY_CONFIG" "$XRAY_DATA_DIR/geosite.dat" \
+    "$XRAY_LOG_DIR/access.log" "$XRAY_LOG_DIR/error.log" \
+    "$XRAY_SYSTEMD_DIR/xray.service" "$XRAY_SYSTEMD_DIR/xray@.service" \
+    "$XRAY_SYSTEMD_DIR/xray.service.d/10-donot_touch_single_conf.conf" \
+    "$XRAY_SYSTEMD_DIR/xray.service.d/10-donot_touch_multi_conf.conf" \
+    "$XRAY_SYSTEMD_DIR/xray@.service.d/10-donot_touch_single_conf.conf" \
+    "$XRAY_SYSTEMD_DIR/xray@.service.d/10-donot_touch_multi_conf.conf"; do
+    [[ ! -e "$path" ]] || fail "first Xray rollback retained installer file: $path"
+  done
+  [[ ! -e "$enablement_link" && ! -L "$enablement_link" ]] ||
+    fail "first Xray rollback retained the enablement symlink"
+  [[ ! -e "$(dirname "$XRAY_CONFIG")" && ! -e "$XRAY_LOG_DIR" &&
+    ! -e "$XRAY_SYSTEMD_DIR/xray.service.d" && ! -e "$XRAY_SYSTEMD_DIR/xray@.service.d" &&
+    ! -e "$enablement_directory" ]] ||
+    fail "first Xray rollback retained installer-created directories"
+  state="$(query_service_state xray)" || fail "unable to inspect rolled-back Xray state"
+  assert_eq $'inactive\tnot-found' "$state" "first Xray exact service rollback"
+  grep -Fq 'daemon-reload' "$service_log" || fail "first Xray rollback omitted daemon-reload"
+  grep -Fq 'disable xray' "$service_log" && fail "not-found Xray rollback called disable"
+
+  BACKUP_DIR="$temp_dir/inconsistent-enablement-backup"
+  init_backup_metadata
+  cat >"$BACKUP_DIR/services" <<'EOF'
+xray	inactive	not-found
+EOF
+  install -d "$enablement_directory"
+  ln -s ../xray.service "$enablement_link"
+  assert_fails "inconsistent Xray enablement" record_xray_installer_state
+  rm -f "$enablement_link"
+  printf 'foreign regular file\n' >"$enablement_link"
+  assert_fails "inconsistent Xray enablement" record_xray_installer_state
+  rm -f "$enablement_link"
+  rmdir "$enablement_directory"
+
+  BACKUP_DIR="$temp_dir/enabled-project-backup"
+  init_backup_metadata
+  cat >"$BACKUP_DIR/services" <<'EOF'
+xray	active	enabled
+EOF
+  printf '[Unit]\nDescription=project Xray\n' >"$XRAY_SYSTEMD_DIR/xray.service"
+  install -d "$enablement_directory"
+  ln -s ../xray.service "$enablement_link"
+  record_xray_installer_state
+  printf 'xray\n' >"$BACKUP_DIR/services-touched"
+  rollback_current_run
+  [[ -L "$enablement_link" ]] || fail "rollback removed a preexisting project Xray enablement link"
+  assert_eq '../xray.service' "$(readlink "$enablement_link")" \
+    "preexisting project Xray enablement target"
+  rm -f "$enablement_link" "$XRAY_SYSTEMD_DIR/xray.service"
+  rmdir "$enablement_directory"
+
+  BACKUP_DIR="$temp_dir/foreign-backup"
+  init_backup_metadata
+  cat >"$BACKUP_DIR/services" <<'EOF'
+xray	inactive	not-found
+EOF
+  foreign_root="$temp_dir/usr/lib/systemd/system"
+  foreign_dropin="$foreign_root/xray.service.d/99-foreign.conf"
+  install -d "$(dirname "$foreign_dropin")"
+  printf '[Service]\nEnvironment=FOREIGN=1\n' >"$foreign_dropin"
+  xray_standard_unit_directories() { printf '%s\n' "$foreign_root"; }
+  assert_fails "unmanaged Xray systemd drop-in" record_xray_installer_state
+  rm -f "$foreign_dropin"
+  ln -s "$temp_dir/foreign-target" "$foreign_dropin"
+  assert_fails "unmanaged Xray systemd drop-in" record_xray_installer_state
+  return 0
+)
+
+test_task5_xray_first_install_not_found_rollback
+printf 'PASS: Task 5 first Xray install rollback tests\n'
+
+test_task5_firewall_transaction_records() (
+  local temp_dir firewall_log
+  temp_dir="$(mktemp -d)"
+  trap 'rm -rf "$temp_dir"' RETURN
+  BACKUP_DIR="$temp_dir/backup"
+  install -d -m 700 "$BACKUP_DIR"
+  init_backup_metadata
+  firewall_log="$temp_dir/firewall.log"
+  ufw_state="active"
+  firewalld_state="active"
+  ufw_existing=""
+  firewalld_runtime_existing=""
+  firewalld_permanent_existing=""
+
+  ufw() {
+    if [[ "$1" == "status" ]]; then
+      printf 'Status: %s\n%s\n' "$ufw_state" "$ufw_existing"
+      return 0
+    fi
+    printf 'ufw %s\n' "$*" >>"$firewall_log"
+  }
+  systemctl() {
+    [[ "$1 $2" == 'is-active firewalld' ]] || return 1
+    if [[ "$firewalld_state" == "active" ]]; then printf 'active\n'; return 0; fi
+    printf 'inactive\n'
+    return 3
+  }
+  firewall-cmd() {
+    case "$1" in
+      --query-port=*) [[ "$firewalld_runtime_existing" == *"${1#--query-port=}"* ]] ;;
+      --permanent)
+        if [[ "$2" == --query-port=* ]]; then
+          [[ "$firewalld_permanent_existing" == *"${2#--query-port=}"* ]]
+        else
+          printf 'firewall %s\n' "$*" >>"$firewall_log"
+        fi
+        ;;
+      *) printf 'firewall %s\n' "$*" >>"$firewall_log" ;;
+    esac
+  }
+
+  open_firewall_range 20000 20100 udp
+  grep -Fq 'ufw allow 20000:20100/udp' "$firewall_log" || fail "UFW range rule missing"
+  grep -Fq 'firewall --add-port=20000-20100/udp' "$firewall_log" ||
+    fail "firewalld runtime range rule missing"
+  grep -Fq 'firewall --permanent --add-port=20000-20100/udp' "$firewall_log" ||
+    fail "firewalld permanent range rule missing"
+  assert_eq "3" "$(wc -l <"$BACKUP_DIR/firewall-rules" | tr -d ' ')" \
+    "recorded current-run firewall additions"
+
+  rollback_firewall_rules
+  grep -Fq 'ufw delete allow 20000:20100/udp' "$firewall_log" || fail "UFW range rollback missing"
+  grep -Fq 'firewall --remove-port=20000-20100/udp' "$firewall_log" ||
+    fail "firewalld runtime rollback missing"
+  grep -Fq 'firewall --permanent --remove-port=20000-20100/udp' "$firewall_log" ||
+    fail "firewalld permanent rollback missing"
+
+  : >"$firewall_log"
+  : >"$BACKUP_DIR/firewall-rules"
+  ufw_existing="20000:20100/udp ALLOW Anywhere"
+  firewalld_runtime_existing="20000-20100/udp"
+  firewalld_permanent_existing="20000-20100/udp"
+  open_firewall_range 20000 20100 udp
+  [[ ! -s "$firewall_log" && ! -s "$BACKUP_DIR/firewall-rules" ]] ||
+    fail "pre-existing firewall rules were changed or adopted"
+
+  ufw_state="inactive"
+  firewalld_state="inactive"
+  open_firewall_range 21000 21100 udp
+  [[ ! -s "$firewall_log" ]] || fail "inactive firewall was modified"
+)
+
+test_task5_firewall_transaction_records
+printf 'PASS: Task 5 firewall transaction tests\n'
+
+test_task5_active_firewall_failures_are_transactional() (
+  local temp_dir firewall_log status_file mode="ufw-query-fail"
+  temp_dir="$(mktemp -d)"
+  trap 'rm -rf "$temp_dir"' RETURN
+  BACKUP_DIR="$temp_dir/backup"
+  init_backup_metadata
+  firewall_log="$temp_dir/firewall.log"
+  status_file="$temp_dir/ufw-status-count"
+  : >"$status_file"
+  ufw() {
+    case "$1" in
+      status)
+        printf 'call\n' >>"$status_file"
+        [[ "$mode" == "ufw-query-fail" && "$(wc -l <"$status_file")" -gt 1 ]] && return 2
+        printf 'Status: active\n'
+        ;;
+      allow) [[ "$mode" != "ufw-add-fail" ]] ;;
+      *) printf 'ufw %s\n' "$*" >>"$firewall_log" ;;
+    esac
+  }
+  systemctl() { return 3; }
+  assert_fails "Unable to query active UFW" open_firewall_port 24444 udp
+
+  mode="ufw-add-fail"
+  : >"$status_file"
+  assert_fails "UFW failed to allow required" open_firewall_port 24444 udp
+  assert_eq $'ufw\t24444/udp' "$(cat "$BACKUP_DIR/firewall-rules")" \
+    "failed UFW add rollback journal"
+
+  mode="firewalld-runtime-query-fail"
+  ufw() { printf 'Status: inactive\n'; }
+  systemctl() {
+    [[ "$*" == 'is-active firewalld' ]] || return 1
+    printf 'active\n'
+  }
+  firewall-cmd() {
+    [[ "$mode" == "firewalld-runtime-query-fail" && "$1" == --query-port=* ]] && return 2
+    case "$*" in
+      --query-port=*) return 1 ;;
+      '--permanent --query-port='*) return 1 ;;
+      '--permanent --add-port='*) return 2 ;;
+      *) printf 'firewall %s\n' "$*" >>"$firewall_log" ;;
+    esac
+  }
+  assert_fails "Unable to query active firewalld runtime" open_firewall_port 25555 udp
+
+  mode="firewalld-permanent-add-fail"
+  : >"$firewall_log"
+  : >"$BACKUP_DIR/firewall-rules"
+  assert_fails "required permanent rule" open_firewall_port 25555 udp
+  assert_eq $'firewalld-runtime\t25555/udp\nfirewalld-permanent\t25555/udp' \
+    "$(cat "$BACKUP_DIR/firewall-rules")" \
+    "partial firewalld addition journal"
+  rollback_firewall_rules
+  grep -Fq 'firewall --remove-port=25555/udp' "$firewall_log" ||
+    fail "partial firewalld runtime addition was not rolled back"
+  grep -Fq -- '--permanent --remove-port=25555/udp' "$firewall_log" ||
+    fail "pending permanent firewalld addition was not rolled back"
+  return 0
+)
+
+test_task5_active_firewall_failures_are_transactional
+printf 'PASS: Task 5 active firewall failure tests\n'
+
+test_task5_firewall_status_and_journal_are_fail_closed() (
+  local temp_dir firewall_log locale_log journal_seen=0
+  temp_dir="$(mktemp -d)"
+  trap 'rm -rf "$temp_dir"' RETURN
+  BACKUP_DIR="$temp_dir/backup"
+  init_backup_metadata
+  firewall_log="$temp_dir/firewall.log"
+  locale_log="$temp_dir/locale.log"
+  ufw() {
+    case "$1" in
+      status) return 2 ;;
+      allow) printf 'add:%s\n' "$2" >>"$firewall_log" ;;
+    esac
+  }
+  systemctl() { printf 'inactive\n'; return 3; }
+  assert_fails "Unable to inspect UFW status" open_firewall_port 26661 udp
+  [[ ! -e "$firewall_log" ]] || fail "UFW status failure still added a rule"
+
+  ufw() {
+    case "$1" in
+      status)
+        if [[ "${LC_ALL:-}" == "C" ]]; then
+          printf 'C\n' >>"$locale_log"
+          printf 'Status: active\n'
+        else
+          printf 'Estado: activo\n'
+        fi
+        ;;
+      allow)
+        grep -Fqx $'ufw\t26662/udp' "$BACKUP_DIR/firewall-rules" && journal_seen=1
+        printf 'add:%s\n' "$2" >>"$firewall_log"
+        ;;
+      delete) : ;;
+    esac
+  }
+  open_firewall_port 26662 udp
+  grep -Fqx C "$locale_log" || fail "UFW status was not queried with LC_ALL=C"
+  [[ "$journal_seen" == "1" ]] || fail "UFW add ran before its rollback journal was persisted"
+
+  : >"$firewall_log"
+  ufw() { printf 'Status: inactive\n'; }
+  firewall-cmd() {
+    [[ "$*" == *'--query-port='* ]] && return 1
+    printf 'firewall:%s\n' "$*" >>"$firewall_log"
+  }
+  systemctl() { printf 'failed\n'; return 1; }
+  assert_fails "Unable to inspect firewalld state" open_firewall_port 26663 udp
+  [[ ! -s "$firewall_log" ]] || fail "firewalld query failure modified rules"
+  systemctl() { printf 'unknown\n'; return 4; }
+  open_firewall_port 26664 udp
+
+  ufw() {
+    case "$1" in
+      status) printf 'Status: active\n' ;;
+      allow) printf 'add:%s\n' "$2" >>"$firewall_log" ;;
+    esac
+  }
+  systemctl() { printf 'inactive\n'; return 3; }
+  rm -f "$BACKUP_DIR/firewall-rules"
+  assert_fails "Firewall journal is unavailable" open_firewall_port 26665 udp
+  [[ ! -s "$firewall_log" ]] || fail "missing firewall journal still allowed an add"
+
+  ln -s "$temp_dir/journal-target" "$BACKUP_DIR/firewall-rules"
+  assert_fails "Firewall journal is unavailable" open_firewall_port 26666 udp
+  [[ ! -s "$firewall_log" ]] || fail "symlink firewall journal still allowed an add"
+
+  rm -f "$BACKUP_DIR/firewall-rules"
+  : >"$BACKUP_DIR/firewall-rules"
+  chmod 0600 "$BACKUP_DIR/firewall-rules"
+  append_firewall_record() { return 74; }
+  assert_fails "Unable to persist firewall rollback rule" open_firewall_port 26667 udp
+  [[ ! -s "$firewall_log" ]] || fail "failed firewall journal append still allowed an add"
+  append_firewall_record() {
+    printf '%s\t%s\n' "$1" "$2" >>"$BACKUP_DIR/firewall-rules"
+  }
+
+  (
+    chmod() {
+      [[ "$*" == "0600 $BACKUP_DIR/firewall-rules" ]] && return 75
+      command chmod "$@"
+    }
+    assert_fails "Unable to secure firewall rollback journal" open_firewall_port 26668 udp
+  )
+  [[ ! -s "$firewall_log" ]] || fail "failed firewall journal chmod still allowed an add"
+  return 0
+)
+
+test_task5_firewall_status_and_journal_are_fail_closed
+printf 'PASS: Task 5 strict firewall status and journal tests\n'
+
+test_task5_hysteria_ownership_accounts_and_rollback() (
+  local temp_dir service_log account_log current_user current_group path account_user=0 account_group=0
+  temp_dir="$(mktemp -d)"
+  trap 'rm -rf "$temp_dir"' RETURN
+  HYSTERIA_BIN="$temp_dir/usr/local/bin/hysteria"
+  HYSTERIA_CONFIG="$temp_dir/etc/hysteria/config.yaml"
+  HYSTERIA_ACL="$temp_dir/etc/hysteria/acl.txt"
+  HYSTERIA_CERT="$temp_dir/etc/hysteria/server.crt"
+  HYSTERIA_KEY="$temp_dir/etc/hysteria/server.key"
+  HYSTERIA_UNIT="$temp_dir/etc/systemd/system/hysteria-server.service"
+  HYSTERIA_OWNERSHIP_MANIFEST="$temp_dir/etc/v2ray-onekey/hysteria.manifest"
+  XRAY_CONFIG="$temp_dir/xray/config.json"
+  STATE_FILE="$temp_dir/state/state.env"
+  NGINX_SITE="$temp_dir/nginx/site.conf"
+  RENEWAL_HOOK="$temp_dir/hooks/hook.sh"
+  LEGACY_V2RAY_CONFIG="$temp_dir/v2ray/config.json"
+  BACKUP_DIR="$temp_dir/backup"
+  MODE="direct"
+  install -d "$(dirname "$HYSTERIA_CONFIG")" "$(dirname "$HYSTERIA_UNIT")" \
+    "$(dirname "$HYSTERIA_BIN")"
+  printf 'third-party\n' >"$HYSTERIA_BIN"
+  assert_fails "Refusing unmanaged Hysteria2" validate_managed_destination_ownership
+  rm -f "$HYSTERIA_BIN"
+
+  for path in "$HYSTERIA_BIN" "$HYSTERIA_CONFIG" "$HYSTERIA_ACL" "$HYSTERIA_CERT" \
+    "$HYSTERIA_KEY" "$HYSTERIA_UNIT"; do
+    install -d "$(dirname "$path")"
+    case "$path" in
+      "$HYSTERIA_CONFIG") printf '%s\n' "$HYSTERIA_CONFIG_MARKER" >"$path" ;;
+      "$HYSTERIA_ACL") printf '%s\n' "$HYSTERIA_ACL_MARKER" >"$path" ;;
+      "$HYSTERIA_UNIT") printf '%s\n' "$HYSTERIA_UNIT_MARKER" >"$path" ;;
+      *) printf 'project-owned-%s\n' "$(basename "$path")" >"$path" ;;
+    esac
+  done
+  systemctl() {
+    case "$*" in
+      'show -p FragmentPath --value hysteria-server') printf '%s\n' "$HYSTERIA_UNIT" ;;
+      'show -p DropInPaths --value hysteria-server') printf '\n' ;;
+      *) return 1 ;;
+    esac
+  }
+  write_hysteria_ownership_manifest
+  validate_managed_destination_ownership
+  printf 'external\n' >"$(dirname "$HYSTERIA_CONFIG")/external.yaml"
+  assert_fails "Refusing unmanaged Hysteria2" validate_managed_destination_ownership
+  rm -f "$(dirname "$HYSTERIA_CONFIG")/external.yaml"
+  printf 'tampered\n' >>"$HYSTERIA_BIN"
+  assert_fails "Refusing unmanaged Hysteria2" validate_managed_destination_ownership
+  printf 'project-owned-%s\n' "$(basename "$HYSTERIA_BIN")" >"$HYSTERIA_BIN"
+
+  init_backup_metadata
+  for path in "$HYSTERIA_BIN" "$HYSTERIA_CONFIG" "$HYSTERIA_ACL" "$HYSTERIA_CERT" \
+    "$HYSTERIA_KEY" "$HYSTERIA_UNIT" "$HYSTERIA_OWNERSHIP_MANIFEST"; do
+    backup_file "$path"
+  done
+  grep -Fqx $'present\t'"$HYSTERIA_BIN" "$BACKUP_DIR/manifest" ||
+    fail "Hysteria2 binary missing from transaction manifest"
+
+  current_user="$(id -un)"
+  current_group="$(id -gn)"
+  account_log="$temp_dir/accounts.log"
+  LOGIN_DEFS_FILE="$temp_dir/login.defs"
+  printf 'SYS_UID_MAX 999\nSYS_GID_MAX 999\n' >"$LOGIN_DEFS_FILE"
+  getent() {
+    case "$1 $2" in
+      'group hysteria') [[ "$account_group" == "1" ]] && printf 'hysteria:x:500:\n' ;;
+      'passwd hysteria') [[ "$account_user" == "1" ]] && printf 'hysteria:x:500:500::/nonexistent:/usr/sbin/nologin\n' ;;
+      *) return 2 ;;
+    esac
+  }
+  id() {
+    case "$*" in
+      hysteria) [[ "$account_user" == "1" ]] ;;
+      '-u hysteria') [[ "$account_user" == "1" ]] && printf '500\n' ;;
+      '-g hysteria') [[ "$account_user" == "1" ]] && printf '500\n' ;;
+      '-gn hysteria') [[ "$account_user" == "1" ]] && printf 'hysteria\n' ;;
+      '-G hysteria') [[ "$account_user" == "1" ]] && printf '500\n' ;;
+      -u) command id -u ;;
+      -un) printf '%s\n' "$current_user" ;;
+      -gn) printf '%s\n' "$current_group" ;;
+      *) command id "$@" ;;
+    esac
+  }
+  groupadd() { account_group=1; printf 'groupadd %s\n' "$*" >>"$account_log"; }
+  useradd() { account_user=1; printf 'useradd %s\n' "$*" >>"$account_log"; }
+  ensure_hysteria_account
+  grep -Fq 'groupadd --system hysteria' "$account_log" || fail "minimal Hysteria group was not created"
+  grep -Fq 'useradd --system --gid hysteria --home-dir /nonexistent --shell /usr/sbin/nologin hysteria' \
+    "$account_log" || fail "minimal Hysteria user was not created"
+  grep -Fqx $'hysteria\tcreated\tcreated' "$BACKUP_DIR/accounts" ||
+    fail "created Hysteria account was not recorded"
+
+  service_log="$temp_dir/services.log"
+  cat >"$BACKUP_DIR/services" <<'EOF'
+hysteria-server	inactive	disabled
+EOF
+  printf 'hysteria-server\n' >"$BACKUP_DIR/services-touched"
+  chmod 0600 "$BACKUP_DIR/services-touched"
+  systemctl() { printf '%s\n' "$*" >>"$service_log"; }
+  userdel() { printf 'userdel %s\n' "$*" >>"$account_log"; }
+  groupdel() { printf 'groupdel %s\n' "$*" >>"$account_log"; }
+  printf 'new-binary\n' >"$HYSTERIA_BIN"
+  rollback_current_run
+  assert_eq "project-owned-hysteria" "$(cat "$HYSTERIA_BIN")" "Hysteria2 binary rollback"
+  grep -Fqx 'stop hysteria-server' "$service_log" || fail "Hysteria2 was not stopped for rollback"
+  grep -Fqx 'disable hysteria-server' "$service_log" || fail "Hysteria2 enablement was not restored"
+  grep -Fq 'userdel hysteria' "$account_log" || fail "created Hysteria user was not rolled back"
+  grep -Fq 'groupdel hysteria' "$account_log" || fail "created Hysteria group was not rolled back"
+)
+
+test_task5_hysteria_ownership_accounts_and_rollback
+printf 'PASS: Task 5 Hysteria ownership and account tests\n'
+
+test_task5_hysteria_account_is_minimal_system_identity() (
+  local temp_dir account_uid=500 account_gid=500 account_groups=500 group_members=""
+  temp_dir="$(mktemp -d)"
+  trap 'rm -rf "$temp_dir"' RETURN
+  LOGIN_DEFS_FILE="$temp_dir/login.defs"
+  printf 'SYS_UID_MAX 999\nSYS_GID_MAX 999\n' >"$LOGIN_DEFS_FILE"
+  getent() {
+    case "$1" in
+      passwd) printf 'hysteria:x:%s:%s::/nonexistent:/usr/sbin/nologin\n' "$account_uid" "$account_gid" ;;
+      group) printf 'hysteria:x:%s:%s\n' "$account_gid" "$group_members" ;;
+    esac
+  }
+  id() {
+    case "$1" in
+      -u) printf '%s\n' "$account_uid" ;;
+      -g) printf '%s\n' "$account_gid" ;;
+      -gn) printf 'hysteria\n' ;;
+      -G) printf '%s\n' "$account_groups" ;;
+      hysteria) return 0 ;;
+    esac
+  }
+  hysteria_account_identity_is_safe >/dev/null || fail "valid system Hysteria account was rejected"
+  account_uid=0
+  assert_fails "non-root system identity" ensure_hysteria_account
+  account_uid=1000
+  assert_fails "non-root system identity" ensure_hysteria_account
+  account_uid=500
+  account_gid=0
+  account_groups=0
+  assert_fails "non-root system identity" ensure_hysteria_account
+  account_gid=1000
+  account_groups=1000
+  assert_fails "non-root system identity" ensure_hysteria_account
+  account_gid=500
+  account_groups='500 998'
+  assert_fails "without supplementary groups" ensure_hysteria_account
+  account_groups=500
+  group_members=alice
+  assert_fails "without supplementary groups" ensure_hysteria_account
+)
+
+test_task5_hysteria_account_is_minimal_system_identity
+printf 'PASS: Task 5 minimal Hysteria account tests\n'
+
+test_task5_created_hysteria_user_is_recorded_before_validation() (
+  local temp_dir account_log group_marker user_marker
+  temp_dir="$(mktemp -d)"
+  trap 'rm -rf "$temp_dir"' RETURN
+  BACKUP_DIR="$temp_dir/backup"
+  RUNTIME_DIR=""
+  LOGIN_DEFS_FILE="$temp_dir/login.defs"
+  account_log="$temp_dir/accounts.log"
+  group_marker="$temp_dir/group-created"
+  user_marker="$temp_dir/user-created"
+  printf 'SYS_UID_MAX 999\nSYS_GID_MAX 999\n' >"$LOGIN_DEFS_FILE"
+  init_backup_metadata
+  getent() {
+    case "$1 $2" in
+      'group hysteria')
+        [[ -f "$group_marker" ]] || return 2
+        if [[ -f "$user_marker" ]]; then
+          printf 'hysteria:x:500:alice\n'
+        else
+          printf 'hysteria:x:500:\n'
+        fi
+        ;;
+      'passwd hysteria')
+        [[ -f "$user_marker" ]] || return 2
+        printf 'hysteria:x:500:500::/nonexistent:/usr/sbin/nologin\n'
+        ;;
+      *) return 2 ;;
+    esac
+  }
+  id() {
+    case "$*" in
+      hysteria) [[ -f "$user_marker" ]] ;;
+      '-u hysteria'|'-g hysteria') [[ -f "$user_marker" ]] && printf '500\n' ;;
+      '-gn hysteria') [[ -f "$user_marker" ]] && printf 'hysteria\n' ;;
+      '-G hysteria') [[ -f "$user_marker" ]] && printf '500\n' ;;
+      *) command id "$@" ;;
+    esac
+  }
+  groupadd() { : >"$group_marker"; }
+  useradd() { : >"$user_marker"; }
+  assert_fails "without supplementary groups" ensure_hysteria_account
+  assert_eq $'hysteria\tcreated\tcreated' "$(cat "$BACKUP_DIR/accounts")" \
+    "created account journal before validation"
+  systemctl() { :; }
+  userdel() { printf 'userdel %s\n' "$*" >>"$account_log"; rm -f "$user_marker"; }
+  groupdel() { printf 'groupdel %s\n' "$*" >>"$account_log"; rm -f "$group_marker"; }
+  rollback_current_run
+  assert_eq $'userdel hysteria\ngroupdel hysteria' "$(cat "$account_log")" \
+    "created account rollback order"
+  [[ ! -e "$user_marker" && ! -e "$group_marker" ]] || fail "created Hysteria account remained after rollback"
+)
+
+test_task5_created_hysteria_user_is_recorded_before_validation
+printf 'PASS: Task 5 created Hysteria account validation rollback tests\n'
+
+test_task5_hysteria_account_journal_is_strict() (
+  local temp_dir account_log group_marker user_marker target
+  temp_dir="$(mktemp -d)"
+  trap 'rm -rf "$temp_dir"' RETURN
+  BACKUP_DIR="$temp_dir/backup"
+  LOGIN_DEFS_FILE="$temp_dir/login.defs"
+  account_log="$temp_dir/accounts.log"
+  group_marker="$temp_dir/group-created"
+  user_marker="$temp_dir/user-created"
+  target="$temp_dir/accounts-target"
+  printf 'SYS_UID_MAX 999\nSYS_GID_MAX 999\n' >"$LOGIN_DEFS_FILE"
+  init_backup_metadata
+
+  rm -f "$BACKUP_DIR/accounts"
+  record_hysteria_account_state preexisting preexisting >/dev/null 2>&1 &&
+    fail "missing Hysteria account journal was accepted"
+  install -d "$BACKUP_DIR/accounts"
+  record_hysteria_account_state preexisting preexisting >/dev/null 2>&1 &&
+    fail "non-regular Hysteria account journal was accepted"
+  rmdir "$BACKUP_DIR/accounts"
+  ln -s "$target" "$BACKUP_DIR/accounts"
+  record_hysteria_account_state preexisting preexisting >/dev/null 2>&1 &&
+    fail "symlink Hysteria account journal was accepted"
+  rm -f "$BACKUP_DIR/accounts"
+  : >"$BACKUP_DIR/accounts"
+  chmod 0644 "$BACKUP_DIR/accounts"
+  record_hysteria_account_state preexisting preexisting >/dev/null 2>&1 &&
+    fail "insecure Hysteria account journal mode was accepted"
+  chmod 0600 "$BACKUP_DIR/accounts"
+  (
+    stat() {
+      [[ "$1 $2" == '-c %u' ]] && { printf '1\n'; return 0; }
+      command stat "$@"
+    }
+    record_hysteria_account_state preexisting preexisting >/dev/null 2>&1
+  ) && fail "non-root Hysteria account journal owner was accepted"
+
+  getent() {
+    case "$1 $2" in
+      'group hysteria') [[ -f "$group_marker" ]] && printf 'hysteria:x:500:\n' ;;
+      'passwd hysteria') [[ -f "$user_marker" ]] && printf 'hysteria:x:500:500::/nonexistent:/usr/sbin/nologin\n' ;;
+      *) return 2 ;;
+    esac
+  }
+  id() {
+    case "$*" in
+      hysteria) [[ -f "$user_marker" ]] ;;
+      '-u hysteria'|'-g hysteria') [[ -f "$user_marker" ]] && printf '500\n' ;;
+      '-gn hysteria') [[ -f "$user_marker" ]] && printf 'hysteria\n' ;;
+      '-G hysteria') [[ -f "$user_marker" ]] && printf '500\n' ;;
+      *) command id "$@" ;;
+    esac
+  }
+  groupadd() { : >"$group_marker"; printf 'groupadd\n' >>"$account_log"; }
+  useradd() {
+    : >"$user_marker"
+    rm -f "$BACKUP_DIR/accounts"
+    printf 'useradd\n' >>"$account_log"
+  }
+  userdel() { rm -f "$user_marker"; printf 'userdel\n' >>"$account_log"; }
+  groupdel() { rm -f "$group_marker"; printf 'groupdel\n' >>"$account_log"; }
+  : >"$BACKUP_DIR/accounts"
+  chmod 0600 "$BACKUP_DIR/accounts"
+  assert_fails "account journal" ensure_hysteria_account
+  [[ ! -e "$user_marker" && ! -e "$group_marker" ]] ||
+    fail "journal removal after useradd left a Hysteria account"
+  assert_eq $'groupadd\nuseradd\nuserdel\ngroupdel' "$(cat "$account_log")" \
+    "journal failure account cleanup order"
+
+  : >"$account_log"
+  : >"$BACKUP_DIR/accounts"
+  chmod 0600 "$BACKUP_DIR/accounts"
+  useradd() {
+    : >"$user_marker"
+    rm -f "$BACKUP_DIR/accounts"
+    ln -s "$target" "$BACKUP_DIR/accounts"
+    printf 'useradd\n' >>"$account_log"
+  }
+  assert_fails "account journal" ensure_hysteria_account
+  [[ ! -e "$user_marker" && ! -e "$group_marker" ]] ||
+    fail "journal symlink replacement after useradd left a Hysteria account"
+  rm -f "$BACKUP_DIR/accounts"
+
+  : >"$account_log"
+  : >"$BACKUP_DIR/accounts"
+  chmod 0600 "$BACKUP_DIR/accounts"
+  write_hysteria_account_record() { return 74; }
+  assert_fails "account journal" ensure_hysteria_account
+  [[ ! -e "$user_marker" && ! -e "$group_marker" ]] ||
+    fail "journal write failure left a Hysteria account"
+
+  : >"$account_log"
+  : >"$BACKUP_DIR/accounts"
+  chmod 0600 "$BACKUP_DIR/accounts"
+  write_hysteria_account_record() { printf '%s\n' "$2" >"$1"; }
+  (
+    chmod() {
+      [[ "$1" == "0600" && "$2" == "$BACKUP_DIR"/.accounts.* ]] && return 75
+      command chmod "$@"
+    }
+    assert_fails "account journal" ensure_hysteria_account
+  )
+  [[ ! -e "$user_marker" && ! -e "$group_marker" ]] ||
+    fail "journal chmod failure left a Hysteria account"
+
+  : >"$account_log"
+  : >"$group_marker"
+  : >"$user_marker"
+  rm -f "$BACKUP_DIR/accounts"
+  assert_fails "account journal" ensure_hysteria_account
+  [[ -e "$user_marker" && -e "$group_marker" ]] ||
+    fail "journal failure removed a preexisting Hysteria account"
+  [[ ! -s "$account_log" ]] || fail "preexisting Hysteria account was mutated after journal failure"
+)
+
+test_task5_hysteria_account_journal_is_strict
+printf 'PASS: Task 5 strict Hysteria account journal tests\n'
+
+test_task5_refuses_every_unproved_hysteria_deployment_before_mutation() (
+  local temp_dir vendor_unit mutation_log drop_in_dir path
+  temp_dir="$(mktemp -d)"
+  trap 'rm -rf "$temp_dir"' RETURN
+  HYSTERIA_BIN="$temp_dir/usr/local/bin/hysteria"
+  HYSTERIA_CONFIG="$temp_dir/etc/hysteria/config.yaml"
+  HYSTERIA_ACL="$temp_dir/etc/hysteria/acl.txt"
+  HYSTERIA_CERT="$temp_dir/etc/hysteria/server.crt"
+  HYSTERIA_KEY="$temp_dir/etc/hysteria/server.key"
+  HYSTERIA_UNIT="$temp_dir/etc/systemd/system/hysteria-server.service"
+  HYSTERIA_OWNERSHIP_MANIFEST="$temp_dir/etc/v2ray-onekey/hysteria.manifest"
+  vendor_unit="$temp_dir/usr/lib/systemd/system/hysteria-server.service"
+  mutation_log="$temp_dir/mutations.log"
+  MODE="direct"
+  direct_bundle_ready() { return 0; }
+  install_required_packages() { printf 'packages\n' >>"$mutation_log"; }
+  install_xray_core() { printf 'xray-installer\n' >>"$mutation_log"; }
+  record_service_touch() { printf 'touch:%s\n' "$1" >>"$mutation_log"; }
+  begin_transaction() { printf 'transaction\n' >>"$mutation_log"; }
+
+  systemctl() {
+    if [[ "$*" == 'show -p FragmentPath --value hysteria-server' ]]; then
+      printf '%s\n' "$vendor_unit"
+    fi
+  }
+  assert_fails "Refusing unmanaged Hysteria2" deploy_services
+  [[ ! -e "$mutation_log" ]] || fail "loaded third-party Hysteria2 was rejected after mutation"
+
+  systemctl() { return 1; }
+  hysteria_vendor_unit_paths() { printf '%s\n' "$vendor_unit"; }
+  install -d "$(dirname "$vendor_unit")"
+  printf '[Service]\nExecStart=/opt/vendor/hysteria server\n' >"$vendor_unit"
+  assert_fails "Refusing unmanaged Hysteria2" validate_managed_destination_ownership
+
+  rm -f "$vendor_unit"
+  install -d "$(dirname "$HYSTERIA_CONFIG")"
+  printf 'third-party\n' >"$(dirname "$HYSTERIA_CONFIG")/unmanaged.yaml"
+  assert_fails "Refusing unmanaged Hysteria2" validate_managed_destination_ownership
+  rm -f "$(dirname "$HYSTERIA_CONFIG")/unmanaged.yaml"
+
+  for path in "$HYSTERIA_BIN" "$HYSTERIA_CONFIG" "$HYSTERIA_ACL" "$HYSTERIA_CERT" \
+    "$HYSTERIA_KEY" "$HYSTERIA_UNIT"; do
+    install -d "$(dirname "$path")"
+    case "$path" in
+      "$HYSTERIA_CONFIG") printf '%s\n' "$HYSTERIA_CONFIG_MARKER" >"$path" ;;
+      "$HYSTERIA_ACL") printf '%s\n' "$HYSTERIA_ACL_MARKER" >"$path" ;;
+      "$HYSTERIA_UNIT") printf '%s\n' "$HYSTERIA_UNIT_MARKER" >"$path" ;;
+      *) printf 'project-owned-%s\n' "$(basename "$path")" >"$path" ;;
+    esac
+  done
+  write_hysteria_ownership_manifest
+  drop_in_dir="$temp_dir/etc/systemd/system/hysteria-server.service.d"
+  hysteria_drop_in_directories() { printf '%s\n' "$drop_in_dir"; }
+  install -d "$drop_in_dir"
+  printf '[Service]\nUser=root\n' >"$drop_in_dir/override.conf"
+  systemctl() {
+    case "$*" in
+      'show -p FragmentPath --value hysteria-server') printf '%s\n' "$HYSTERIA_UNIT" ;;
+      'show -p DropInPaths --value hysteria-server') printf '\n' ;;
+      *) return 1 ;;
+    esac
+  }
+  assert_fails "Refusing unmanaged Hysteria2" deploy_services
+  [[ ! -e "$mutation_log" ]] || fail "filesystem Hysteria2 drop-in was rejected after mutation"
+
+  rm -f "$drop_in_dir/override.conf"
+  systemctl() {
+    case "$*" in
+      'show -p FragmentPath --value hysteria-server') printf '%s\n' "$HYSTERIA_UNIT" ;;
+      'show -p DropInPaths --value hysteria-server')
+        printf '%s\n' "$drop_in_dir/third-party.conf"
+        ;;
+      *) return 1 ;;
+    esac
+  }
+  assert_fails "Refusing unmanaged Hysteria2" deploy_services
+  [[ ! -e "$mutation_log" ]] || fail "loaded Hysteria2 DropInPaths was rejected after mutation"
+)
+
+test_task5_refuses_every_unproved_hysteria_deployment_before_mutation
+printf 'PASS: Task 5 third-party Hysteria preflight tests\n'
+
+test_task5_hysteria_directory_transaction_rollback() (
+  local temp_dir config_dir path account_log
+  temp_dir="$(mktemp -d)"
+  trap 'rm -rf "$temp_dir"' RETURN
+  HYSTERIA_BIN="$temp_dir/usr/local/bin/hysteria"
+  HYSTERIA_CONFIG="$temp_dir/etc/hysteria/config.yaml"
+  HYSTERIA_ACL="$temp_dir/etc/hysteria/acl.txt"
+  HYSTERIA_CERT="$temp_dir/etc/hysteria/server.crt"
+  HYSTERIA_KEY="$temp_dir/etc/hysteria/server.key"
+  HYSTERIA_UNIT="$temp_dir/etc/systemd/system/hysteria-server.service"
+  HYSTERIA_OWNERSHIP_MANIFEST="$temp_dir/etc/v2ray-onekey/hysteria.manifest"
+  XRAY_CONFIG="$temp_dir/xray/config.json"
+  STATE_FILE="$temp_dir/state/state.env"
+  NGINX_SITE="$temp_dir/nginx/site.conf"
+  RENEWAL_HOOK="$temp_dir/hooks/hook.sh"
+  LEGACY_V2RAY_CONFIG="$temp_dir/v2ray/config.json"
+  config_dir="$(dirname "$HYSTERIA_CONFIG")"
+  account_log="$temp_dir/accounts.log"
+  MODE="direct"
+  RUNTIME_DIR=""
+  systemctl() { :; }
+  userdel() { printf 'userdel %s\n' "$*" >>"$account_log"; }
+  groupdel() {
+    [[ ! -d "$config_dir" || "$(stat -c '%g' "$config_dir")" == "0" ]] ||
+      fail "Hysteria directory still referenced the deleted group"
+    printf 'groupdel %s\n' "$*" >>"$account_log"
+  }
+
+  BACKUP_DIR="$temp_dir/fresh-empty-backup"
+  init_backup_metadata
+  record_hysteria_directory_state
+  while IFS= read -r path; do backup_file "$path"; done < <(hysteria_managed_paths)
+  backup_file "$HYSTERIA_OWNERSHIP_MANIFEST"
+  printf 'hysteria\tcreated\tcreated\n' >"$BACKUP_DIR/accounts"
+  install -d -m 0750 "$config_dir"
+  printf 'new managed file\n' >"$HYSTERIA_CONFIG"
+  rollback_current_run
+  [[ ! -e "$config_dir" ]] || fail "fresh failed install left an empty Hysteria directory"
+  grep -Fq 'groupdel hysteria' "$account_log" || fail "fresh failed install did not remove its group"
+
+  : >"$account_log"
+  BACKUP_DIR="$temp_dir/fresh-external-backup"
+  init_backup_metadata
+  record_hysteria_directory_state
+  while IFS= read -r path; do backup_file "$path"; done < <(hysteria_managed_paths)
+  backup_file "$HYSTERIA_OWNERSHIP_MANIFEST"
+  printf 'hysteria\tcreated\tcreated\n' >"$BACKUP_DIR/accounts"
+  install -d -m 0750 "$config_dir"
+  printf 'new managed file\n' >"$HYSTERIA_CONFIG"
+  printf 'external content\n' >"$config_dir/external.keep"
+  rollback_current_run
+  [[ -f "$config_dir/external.keep" ]] || fail "rollback recursively deleted external Hysteria content"
+  [[ ! -e "$HYSTERIA_CONFIG" ]] || fail "rollback retained a current-run Hysteria config"
+  assert_eq "0" "$(stat -c '%g' "$config_dir")" "retained Hysteria directory group"
+  grep -Fq 'groupdel hysteria' "$account_log" || fail "external content prevented account rollback"
+
+  BACKUP_DIR="$temp_dir/preexisting-backup"
+  chmod 0711 "$config_dir"
+  chown 12345:12346 "$config_dir"
+  init_backup_metadata
+  record_hysteria_directory_state
+  while IFS= read -r path; do backup_file "$path"; done < <(hysteria_managed_paths)
+  backup_file "$HYSTERIA_OWNERSHIP_MANIFEST"
+  chmod 0750 "$config_dir"
+  chown root:root "$config_dir"
+  printf 'new managed file\n' >"$HYSTERIA_CONFIG"
+  rollback_current_run
+  assert_eq "711" "$(stat -c '%a' "$config_dir")" "preexisting Hysteria directory mode"
+  assert_eq "12345" "$(stat -c '%u' "$config_dir")" "preexisting Hysteria directory owner"
+  assert_eq "12346" "$(stat -c '%g' "$config_dir")" "preexisting Hysteria directory group"
+  [[ -f "$config_dir/external.keep" ]] || fail "preexisting directory content was not preserved"
+)
+
+test_task5_hysteria_directory_transaction_rollback
+printf 'PASS: Task 5 Hysteria directory rollback tests\n'
+
+test_task5_loaded_hysteria_service_identity() (
+  local temp_dir unit_mode="valid"
+  temp_dir="$(mktemp -d)"
+  trap 'rm -rf "$temp_dir"' RETURN
+  HYSTERIA_CONFIG="/etc/hysteria/config.yaml"
+  HYSTERIA_ACL="/etc/hysteria/acl.txt"
+  HYSTERIA_CERT="/etc/hysteria/server.crt"
+  HYSTERIA_KEY="/etc/hysteria/server.key"
+  HYSTERIA_BIN="/usr/local/bin/hysteria"
+  HYSTERIA_UNIT="/etc/systemd/system/hysteria-server.service"
+  LOGIN_DEFS_FILE="$temp_dir/login.defs"
+  printf 'SYS_UID_MAX 999\nSYS_GID_MAX 999\n' >"$LOGIN_DEFS_FILE"
+  getent() {
+    [[ "$1" == passwd ]] && printf 'hysteria:x:500:500::/nonexistent:/usr/sbin/nologin\n' ||
+      printf 'hysteria:x:500:\n'
+  }
+  id() {
+    case "$1" in
+      -u|-g) printf '500\n' ;;
+      -gn) printf 'hysteria\n' ;;
+      -G) printf '500\n' ;;
+      *) return 0 ;;
+    esac
+  }
+  systemctl() {
+    case "$*" in
+      'show -p User --value hysteria-server') printf 'hysteria\n' ;;
+      'show -p Group --value hysteria-server') printf 'hysteria\n' ;;
+      'show -p MainPID --value hysteria-server') printf '4242\n' ;;
+      'cat hysteria-server')
+        printf '%s\n' \
+          '[Service]' \
+          'User=hysteria' \
+          'Group=hysteria' \
+          'ExecStart=/usr/local/bin/hysteria server -c /etc/hysteria/config.yaml' \
+          'AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE'
+        [[ "$unit_mode" == "valid" ]] &&
+          printf '%s\n' 'CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE'
+        printf '%s\n' 'NoNewPrivileges=true'
+        ;;
+      *) return 1 ;;
+    esac
+  }
+  stat() {
+    local path="${@: -1}"
+    case "$path" in
+      /etc/hysteria/config.yaml|/etc/hysteria/acl.txt|/etc/hysteria/server.crt|/etc/hysteria/server.key)
+        printf 'root:hysteria:440\n' ;;
+      /etc/hysteria) printf 'root:hysteria:750\n' ;;
+      /usr/local/bin/hysteria) printf 'root:root:755\n' ;;
+      /etc/systemd/system/hysteria-server.service) printf 'root:root:644\n' ;;
+      "$temp_dir/proc/4242") printf 'hysteria:hysteria\n' ;;
+      *) return 1 ;;
+    esac
+  }
+  verify_hysteria_service_definition
+  unit_mode="missing-capability"
+  assert_fails "CapabilityBoundingSet" verify_hysteria_service_definition
+
+  unit_mode="valid"
+  HYSTERIA_PROC_ROOT="$temp_dir/proc"
+  install -d "$HYSTERIA_PROC_ROOT/4242"
+  ln -s "$HYSTERIA_BIN" "$HYSTERIA_PROC_ROOT/4242/exe"
+  printf '%s\0%s\0%s\0%s\0' "$HYSTERIA_BIN" server -c "$HYSTERIA_CONFIG" \
+    >"$HYSTERIA_PROC_ROOT/4242/cmdline"
+  cat >"$HYSTERIA_PROC_ROOT/4242/status" <<'EOF'
+Name:	hysteria
+Uid:	500	500	500	500
+Gid:	500	500	500	500
+Groups:	500
+CapEff:	0000000000001400
+CapBnd:	0000000000001400
+CapAmb:	0000000000001400
+NoNewPrivs:	1
+EOF
+  verify_hysteria_runtime_identity
+  sed -i 's/Groups:\t500/Groups:\t500 998/' "$HYSTERIA_PROC_ROOT/4242/status"
+  assert_fails "supplementary groups" verify_hysteria_runtime_identity
+  sed -i 's/Groups:\t500 998/Groups:\t500/' "$HYSTERIA_PROC_ROOT/4242/status"
+  sed -i 's/Uid:\t500\t500\t500\t500/Uid:\t1000\t1000\t1000\t1000/' \
+    "$HYSTERIA_PROC_ROOT/4242/status"
+  assert_fails "runtime UID" verify_hysteria_runtime_identity
+  sed -i 's/Uid:\t1000\t1000\t1000\t1000/Uid:\t500\t500\t500\t500/' \
+    "$HYSTERIA_PROC_ROOT/4242/status"
+  sed -i 's/CapEff:\t0000000000001400/CapEff:\t0000000000001c00/' \
+    "$HYSTERIA_PROC_ROOT/4242/status"
+  assert_fails "CapEff grants unexpected" verify_hysteria_runtime_identity
+)
+
+test_task5_loaded_hysteria_service_identity
+printf 'PASS: Task 5 loaded Hysteria service identity tests\n'
+
+test_task5_multi_protocol_readiness_and_cleanup() (
+  local temp_dir diagnostics_log calls_log
+  temp_dir="$(mktemp -d)"
+  trap 'rm -rf "$temp_dir"' RETURN
+  MODE="direct"
+  SS_PORT="8388"
+  HY2_PORT_RANGE="20000-20100"
+  parse_port_range "$HY2_PORT_RANGE"
+  LISTENER_WAIT_ATTEMPTS=2
+  LISTENER_WAIT_INTERVAL=0
+  calls_log="$temp_dir/listener-calls.log"
+  systemctl() {
+    case "$*" in
+      'is-active --quiet xray'|'is-active --quiet hysteria-server') return 0 ;;
+      *) return 0 ;;
+    esac
+  }
+  ss() {
+    printf '%s\n' "$*" >>"$calls_log"
+    case "$*" in
+      *'-H -lntp'*':8388'*) printf 'LISTEN 0 128 0.0.0.0:8388 users:(("xray",pid=2,fd=3))\n' ;;
+      *'-H -lnup'*':8388'*) printf 'UNCONN 0 0 0.0.0.0:8388 users:(("xray",pid=2,fd=4))\n' ;;
+      *'-H -lnup'*':20000'*) printf 'UNCONN 0 0 0.0.0.0:20000 users:(("hysteria",pid=3,fd=5))\n' ;;
+    esac
+  }
+  sleep() { :; }
+  verify_started_services
+  [[ "$(wc -l <"$calls_log" | tr -d ' ')" -ge 3 ]] ||
+    fail "multi-protocol readiness did not inspect every expected listener"
+
+  diagnostics_log="$temp_dir/diagnostics.log"
+  systemctl() {
+    if [[ "$*" == 'is-active --quiet hysteria-server' ]]; then return 3; fi
+    printf 'status %s\n' "$*" >>"$diagnostics_log"
+    return 0
+  }
+  journalctl() { printf 'journal %s\n' "$*" >>"$diagnostics_log"; }
+  ss() { printf 'listeners %s\n' "$*" >>"$diagnostics_log"; }
+  assert_fails "Multi-protocol readiness timed out" verify_started_services
+  grep -Fq 'status status hysteria-server --no-pager --full' "$diagnostics_log" ||
+    fail "Hysteria2 status diagnostics missing"
+  grep -Fq 'journal -u hysteria-server' "$diagnostics_log" ||
+    fail "Hysteria2 journal diagnostics missing"
+  grep -Fq 'listeners -H -lntup' "$diagnostics_log" || fail "listener diagnostics missing"
+
+  RUNTIME_DIR="$temp_dir/runtime"
+  install -d -m 700 "$RUNTIME_DIR"
+  RUN_TIMESTAMP="task5-test"
+  printf '%s\n' "$RUN_TIMESTAMP" >"$RUNTIME_DIR/.v2ray-onekey-runtime"
+  printf 'staged\n' >"$RUNTIME_DIR/file"
+  cleanup_runtime_directory
+  [[ ! -e "$RUNTIME_DIR" ]] || fail "successful cleanup left the runtime staging directory"
+
+  BACKUP_DIR="$temp_dir/failure-backup"
+  install -d -m 700 "$BACKUP_DIR"
+  : >"$BACKUP_DIR/manifest"
+  : >"$BACKUP_DIR/services"
+  : >"$BACKUP_DIR/firewall-rules"
+  : >"$BACKUP_DIR/accounts"
+  RUNTIME_DIR="$temp_dir/failure-runtime"
+  RUN_TIMESTAMP="task5-failure"
+  install -d -m 700 "$RUNTIME_DIR"
+  printf '%s\n' "$RUN_TIMESTAMP" >"$RUNTIME_DIR/.v2ray-onekey-runtime"
+  printf 'staged\n' >"$RUNTIME_DIR/file"
+  systemctl() { :; }
+  rollback_current_run
+  [[ ! -e "$RUNTIME_DIR" ]] || fail "failed transaction left the runtime staging directory"
+)
+
+test_task5_multi_protocol_readiness_and_cleanup
+printf 'PASS: Task 5 readiness and cleanup tests\n'
+
+test_task5_hysteria_smoke_uses_independent_udp_port() (
+  local temp_dir ss_log smoke_port
+  temp_dir="$(mktemp -d)"
+  trap 'rm -rf "$temp_dir"' RETURN
+  HY2_PORT_RANGE="49154-49160"
+  parse_port_range "$HY2_PORT_RANGE"
+  HY2_AUTH="$HY2_TEST_AUTH"
+  HY2_OBFS_PASSWORD="$HY2_TEST_OBFS"
+  ss_log="$temp_dir/ss.log"
+  ss() {
+    printf '%s\n' "$*" >>"$ss_log"
+    if [[ "$*" == *':49152'* ]]; then
+      printf 'UNCONN 0 0 0.0.0.0:49152 users:(("other",pid=9,fd=3))\n'
+    fi
+  }
+  smoke_port="$(select_hysteria_smoke_port)"
+  assert_eq "49153" "$smoke_port" "free Hysteria2 smoke port selection"
+  grep -Fq 'sport = :49152' "$ss_log" || fail "occupied smoke candidate was not inspected"
+  grep -Fq 'sport = :49153' "$ss_log" || fail "free smoke candidate was not inspected"
+
+  render_hysteria_config "$temp_dir/smoke.yaml" "$temp_dir/cert" "$temp_dir/key" \
+    "$temp_dir/acl" "$smoke_port"
+  grep -Fq 'listen: ":49153"' "$temp_dir/smoke.yaml" ||
+    fail "smoke config did not use its single probe port"
+  grep -Fq '49154-49160' "$temp_dir/smoke.yaml" &&
+    fail "smoke config reused the production port-hopping range"
+  return 0
+)
+
+test_task5_hysteria_smoke_uses_independent_udp_port
+printf 'PASS: Task 5 independent Hysteria smoke port tests\n'
+
+test_task5_cutover_stop_rolls_back_active_enabled_hysteria() (
+  local temp_dir service_log
+  temp_dir="$(mktemp -d)"
+  trap 'rm -rf "$temp_dir"' RETURN
+  BACKUP_DIR="$temp_dir/backup"
+  service_log="$temp_dir/services.log"
+  RUNTIME_DIR=""
+  MODE="direct"
+  init_backup_metadata
+  printf 'hysteria-server\tactive\tenabled\n' >"$BACKUP_DIR/services"
+  project_hysteria_listener_pid() { printf '4242\n'; }
+  systemctl() { printf '%s\n' "$*" >>"$service_log"; }
+
+  stop_project_hysteria_for_cutover
+  grep -Fqx 'hysteria-server' "$BACKUP_DIR/services-touched" ||
+    fail "staging stop did not journal the touched Hysteria2 service"
+  rollback_current_run
+
+  [[ "$(grep -n '^stop hysteria-server$' "$service_log" | head -n 1 | cut -d: -f1)" -lt \
+    "$(grep -n '^restart hysteria-server$' "$service_log" | cut -d: -f1)" ]] ||
+    fail "rollback did not restart the previously active Hysteria2 service"
+  grep -Fqx 'enable hysteria-server' "$service_log" ||
+    fail "rollback did not restore Hysteria2 enablement"
+)
+
+test_task5_cutover_stop_rolls_back_active_enabled_hysteria
+printf 'PASS: Task 5 Hysteria cutover-stop rollback tests\n'
+
 test_packages_permissions_and_firewall() (
   local temp_dir package_log firewall_log current_user current_group installer_log
   temp_dir="$(mktemp -d)"
@@ -2609,9 +4482,21 @@ test_packages_permissions_and_firewall() (
     fail "RPM base package set does not include iproute"
   grep -Fq 'iproute2' "$package_log" && fail "RPM package set incorrectly uses iproute2"
   : >"$package_log"
+  BACKUP_DIR="$temp_dir/cloudflare-packages-backup"
+  init_backup_metadata
   MODE="cloudflare"
   PKG_MANAGER="apt"
+  systemctl() {
+    case "$*" in
+      'show -p LoadState --value nginx') printf 'loaded\n' ;;
+      'show -p ActiveState --value nginx') printf 'inactive\n' ;;
+      'show -p UnitFileState --value nginx') printf 'disabled\n' ;;
+      *) return 1 ;;
+    esac
+  }
   install_required_packages
+  [[ ! -s "$BACKUP_DIR/services-touched" ]] ||
+    fail "unchanged package doubles marked Nginx as touched"
   grep -Fq 'nginx certbot' "$package_log" || fail "Cloudflare packages missing"
   grep -Fq 'python3-certbot-nginx' "$package_log" || fail "optional Certbot Nginx package not attempted"
 
@@ -2630,8 +4515,16 @@ test_packages_permissions_and_firewall() (
   ufw() {
     if [[ "$1" == "status" ]]; then printf 'Status: %s\n' "$ufw_state"; else printf 'ufw %s\n' "$*" >>"$firewall_log"; fi
   }
-  firewall-cmd() { printf 'firewall %s\n' "$*" >>"$firewall_log"; }
-  systemctl() { [[ "$1 $2 $3" == 'is-active --quiet firewalld' && "$firewalld_state" == "active" ]]; }
+  firewall-cmd() {
+    [[ "$*" == *'--query-port='* ]] && return 1
+    printf 'firewall %s\n' "$*" >>"$firewall_log"
+  }
+  systemctl() {
+    [[ "$1 $2" == 'is-active firewalld' ]] || return 1
+    if [[ "$firewalld_state" == "active" ]]; then printf 'active\n'; return 0; fi
+    printf 'inactive\n'
+    return 3
+  }
   open_firewall_port 443 tcp
   [[ ! -s "$firewall_log" ]] || fail "inactive firewall was modified"
   ufw_state="active"
@@ -2645,20 +4538,21 @@ test_packages_permissions_and_firewall() (
   : >"$firewall_log"
   ufw_state="inactive"
   firewall-cmd() { printf 'firewall %s\n' "$*" >>"$firewall_log"; return 1; }
-  local firewall_warning=""
-  firewall_warning="$(open_firewall_port 2053 tcp 2>&1)"
-  [[ "$firewall_warning" == *'firewalld'* && "$firewall_warning" == *'2053/tcp'* ]] ||
-    fail "firewalld failure was silent: $firewall_warning"
+  assert_fails "required runtime rule 2053/tcp" open_firewall_port 2053 tcp
   grep -Eq '(apt-get|dnf|yum).*(remove|erase)' "$SCRIPT" &&
     fail "installer contains package-removal behavior"
 
   installer_log="$temp_dir/installer.log"
+  BACKUP_DIR="$temp_dir/xray-installer-backup"
+  init_backup_metadata
   curl() {
     [[ "$*" == *'-LfsS'* && "$*" == *'--connect-timeout 10'* && "$*" == *'--max-time 120'* ]] ||
       fail "Xray installer download lacks finite timeout flags"
     printf 'official-installer-body'
   }
-  bash() { printf '%s\n' "$*" >"$installer_log"; }
+  bash() {
+    printf '%s\n' "$*" >"$installer_log"
+  }
   install_xray_core >/dev/null
   assert_eq "-c official-installer-body @ install" "$(cat "$installer_log")" "official Xray installer invocation"
 )
@@ -2728,10 +4622,22 @@ test_deployment_order_and_failure_trap() (
   SS_PORT="8388"
   RUNTIME_DIR="$temp_dir/run"
   ACME_WEBROOT="$temp_dir/acme"
-  begin_transaction() { RUN_TIMESTAMP="test"; BACKUP_DIR="$temp_dir/backup"; install -d "$BACKUP_DIR"; event backup; }
+  begin_transaction() {
+    RUN_TIMESTAMP="test"
+    BACKUP_DIR="$temp_dir/backup"
+    init_backup_metadata
+    cat >"$BACKUP_DIR/services" <<'EOF'
+v2ray	inactive	disabled
+xray	inactive	disabled
+nginx	inactive	disabled
+hysteria-server	inactive	disabled
+EOF
+    event backup
+  }
   validate_managed_destination_ownership() { event ownership; }
   install_required_packages() { event packages; }
   install_xray_core() { event xray-install; }
+  run_guarded_service_action() { local service="$1"; shift; event "guard:$service"; "$@"; }
   generate_runtime_values() { event generate; }
   validate_loaded_runtime_values() { event runtime-validate; }
   download_cloudflare_ranges() { event cf-download; }
@@ -2739,9 +4645,16 @@ test_deployment_order_and_failure_trap() (
   check_internal_ws_port_listener() { event internal-port; }
   render_xray_config() { printf '{}\n' >"$1"; event render; }
   xray() { event xray-test; }
+  stage_hysteria_bundle() { event hysteria-stage; }
   stop_legacy_service_for_cutover() { event v2ray-stop; }
   release_legacy_nginx_listeners() { event nginx-release; }
   install_validated_xray_config() { event config-install; }
+  ensure_hysteria_account() { event hysteria-account; }
+  install_validated_hysteria_binary() { event hysteria-binary-install; }
+  install_hysteria_runtime_files() { event hysteria-files-install; }
+  write_hysteria_ownership_manifest() { event hysteria-manifest; }
+  verify_hysteria_service_definition() { event hysteria-definition; }
+  verify_hysteria_runtime_identity() { event hysteria-runtime; }
   systemctl() { event "systemctl:$*"; }
   verify_started_services() { event listeners-ok; }
   disable_legacy_v2ray_after_success() { event v2ray-disable; }
@@ -2756,8 +4669,19 @@ test_deployment_order_and_failure_trap() (
   grep -Fq 'cf-download' "$order_log" && fail "direct-only downloaded Cloudflare ranges"
   [[ "$(grep -n '^xray-test$' "$order_log" | cut -d: -f1)" -lt "$(grep -n '^config-install$' "$order_log" | cut -d: -f1)" ]] ||
     fail "Xray test did not precede config installation"
+  [[ "$(grep -n '^public-ports$' "$order_log" | cut -d: -f1)" -lt \
+    "$(grep -n '^hysteria-stage$' "$order_log" | cut -d: -f1)" && \
+    "$(grep -n '^hysteria-stage$' "$order_log" | cut -d: -f1)" -lt \
+    "$(grep -n '^v2ray-stop$' "$order_log" | cut -d: -f1)" ]] ||
+    fail "Hysteria2 staging did not finish before cutover stop"
   [[ "$(grep -n '^listeners-ok$' "$order_log" | cut -d: -f1)" -lt "$(grep -n '^v2ray-disable$' "$order_log" | cut -d: -f1)" ]] ||
     fail "V2Ray was disabled before listener validation"
+  [[ "$(grep -n '^listeners-ok$' "$order_log" | cut -d: -f1)" -lt \
+    "$(grep -n '^hysteria-runtime$' "$order_log" | cut -d: -f1)" ]] ||
+    fail "Hysteria2 runtime identity was checked before readiness"
+  [[ "$(grep -n '^hysteria-runtime$' "$order_log" | cut -d: -f1)" -lt \
+    "$(grep -n '^state-save$' "$order_log" | cut -d: -f1)" ]] ||
+    fail "state was saved before Hysteria2 runtime identity validation"
 
   : >"$order_log"
   verify_started_services() { event listeners-failed; return 1; }

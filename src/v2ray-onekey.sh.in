@@ -2,7 +2,7 @@
 INSTALLER_VARIANT="@INSTALLER_VARIANT@"
 
 APP_NAME="v2ray-onekey"
-XRAY_CONFIG="${XRAY_CONFIG:-/usr/local/etc/xray/config.json}"
+XRAY_CONFIG="/usr/local/etc/xray/config.json"
 STATE_FILE="${STATE_FILE:-/etc/v2ray-onekey/state.env}"
 BACKUP_ROOT="${BACKUP_ROOT:-/var/backups/v2ray-onekey}"
 DEPLOYMENT_LOCK_DIR="${DEPLOYMENT_LOCK_DIR:-/run/lock/v2ray-onekey}"
@@ -10,6 +10,10 @@ NGINX_SITE="${NGINX_SITE:-/etc/nginx/conf.d/v2ray-onekey.conf}"
 RENEWAL_HOOK="${RENEWAL_HOOK:-/etc/letsencrypt/renewal-hooks/deploy/v2ray-onekey-nginx.sh}"
 LEGACY_V2RAY_CONFIG="${LEGACY_V2RAY_CONFIG:-/usr/local/etc/v2ray/config.json}"
 XRAY_INSTALL_URL="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
+XRAY_BIN="/usr/local/bin/xray"
+XRAY_DATA_DIR="/usr/local/share/xray"
+XRAY_LOG_DIR="/var/log/xray"
+XRAY_SYSTEMD_DIR="/etc/systemd/system"
 HYSTERIA_DOWNLOAD_URL="https://download.hysteria.network/app/latest/hysteria-linux-amd64"
 HYSTERIA_BIN="/usr/local/bin/hysteria"
 HYSTERIA_CONFIG="/etc/hysteria/config.yaml"
@@ -17,6 +21,10 @@ HYSTERIA_ACL="/etc/hysteria/acl.txt"
 HYSTERIA_CERT="/etc/hysteria/server.crt"
 HYSTERIA_KEY="/etc/hysteria/server.key"
 HYSTERIA_UNIT="/etc/systemd/system/hysteria-server.service"
+HYSTERIA_OWNERSHIP_MANIFEST="/etc/v2ray-onekey/hysteria.manifest"
+HYSTERIA_CONFIG_MARKER="# Managed by v2ray-onekey: Hysteria2 config v1"
+HYSTERIA_ACL_MARKER="# Managed by v2ray-onekey: Hysteria2 ACL v1"
+HYSTERIA_UNIT_MARKER="# Managed by v2ray-onekey: Hysteria2 unit v1"
 CLOUDFLARE_CONNECT_TIMEOUT="${CLOUDFLARE_CONNECT_TIMEOUT:-10}"
 CLOUDFLARE_MAX_TIME="${CLOUDFLARE_MAX_TIME:-30}"
 LISTENER_WAIT_ATTEMPTS="${LISTENER_WAIT_ATTEMPTS:-15}"
@@ -73,6 +81,10 @@ reset_options() {
   CLI_ALLOW_BITTORRENT_SET="0"
   CLI_ALLOW_MAIL_SET="0"
   LEGACY_HY2_BOOTSTRAP="0"
+  HY2_PORT_START=""
+  HY2_PORT_END=""
+  HY2_CONFLICT_DETAILS=""
+  SS_CONFLICT_DETAILS=""
 }
 
 valid_domain() {
@@ -108,13 +120,24 @@ normalize_domain() {
   printf '%s\n' "${1,,}"
 }
 
-valid_hy2_port_range() {
+parse_port_range() {
   local range="${1:-}" start end
-  [[ "$range" =~ ^([0-9]+)-([0-9]+)$ ]] || return 1
+  [[ "$range" =~ ^([0-9]{1,5})-([0-9]{1,5})$ ]] || return 1
   start="$(normalize_port "${BASH_REMATCH[1]}")" || return 1
   end="$(normalize_port "${BASH_REMATCH[2]}")" || return 1
   valid_port "$start" && valid_port "$end" || return 1
-  (( 10#$start <= 10#$end && 10#$end - 10#$start + 1 <= 1000 ))
+  (( 10#$start <= 10#$end )) || return 1
+  (( 10#$end - 10#$start <= 1000 )) || return 1
+  HY2_PORT_START="$start"
+  HY2_PORT_END="$end"
+}
+
+valid_hy2_port_range() {
+  local saved_start="${HY2_PORT_START:-}" saved_end="${HY2_PORT_END:-}" status=0
+  parse_port_range "${1:-}" || status=$?
+  HY2_PORT_START="$saved_start"
+  HY2_PORT_END="$saved_end"
+  return "$status"
 }
 
 normalize_hy2_port_range() {
@@ -1143,6 +1166,10 @@ current_nginx_config_is_project_owned() {
 }
 
 validate_managed_destination_ownership() {
+  if mode_has_hysteria && hysteria_managed_deployment_exists &&
+    ! hysteria_deployment_is_strictly_project_owned; then
+    die "Refusing unmanaged Hysteria2 files; the exact v2ray-onekey ownership manifest is missing or does not match"
+  fi
   if mode_has_cloudflare; then
     if [[ -e "$NGINX_SITE" || -L "$NGINX_SITE" ]] &&
       ! current_nginx_config_is_project_owned "$NGINX_SITE"; then
@@ -1154,6 +1181,187 @@ validate_managed_destination_ownership() {
     fi
   fi
 }
+
+hysteria_managed_paths() {
+  printf '%s\n' \
+    "$HYSTERIA_BIN" "$HYSTERIA_CONFIG" "$HYSTERIA_ACL" "$HYSTERIA_CERT" \
+    "$HYSTERIA_KEY" "$HYSTERIA_UNIT"
+}
+
+hysteria_config_directory() {
+  dirname "$HYSTERIA_CONFIG"
+}
+
+hysteria_vendor_unit_paths() {
+  printf '%s\n' \
+    /lib/systemd/system/hysteria-server.service \
+    /usr/lib/systemd/system/hysteria-server.service \
+    /usr/local/lib/systemd/system/hysteria-server.service
+}
+
+hysteria_drop_in_directories() {
+  printf '%s\n' \
+    /etc/systemd/system/hysteria-server.service.d \
+    /run/systemd/system/hysteria-server.service.d \
+    /usr/local/lib/systemd/system/hysteria-server.service.d \
+    /usr/lib/systemd/system/hysteria-server.service.d \
+    /lib/systemd/system/hysteria-server.service.d
+}
+
+loaded_service_fragment_path() {
+  systemctl show -p FragmentPath --value "$1" 2>/dev/null || true
+}
+
+hysteria_config_directory_has_entries() {
+  local directory entry
+  directory="$(hysteria_config_directory)"
+  [[ -d "$directory" && ! -L "$directory" ]] || return 1
+  for entry in "$directory"/* "$directory"/.[!.]* "$directory"/..?*; do
+    [[ -e "$entry" || -L "$entry" ]] || continue
+    return 0
+  done
+  return 1
+}
+
+hysteria_config_directory_contains_only_managed_paths() {
+  local directory entry
+  directory="$(hysteria_config_directory)"
+  if [[ -e "$directory" || -L "$directory" ]]; then
+    [[ -d "$directory" && ! -L "$directory" ]] || return 1
+  else
+    return 0
+  fi
+  for entry in "$directory"/* "$directory"/.[!.]* "$directory"/..?*; do
+    [[ -e "$entry" || -L "$entry" ]] || continue
+    case "$entry" in
+      "$HYSTERIA_CONFIG"|"$HYSTERIA_ACL"|"$HYSTERIA_CERT"|"$HYSTERIA_KEY") ;;
+      *) return 1 ;;
+    esac
+  done
+}
+
+hysteria_vendor_deployment_exists() {
+  local path
+  while IFS= read -r path; do
+    [[ -e "$path" || -L "$path" ]] && return 0
+  done < <(hysteria_vendor_unit_paths)
+  return 1
+}
+
+hysteria_drop_in_deployment_exists() {
+  local directory entry
+  while IFS= read -r directory; do
+    if [[ -e "$directory" || -L "$directory" ]]; then
+      [[ -d "$directory" && ! -L "$directory" ]] || return 0
+    else
+      continue
+    fi
+    for entry in "$directory"/* "$directory"/.[!.]* "$directory"/..?*; do
+      [[ -e "$entry" || -L "$entry" ]] || continue
+      return 0
+    done
+  done < <(hysteria_drop_in_directories)
+  return 1
+}
+
+hysteria_managed_deployment_exists() {
+  local path fragment directory drop_in_paths
+  [[ -e "$HYSTERIA_OWNERSHIP_MANIFEST" || -L "$HYSTERIA_OWNERSHIP_MANIFEST" ]] && return 0
+  while IFS= read -r path; do
+    [[ -e "$path" || -L "$path" ]] && return 0
+  done < <(hysteria_managed_paths)
+  directory="$(hysteria_config_directory)"
+  if [[ -e "$directory" || -L "$directory" ]]; then
+    [[ -d "$directory" && ! -L "$directory" ]] || return 0
+  fi
+  hysteria_config_directory_has_entries && return 0
+  hysteria_vendor_deployment_exists && return 0
+  hysteria_drop_in_deployment_exists && return 0
+  drop_in_paths="$(systemctl show -p DropInPaths --value hysteria-server 2>/dev/null || true)"
+  [[ -n "${drop_in_paths//[[:space:]]/}" ]] && return 0
+  fragment="$(loaded_service_fragment_path hysteria-server)"
+  [[ -n "$fragment" ]] && return 0
+  return 1
+}
+
+hysteria_deployment_is_strictly_project_owned() {
+  local fragment drop_in_paths
+  hysteria_ownership_manifest_is_valid || return 1
+  hysteria_config_directory_contains_only_managed_paths || return 1
+  hysteria_vendor_deployment_exists && return 1
+  hysteria_drop_in_deployment_exists && return 1
+  fragment="$(loaded_service_fragment_path hysteria-server)"
+  [[ "$fragment" == "$HYSTERIA_UNIT" ]] || return 1
+  drop_in_paths="$(systemctl show -p DropInPaths --value hysteria-server 2>/dev/null)" || return 1
+  [[ -z "${drop_in_paths//[[:space:]]/}" ]]
+}
+
+hysteria_ownership_manifest_is_valid() {
+  local expected_path digest recorded_path extra owner mode actual_digest
+  [[ -f "$HYSTERIA_OWNERSHIP_MANIFEST" && ! -L "$HYSTERIA_OWNERSHIP_MANIFEST" ]] || return 1
+  owner="$(stat -c '%u' "$HYSTERIA_OWNERSHIP_MANIFEST" 2>/dev/null)" || return 1
+  mode="$(stat -c '%a' "$HYSTERIA_OWNERSHIP_MANIFEST" 2>/dev/null)" || return 1
+  [[ "$owner" == "0" && "$mode" == "600" ]] || return 1
+  hysteria_text_markers_are_valid || return 1
+  exec 3<"$HYSTERIA_OWNERSHIP_MANIFEST" || return 1
+  IFS= read -r extra <&3 || { exec 3<&-; return 1; }
+  [[ "$extra" == '# Managed by v2ray-onekey: Hysteria2 ownership v1' ]] || {
+    exec 3<&-
+    return 1
+  }
+  while IFS= read -r expected_path; do
+    IFS=$'\t' read -r digest recorded_path <&3 || { exec 3<&-; return 1; }
+    [[ "$recorded_path" == "$expected_path" && "$digest" =~ ^[0-9a-f]{64}$ ]] || {
+      exec 3<&-
+      return 1
+    }
+    [[ -f "$expected_path" && ! -L "$expected_path" ]] || { exec 3<&-; return 1; }
+    actual_digest="$(sha256sum -- "$expected_path" 2>/dev/null)" || { exec 3<&-; return 1; }
+    actual_digest="${actual_digest%% *}"
+    [[ "$actual_digest" == "$digest" ]] || {
+      exec 3<&-
+      return 1
+    }
+  done < <(hysteria_managed_paths)
+  if IFS= read -r extra <&3; then
+    exec 3<&-
+    return 1
+  fi
+  exec 3<&-
+}
+
+hysteria_text_markers_are_valid() {
+  local first_line
+  [[ -f "$HYSTERIA_CONFIG" && ! -L "$HYSTERIA_CONFIG" ]] || return 1
+  IFS= read -r first_line <"$HYSTERIA_CONFIG" || return 1
+  [[ "$first_line" == "$HYSTERIA_CONFIG_MARKER" ]] || return 1
+  [[ -f "$HYSTERIA_ACL" && ! -L "$HYSTERIA_ACL" ]] || return 1
+  IFS= read -r first_line <"$HYSTERIA_ACL" || return 1
+  [[ "$first_line" == "$HYSTERIA_ACL_MARKER" ]] || return 1
+  [[ -f "$HYSTERIA_UNIT" && ! -L "$HYSTERIA_UNIT" ]] || return 1
+  IFS= read -r first_line <"$HYSTERIA_UNIT" || return 1
+  [[ "$first_line" == "$HYSTERIA_UNIT_MARKER" ]]
+}
+
+write_hysteria_ownership_manifest() (
+  local manifest_dir temp_path="" path digest
+  cleanup_hysteria_manifest() { [[ -z "$temp_path" ]] || rm -f -- "$temp_path" || true; }
+  trap cleanup_hysteria_manifest EXIT
+  manifest_dir="$(dirname "$HYSTERIA_OWNERSHIP_MANIFEST")"
+  hysteria_text_markers_are_valid || die "Hysteria2 managed-file markers are missing or invalid"
+  install -d -o root -g root -m 0700 "$manifest_dir"
+  temp_path="$(mktemp "$manifest_dir/.hysteria-manifest.XXXXXX")"
+  chmod 0600 "$temp_path"
+  printf '%s\n' '# Managed by v2ray-onekey: Hysteria2 ownership v1' >"$temp_path"
+  while IFS= read -r path; do
+    [[ -f "$path" && ! -L "$path" ]] || die "Cannot record missing Hysteria2 managed file: $path"
+    digest="$(sha256sum -- "$path")" || die "Unable to hash Hysteria2 managed file: $path"
+    digest="${digest%% *}"
+    [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || die "Invalid Hysteria2 managed-file digest"
+    printf '%s\t%s\n' "$digest" "$path" >>"$temp_path"
+  done < <(hysteria_managed_paths)
+  install -o root -g root -m 0600 "$temp_path" "$HYSTERIA_OWNERSHIP_MANIFEST"
+)
 
 current_renewal_hook_is_project_owned() {
   local path="$1"
@@ -1191,13 +1399,119 @@ legacy_nginx_config_paths() {
   done
 }
 
+xray_installer_managed_paths() {
+  printf '%s\n' \
+    "$XRAY_BIN" \
+    "$XRAY_DATA_DIR/geoip.dat" \
+    "$XRAY_DATA_DIR/geosite.dat" \
+    "$XRAY_CONFIG" \
+    "$XRAY_LOG_DIR/access.log" \
+    "$XRAY_LOG_DIR/error.log" \
+    "$XRAY_SYSTEMD_DIR/xray.service" \
+    "$XRAY_SYSTEMD_DIR/xray@.service" \
+    "$XRAY_SYSTEMD_DIR/xray.service.d/10-donot_touch_single_conf.conf" \
+    "$XRAY_SYSTEMD_DIR/xray.service.d/10-donot_touch_multi_conf.conf" \
+    "$XRAY_SYSTEMD_DIR/xray@.service.d/10-donot_touch_single_conf.conf" \
+    "$XRAY_SYSTEMD_DIR/xray@.service.d/10-donot_touch_multi_conf.conf"
+}
+
+xray_enablement_link() {
+  printf '%s\n' "$XRAY_SYSTEMD_DIR/multi-user.target.wants/xray.service"
+}
+
+xray_enablement_directory() {
+  dirname "$(xray_enablement_link)"
+}
+
+xray_enablement_target_is_project_unit() {
+  [[ "$1" == "../xray.service" || "$1" == "$XRAY_SYSTEMD_DIR/xray.service" ]]
+}
+
+xray_installer_managed_directories() {
+  printf '%s\n' \
+    "$XRAY_DATA_DIR" \
+    "$(dirname "$XRAY_CONFIG")" \
+    "$XRAY_LOG_DIR" \
+    "$XRAY_SYSTEMD_DIR/xray.service.d" \
+    "$XRAY_SYSTEMD_DIR/xray@.service.d" \
+    "$(xray_enablement_directory)"
+}
+
+xray_standard_unit_directories() {
+  printf '%s\n' \
+    /etc/systemd/system \
+    /run/systemd/system \
+    /usr/local/lib/systemd/system \
+    /usr/lib/systemd/system \
+    /lib/systemd/system
+}
+
+xray_installer_known_dropin_path() {
+  case "$1" in
+    "$XRAY_SYSTEMD_DIR/xray.service.d/10-donot_touch_single_conf.conf" | \
+      "$XRAY_SYSTEMD_DIR/xray.service.d/10-donot_touch_multi_conf.conf" | \
+      "$XRAY_SYSTEMD_DIR/xray@.service.d/10-donot_touch_single_conf.conf" | \
+      "$XRAY_SYSTEMD_DIR/xray@.service.d/10-donot_touch_multi_conf.conf") return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+validate_xray_not_found_systemd_paths() {
+  local unit_root unit_name dropin_directory entry
+  while IFS= read -r unit_root; do
+    for unit_name in xray.service xray@.service; do
+      entry="$unit_root/$unit_name"
+      [[ ! -e "$entry" && ! -L "$entry" ]] ||
+        die "Xray is reported not-found but an unmanaged unit already exists: $entry"
+      dropin_directory="$unit_root/$unit_name.d"
+      [[ ! -L "$dropin_directory" ]] ||
+        die "Refusing unmanaged Xray systemd drop-in: $dropin_directory"
+      if [[ -e "$dropin_directory" ]]; then
+        [[ -d "$dropin_directory" ]] ||
+          die "Refusing unmanaged Xray systemd drop-in: $dropin_directory"
+        for entry in "$dropin_directory"/* "$dropin_directory"/.[!.]* \
+          "$dropin_directory"/..?*; do
+          [[ -e "$entry" || -L "$entry" ]] || continue
+          [[ -f "$entry" && ! -L "$entry" ]] && xray_installer_known_dropin_path "$entry" ||
+            die "Refusing unmanaged Xray systemd drop-in: $entry"
+        done
+      fi
+    done
+  done < <(xray_standard_unit_directories)
+}
+
+xray_installer_path_allowed() {
+  local wanted="$1" path
+  while IFS= read -r path; do
+    [[ "$wanted" == "$path" ]] && return 0
+  done < <(xray_installer_managed_paths)
+  return 1
+}
+
+managed_directory_allowed() {
+  local wanted="$1" directory
+  [[ "$wanted" == "$(hysteria_config_directory)" ]] && return 0
+  while IFS= read -r directory; do
+    [[ "$wanted" == "$directory" ]] && return 0
+  done < <(xray_installer_managed_directories)
+  return 1
+}
+
 managed_path_allowed() {
   local path="$1"
   [[ "$path" == "$LEGACY_V2RAY_CONFIG" ||
     "$path" == "$XRAY_CONFIG" ||
     "$path" == "$STATE_FILE" ||
     "$path" == "$NGINX_SITE" ||
-    "$path" == "$RENEWAL_HOOK" ]] && return 0
+    "$path" == "$RENEWAL_HOOK" ||
+    "$path" == "$HYSTERIA_BIN" ||
+    "$path" == "$HYSTERIA_CONFIG" ||
+    "$path" == "$HYSTERIA_ACL" ||
+    "$path" == "$HYSTERIA_CERT" ||
+    "$path" == "$HYSTERIA_KEY" ||
+    "$path" == "$HYSTERIA_UNIT" ||
+    "$path" == "$HYSTERIA_OWNERSHIP_MANIFEST" ]] && return 0
+  xray_installer_path_allowed "$path" && return 0
   current_nginx_config_is_project_owned "$path" && return 0
   legacy_nginx_config_is_project_owned "$path" && return 0
   [[ -n "${BACKUP_DIR:-}" && -f "$BACKUP_DIR/legacy-files" ]] &&
@@ -1210,7 +1524,14 @@ init_backup_metadata() {
   : >"$BACKUP_DIR/manifest"
   : >"$BACKUP_DIR/services"
   : >"$BACKUP_DIR/legacy-renames"
-  chmod 0600 "$BACKUP_DIR/manifest" "$BACKUP_DIR/services" "$BACKUP_DIR/legacy-renames"
+  : >"$BACKUP_DIR/firewall-rules"
+  : >"$BACKUP_DIR/accounts"
+  : >"$BACKUP_DIR/directories"
+  : >"$BACKUP_DIR/symlinks"
+  : >"$BACKUP_DIR/services-touched"
+  chmod 0600 "$BACKUP_DIR/manifest" "$BACKUP_DIR/services" "$BACKUP_DIR/legacy-renames" \
+    "$BACKUP_DIR/firewall-rules" "$BACKUP_DIR/accounts" "$BACKUP_DIR/directories" \
+    "$BACKUP_DIR/symlinks" "$BACKUP_DIR/services-touched"
 }
 
 lock_directory_is_safe() {
@@ -1327,27 +1648,297 @@ backup_file() {
   fi
 }
 
-service_active_state() {
-  if systemctl is-active --quiet "$1" 2>/dev/null; then
-    printf 'active\n'
+systemd_property_value() {
+  local service="$1" property="$2" output="" status=0
+  output="$(systemctl show -p "$property" --value "$service" 2>/dev/null)" || status=$?
+  [[ "$output" != *$'\n'* && "$output" =~ ^[A-Za-z-]*$ ]] || return 1
+  [[ "$status" -eq 0 || -n "$output" ]] || return 1
+  printf '%s\n' "$output"
+}
+
+query_service_state() {
+  local service="$1" load active unit
+  load="$(systemd_property_value "$service" LoadState)" || return 1
+  active="$(systemd_property_value "$service" ActiveState)" || return 1
+  if [[ "$load" == "not-found" ]]; then
+    [[ "$active" == "inactive" ]] || return 1
+    unit="not-found"
   else
-    printf 'inactive\n'
+    unit="$(systemd_property_value "$service" UnitFileState)" || return 1
+    [[ -n "$unit" ]] || return 1
   fi
+  printf '%s\t%s\n' "$active" "$unit"
+}
+
+service_state_is_restorable() {
+  local active="$1" unit="$2"
+  [[ "$active" == "active" || "$active" == "inactive" ]] || return 1
+  case "$unit" in
+    enabled|enabled-runtime|disabled|masked|masked-runtime|not-found) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+recorded_service_state() {
+  local service="$1"
+  awk -F '\t' -v wanted="$service" '$1 == wanted { print $2 "\t" $3; found = 1 }
+    END { exit !found }' "$BACKUP_DIR/services"
+}
+
+recorded_service_state_is_restorable() {
+  local service="$1" state active unit
+  state="$(recorded_service_state "$service")" || return 1
+  active="${state%%$'\t'*}"
+  unit="${state#*$'\t'}"
+  service_state_is_restorable "$active" "$unit"
 }
 
 record_service_states() {
-  local service active enabled
+  local service state active unit
   : >"$BACKUP_DIR/services"
-  for service in v2ray xray nginx; do
-    active="$(service_active_state "$service")"
-    if systemctl is-enabled --quiet "$service" 2>/dev/null; then
-      enabled="enabled"
-    else
-      enabled="disabled"
-    fi
-    printf '%s\t%s\t%s\n' "$service" "$active" "$enabled" >>"$BACKUP_DIR/services"
+  for service in v2ray xray nginx hysteria-server; do
+    state="$(query_service_state "$service")" || die "Unable to inspect exact service state: $service"
+    active="${state%%$'\t'*}"
+    unit="${state#*$'\t'}"
+    printf '%s\t%s\t%s\n' "$service" "$active" "$unit" >>"$BACKUP_DIR/services"
   done
   chmod 0600 "$BACKUP_DIR/services"
+}
+
+managed_service_name() {
+  case "$1" in
+    v2ray|xray|nginx|hysteria-server) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+record_service_touch() {
+  local service="$1" journal="${BACKUP_DIR:-}/services-touched"
+  managed_service_name "$service" || die "Refusing to journal unmanaged service: $service"
+  [[ -f "$journal" && ! -L "$journal" ]] || die "Service touch journal is unavailable"
+  recorded_service_state_is_restorable "$service" ||
+    die "Refusing to touch $service with an unsupported original service state"
+  if ! grep -Fqx -- "$service" "$journal"; then
+    printf '%s\n' "$service" >>"$journal"
+  fi
+  chmod 0600 "$journal"
+}
+
+service_was_touched() {
+  local service="$1"
+  [[ -f "${BACKUP_DIR:-}/services-touched" ]] || return 1
+  grep -Fqx -- "$service" "$BACKUP_DIR/services-touched"
+}
+
+run_service_mutation() {
+  local service="$1" action="${2:-}"
+  shift 2 || die "Invalid service mutation"
+  managed_service_name "$service" || die "Refusing to mutate unmanaged service: $service"
+  case "$action" in
+    stop|start|restart|enable|disable|reload) ;;
+    *) die "Unsupported service mutation: $action" ;;
+  esac
+  record_service_touch "$service"
+  systemctl "$action" "$@" "$service"
+}
+
+run_guarded_service_action() {
+  local service="$1" before after command_status=0 after_status=0 had_errexit=0
+  shift
+  [[ "$#" -gt 0 ]] || die "Missing guarded service action"
+  managed_service_name "$service" || die "Refusing to guard unmanaged service: $service"
+  before="$(query_service_state "$service")" || die "Unable to inspect $service before external action"
+  service_state_is_restorable "${before%%$'\t'*}" "${before#*$'\t'}" ||
+    die "Refusing external action for $service with an unsupported service state"
+  [[ "$-" == *e* ]] && had_errexit=1
+  set +e
+  "$@"
+  command_status=$?
+  after="$(query_service_state "$service")"
+  after_status=$?
+  if [[ "$had_errexit" == "1" ]]; then set -e; else set +e; fi
+  if [[ "$after_status" -ne 0 ]] ||
+    ! service_state_is_restorable "${after%%$'\t'*}" "${after#*$'\t'}"; then
+    record_service_touch "$service"
+    [[ "$command_status" -ne 0 ]] && return "$command_status"
+    die "Unable to inspect $service after external action"
+  fi
+  [[ "$before" == "$after" ]] || record_service_touch "$service"
+  return "$command_status"
+}
+
+directory_state_is_recorded() {
+  local directory="$1"
+  awk -F '\t' -v wanted="$directory" '$2 == wanted { found = 1 } END { exit !found }' \
+    "$BACKUP_DIR/directories"
+}
+
+record_managed_directory_state() {
+  local directory="$1" owner group mode
+  [[ "$directory" == /* && "$directory" != "/" && "$directory" != *$'\n'* ]] ||
+    die "Invalid managed directory: $directory"
+  managed_directory_allowed "$directory" || die "Refusing to record unmanaged directory: $directory"
+  directory_state_is_recorded "$directory" && return 0
+  [[ ! -L "$directory" ]] || die "Refusing symlink managed directory: $directory"
+  if [[ -e "$directory" ]]; then
+    [[ -d "$directory" ]] || die "Managed directory path is not a directory: $directory"
+    owner="$(stat -c '%u' "$directory")" || die "Unable to inspect managed directory owner: $directory"
+    group="$(stat -c '%g' "$directory")" || die "Unable to inspect managed directory group: $directory"
+    mode="$(stat -c '%a' "$directory")" || die "Unable to inspect managed directory mode: $directory"
+    printf 'present\t%s\t%s\t%s\t%s\n' "$directory" "$owner" "$group" "$mode" \
+      >>"$BACKUP_DIR/directories"
+  else
+    printf 'absent\t%s\n' "$directory" >>"$BACKUP_DIR/directories"
+  fi
+  chmod 0600 "$BACKUP_DIR/directories"
+}
+
+record_hysteria_directory_state() {
+  record_managed_directory_state "$(hysteria_config_directory)"
+}
+
+record_xray_enablement_state() {
+  local unit="$1" link journal target="" kind="absent"
+  link="$(xray_enablement_link)"
+  journal="${BACKUP_DIR:-}/symlinks"
+  [[ -f "$journal" && ! -L "$journal" ]] || die "Xray symlink journal is unavailable"
+  [[ "$link" == /* && "$link" != *$'\n'* ]] || die "Invalid Xray enablement path"
+
+  if [[ "$unit" == "not-found" ]]; then
+    [[ ! -e "$link" && ! -L "$link" ]] ||
+      die "Xray is reported not-found with inconsistent Xray enablement: $link"
+  elif [[ -L "$link" ]]; then
+    target="$(readlink -- "$link")" || die "Unable to inspect Xray enablement link"
+    [[ -n "$target" && "$target" != *$'\n'* ]] &&
+      xray_enablement_target_is_project_unit "$target" ||
+      die "Refusing unmanaged Xray enablement link: $link"
+    kind="present"
+  elif [[ -e "$link" ]]; then
+    die "Refusing non-symlink Xray enablement path: $link"
+  fi
+
+  if [[ "$kind" == "present" ]]; then
+    printf 'present\t%s\t%s\n' "$link" "$target" >>"$journal" ||
+      die "Unable to record Xray enablement link"
+  else
+    printf 'absent\t%s\n' "$link" >>"$journal" ||
+      die "Unable to record absent Xray enablement link"
+  fi
+  chmod 0600 "$journal" || die "Unable to secure Xray symlink journal"
+}
+
+record_xray_installer_state() {
+  local active unit state path directory entry
+  state="$(recorded_service_state xray)" || die "Missing original Xray service state"
+  active="${state%%$'\t'*}"
+  unit="${state#*$'\t'}"
+  service_state_is_restorable "$active" "$unit" || die "Unsupported original Xray service state"
+
+  if [[ "$unit" == "not-found" ]]; then
+    validate_xray_not_found_systemd_paths
+  fi
+  record_xray_enablement_state "$unit"
+
+  if [[ -d "$XRAY_LOG_DIR" && ! -L "$XRAY_LOG_DIR" ]]; then
+    for entry in "$XRAY_LOG_DIR"/*.log; do
+      [[ -e "$entry" || -L "$entry" ]] || continue
+      [[ "$entry" == "$XRAY_LOG_DIR/access.log" || "$entry" == "$XRAY_LOG_DIR/error.log" ]] ||
+        die "Refusing Xray installer because it may modify an unmanaged log file: $entry"
+    done
+  fi
+
+  while IFS= read -r directory; do
+    record_managed_directory_state "$directory"
+  done < <(xray_installer_managed_directories)
+  while IFS= read -r path; do
+    backup_file "$path"
+  done < <(xray_installer_managed_paths)
+}
+
+restore_managed_symlink_states() {
+  local kind path target current parent
+  [[ -f "${BACKUP_DIR:-}/symlinks" && ! -L "$BACKUP_DIR/symlinks" ]] || return 0
+  while IFS=$'\t' read -r kind path target; do
+    [[ -n "$path" ]] || continue
+    [[ "$path" == "$(xray_enablement_link)" ]] || {
+      warn "Skipping unmanaged rollback symlink: $path"
+      continue
+    }
+    if [[ "$kind" == "absent" ]]; then
+      if [[ -L "$path" ]]; then
+        rm -f -- "$path" || warn "Could not remove current-run Xray enablement link"
+      elif [[ -e "$path" ]]; then
+        warn "Refusing to remove non-symlink Xray enablement path: $path"
+      fi
+    elif [[ "$kind" == "present" ]] && xray_enablement_target_is_project_unit "$target"; then
+      if [[ -L "$path" ]]; then
+        current="$(readlink -- "$path" 2>/dev/null)" || current=""
+        [[ "$current" == "$target" ]] && continue
+        rm -f -- "$path" || {
+          warn "Could not replace Xray enablement link during rollback"
+          continue
+        }
+      elif [[ -e "$path" ]]; then
+        warn "Refusing to replace non-symlink Xray enablement path: $path"
+        continue
+      fi
+      parent="$(dirname "$path")"
+      install -d -m 0755 "$parent" || {
+        warn "Could not recreate Xray enablement directory during rollback"
+        continue
+      }
+      ln -s -- "$target" "$path" || warn "Could not restore Xray enablement link"
+    else
+      warn "Skipping malformed Xray symlink rollback metadata"
+    fi
+  done <"$BACKUP_DIR/symlinks"
+}
+
+restore_managed_directory_states() {
+  local kind directory owner group mode
+  [[ -f "${BACKUP_DIR:-}/directories" ]] || return 0
+  while IFS=$'\t' read -r kind directory owner group mode; do
+    [[ -n "$directory" ]] || continue
+    [[ "$directory" == /* && "$directory" != "/" && "$directory" != *$'\n'* ]] &&
+      managed_directory_allowed "$directory" || {
+      warn "Skipping invalid managed rollback directory: $directory"
+      continue
+    }
+    [[ ! -L "$directory" ]] || {
+      warn "Refusing symlink managed rollback directory: $directory"
+      continue
+    }
+    if [[ "$kind" == "present" ]]; then
+      [[ "$owner" =~ ^[0-9]+$ && "$group" =~ ^[0-9]+$ && "$mode" =~ ^[0-7]{3,4}$ ]] || {
+        warn "Skipping malformed managed directory metadata: $directory"
+        continue
+      }
+      if [[ ! -e "$directory" ]]; then
+        mkdir -p -- "$directory" || {
+          warn "Could not recreate managed directory: $directory"
+          continue
+        }
+      fi
+      [[ -d "$directory" ]] || {
+        warn "Cannot restore non-directory managed path: $directory"
+        continue
+      }
+      chown "$owner:$group" "$directory" || warn "Could not restore managed directory ownership: $directory"
+      chmod "$mode" "$directory" || warn "Could not restore managed directory mode: $directory"
+    elif [[ "$kind" == "absent" && -d "$directory" ]]; then
+      if ! rmdir -- "$directory" 2>/dev/null; then
+        if [[ "$directory" == "$(hysteria_config_directory)" ]]; then
+          chown root:root "$directory" || warn "Could not detach retained Hysteria2 directory from its temporary group"
+          chmod 0750 "$directory" || warn "Could not secure retained Hysteria2 directory"
+        fi
+        warn "Retaining non-empty managed directory because it contains external content: $directory"
+      fi
+    fi
+  done <"$BACKUP_DIR/directories"
+}
+
+restore_hysteria_directory_state() {
+  restore_managed_directory_states
 }
 
 collect_owned_legacy_nginx_files() {
@@ -1368,10 +1959,20 @@ begin_transaction() {
   create_unique_backup_directory
   init_backup_metadata
   record_service_states
+  record_xray_installer_state
+  if mode_has_hysteria; then
+    record_hysteria_directory_state
+  fi
   for managed_path in \
     "$LEGACY_V2RAY_CONFIG" "$XRAY_CONFIG" "$STATE_FILE" "$NGINX_SITE" "$RENEWAL_HOOK"; do
     backup_file "$managed_path"
   done
+  if mode_has_hysteria; then
+    while IFS= read -r managed_path; do
+      backup_file "$managed_path"
+    done < <(hysteria_managed_paths)
+    backup_file "$HYSTERIA_OWNERSHIP_MANIFEST"
+  fi
   collect_owned_legacy_nginx_files
 }
 
@@ -1389,34 +1990,105 @@ disable_owned_legacy_nginx_files() {
 }
 
 restore_service_states() {
-  local service state enabled
+  local service active unit
   [[ -f "$BACKUP_DIR/services" ]] || return 0
 
-  while IFS=$'\t' read -r service state enabled; do
+  while IFS=$'\t' read -r service active unit; do
     [[ -n "$service" ]] || continue
-    systemctl stop "$service" >/dev/null 2>&1 || true
-  done <"$BACKUP_DIR/services"
-
-  while IFS=$'\t' read -r service state enabled; do
-    [[ -n "$service" ]] || continue
-    if [[ "$state" == "active" ]]; then
+    service_was_touched "$service" || continue
+    service_state_is_restorable "$active" "$unit" || {
+      warn "Skipping unsupported service state during rollback: $service"
+      continue
+    }
+    [[ "$unit" != "not-found" ]] || continue
+    systemctl unmask "$service" >/dev/null 2>&1 || true
+    systemctl unmask --runtime "$service" >/dev/null 2>&1 || true
+    if [[ "$active" == "active" ]]; then
       systemctl restart "$service" >/dev/null 2>&1 || warn "Could not restart $service during rollback"
     fi
   done <"$BACKUP_DIR/services"
 
-  while IFS=$'\t' read -r service state enabled; do
+  while IFS=$'\t' read -r service active unit; do
     [[ -n "$service" ]] || continue
-    if [[ "$enabled" == "enabled" ]]; then
-      systemctl enable "$service" >/dev/null 2>&1 || warn "Could not re-enable $service during rollback"
-    else
-      systemctl disable "$service" >/dev/null 2>&1 || true
-    fi
+    service_was_touched "$service" || continue
+    case "$unit" in
+      enabled) systemctl enable "$service" >/dev/null 2>&1 || warn "Could not re-enable $service during rollback" ;;
+      enabled-runtime)
+        systemctl disable "$service" >/dev/null 2>&1 || true
+        systemctl enable --runtime "$service" >/dev/null 2>&1 || warn "Could not restore runtime enablement for $service"
+        ;;
+      disabled) systemctl disable "$service" >/dev/null 2>&1 || true ;;
+      not-found) : ;;
+      masked)
+        systemctl disable "$service" >/dev/null 2>&1 || true
+        systemctl mask "$service" >/dev/null 2>&1 || warn "Could not restore masked state for $service"
+        ;;
+      masked-runtime)
+        systemctl disable "$service" >/dev/null 2>&1 || true
+        systemctl mask --runtime "$service" >/dev/null 2>&1 || warn "Could not restore runtime mask for $service"
+        ;;
+    esac
   done <"$BACKUP_DIR/services"
+}
+
+stop_touched_services() {
+  local service
+  [[ -f "${BACKUP_DIR:-}/services-touched" ]] || return 0
+  while IFS= read -r service; do
+    [[ -n "$service" ]] || continue
+    managed_service_name "$service" || {
+      warn "Skipping unmanaged touched service: $service"
+      continue
+    }
+    systemctl stop "$service" >/dev/null 2>&1 || true
+  done <"$BACKUP_DIR/services-touched"
+}
+
+rollback_firewall_rules() {
+  local -a records=()
+  local backend rule index
+  [[ -f "${BACKUP_DIR:-}/firewall-rules" ]] || return 0
+  while IFS=$'\t' read -r backend rule; do
+    [[ -n "$backend" && -n "$rule" ]] && records+=("$backend"$'\t'"$rule")
+  done <"$BACKUP_DIR/firewall-rules"
+  for ((index = ${#records[@]} - 1; index >= 0; index--)); do
+    backend="${records[index]%%$'\t'*}"
+    rule="${records[index]#*$'\t'}"
+    case "$backend" in
+      ufw)
+        ufw delete allow "$rule" >/dev/null 2>&1 || warn "Could not remove current-run UFW rule $rule"
+        ;;
+      firewalld-runtime)
+        firewall-cmd --remove-port="$rule" >/dev/null 2>&1 ||
+          warn "Could not remove current-run firewalld runtime rule $rule"
+        ;;
+      firewalld-permanent)
+        firewall-cmd --permanent --remove-port="$rule" >/dev/null 2>&1 ||
+          warn "Could not remove current-run firewalld permanent rule $rule"
+        ;;
+    esac
+  done
+}
+
+rollback_hysteria_account() {
+  local name user_state group_state
+  [[ -f "${BACKUP_DIR:-}/accounts" ]] || return 0
+  while IFS=$'\t' read -r name user_state group_state; do
+    [[ "$name" == "hysteria" ]] || continue
+    if [[ "$user_state" == "created" ]]; then
+      userdel hysteria >/dev/null 2>&1 || warn "Could not remove the current-run Hysteria2 user"
+    fi
+    if [[ "$group_state" == "created" ]]; then
+      groupdel hysteria >/dev/null 2>&1 || warn "Could not remove the current-run Hysteria2 group"
+    fi
+  done <"$BACKUP_DIR/accounts"
 }
 
 rollback_current_run() {
   local kind path backup_path original disabled
   [[ -n "${BACKUP_DIR:-}" && -f "$BACKUP_DIR/manifest" ]] || return 0
+  stop_touched_services
+  rollback_firewall_rules
   while IFS=$'\t' read -r kind path; do
     [[ -n "$path" ]] || continue
     managed_path_allowed "$path" || {
@@ -1444,8 +2116,12 @@ rollback_current_run() {
       mv -- "$disabled" "$original"
     done <"$BACKUP_DIR/legacy-renames"
   fi
+  restore_managed_symlink_states
+  restore_managed_directory_states
   systemctl daemon-reload >/dev/null 2>&1 || true
   restore_service_states
+  rollback_hysteria_account
+  cleanup_runtime_directory || true
 }
 
 analyze_nginx_configuration() {
@@ -1629,6 +2305,209 @@ port_listener_conflicts() {
   return 1
 }
 
+project_service_proc_root() {
+  if [[ "${V2RAY_ONEKEY_SOURCE_ONLY:-0}" == "1" && -n "${SERVICE_PROC_ROOT:-}" ]]; then
+    printf '%s\n' "$SERVICE_PROC_ROOT"
+  elif [[ "${V2RAY_ONEKEY_SOURCE_ONLY:-0}" == "1" && -n "${HYSTERIA_PROC_ROOT:-}" ]]; then
+    printf '%s\n' "$HYSTERIA_PROC_ROOT"
+  else
+    printf '/proc\n'
+  fi
+}
+
+inspect_hysteria_runtime_identity() {
+  local pid="${1:-}" proc_root status_file runtime_identity executable command_line
+  local loaded_user loaded_group field value numeric account_ids account_uid account_gid
+  local expected_cap_mask=$(( (1 << 10) | (1 << 12) ))
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || {
+    printf 'Hysteria2 does not have a live MainPID\n'
+    return 1
+  }
+  loaded_user="$(systemctl show -p User --value hysteria-server 2>/dev/null)" || {
+    printf 'Unable to inspect the Hysteria2 service user\n'
+    return 1
+  }
+  loaded_group="$(systemctl show -p Group --value hysteria-server 2>/dev/null)" || {
+    printf 'Unable to inspect the Hysteria2 service group\n'
+    return 1
+  }
+  [[ "$loaded_user" == "hysteria" && "$loaded_group" == "hysteria" ]] || {
+    printf 'Hysteria2 is not loaded with the dedicated service identity\n'
+    return 1
+  }
+  account_ids="$(hysteria_account_identity_is_safe)" || {
+    printf 'Hysteria2 service account is not a minimal system identity\n'
+    return 1
+  }
+  account_uid="${account_ids%%:*}"
+  account_gid="${account_ids#*:}"
+  proc_root="$(project_service_proc_root)"
+  [[ -d "$proc_root/$pid" && ! -L "$proc_root/$pid" ]] || {
+    printf 'Hysteria2 MainPID is not present in procfs\n'
+    return 1
+  }
+  runtime_identity="$(stat -c '%U:%G' "$proc_root/$pid" 2>/dev/null)" || {
+    printf 'Unable to inspect the Hysteria2 runtime identity\n'
+    return 1
+  }
+  [[ "$runtime_identity" == "hysteria:hysteria" ]] || {
+    printf 'Hysteria2 is not running as hysteria:hysteria\n'
+    return 1
+  }
+  executable="$(readlink "$proc_root/$pid/exe" 2>/dev/null)" || {
+    printf 'Unable to inspect the Hysteria2 runtime executable\n'
+    return 1
+  }
+  [[ "$executable" == "$HYSTERIA_BIN" ]] || {
+    printf 'Hysteria2 is running an unexpected executable: %s\n' "$executable"
+    return 1
+  }
+  command_line="$(tr '\0' ' ' <"$proc_root/$pid/cmdline" 2>/dev/null)" || {
+    printf 'Unable to inspect the Hysteria2 runtime command line\n'
+    return 1
+  }
+  [[ "$command_line" == "$HYSTERIA_BIN server -c $HYSTERIA_CONFIG " ]] || {
+    printf 'Hysteria2 is running with an unexpected command line\n'
+    return 1
+  }
+  status_file="$proc_root/$pid/status"
+  [[ -f "$status_file" && ! -L "$status_file" ]] || {
+    printf 'Hysteria2 procfs status is unavailable\n'
+    return 1
+  }
+  value="$(awk '$1 == "Uid:" { print $2 " " $3 " " $4 " " $5 }' "$status_file" 2>/dev/null)" || return 1
+  [[ "$value" == "$account_uid $account_uid $account_uid $account_uid" ]] || {
+    printf 'Hysteria2 runtime UID set is unexpected\n'
+    return 1
+  }
+  value="$(awk '$1 == "Gid:" { print $2 " " $3 " " $4 " " $5 }' "$status_file" 2>/dev/null)" || return 1
+  [[ "$value" == "$account_gid $account_gid $account_gid $account_gid" ]] || {
+    printf 'Hysteria2 runtime GID set is unexpected\n'
+    return 1
+  }
+  value="$(awk '$1 == "Groups:" { $1=""; sub(/^[[:space:]]+/, ""); print }' "$status_file" 2>/dev/null)" || return 1
+  [[ "$value" == "$account_gid" ]] || {
+    printf 'Hysteria2 runtime has unexpected supplementary groups\n'
+    return 1
+  }
+  for field in CapEff CapBnd CapAmb; do
+    value="$(awk -v wanted="$field:" '$1 == wanted { print $2 }' "$status_file" 2>/dev/null)" || {
+      printf 'Unable to inspect Hysteria2 runtime capabilities\n'
+      return 1
+    }
+    [[ "$value" =~ ^[0-9A-Fa-f]{1,16}$ ]] || {
+      printf 'Hysteria2 runtime %s is malformed\n' "$field"
+      return 1
+    }
+    numeric=$((16#$value))
+    ((numeric == expected_cap_mask)) || {
+      printf 'Hysteria2 runtime %s grants unexpected capabilities\n' "$field"
+      return 1
+    }
+  done
+  value="$(awk '$1 == "NoNewPrivs:" { print $2 }' "$status_file" 2>/dev/null)" || {
+    printf 'Unable to inspect Hysteria2 NoNewPrivileges state\n'
+    return 1
+  }
+  [[ "$value" == "1" ]] || {
+    printf 'Hysteria2 runtime does not enforce NoNewPrivileges\n'
+    return 1
+  }
+}
+
+hysteria_runtime_identity_is_expected() {
+  inspect_hysteria_runtime_identity "$1" >/dev/null
+}
+
+project_hysteria_listener_pid() {
+  local pid
+  hysteria_deployment_is_strictly_project_owned || return 1
+  pid="$(systemctl show -p MainPID --value hysteria-server 2>/dev/null)" || return 1
+  hysteria_runtime_identity_is_expected "$pid" || return 1
+  printf '%s\n' "$pid"
+}
+
+project_xray_disk_deployment_is_consistent() (
+  local compare_dir compare_config
+  [[ -f "$STATE_FILE" && ! -L "$STATE_FILE" ]] || return 1
+  [[ -f "$XRAY_CONFIG" && ! -L "$XRAY_CONFIG" ]] || return 1
+  grep -Fqx 'STATE_SCHEMA=2' "$STATE_FILE" || return 1
+  load_state >/dev/null 2>&1 || return 1
+  compare_dir="$(mktemp -d "${TMPDIR:-/tmp}/.v2ray-onekey-xray-compare.XXXXXX")" || return 1
+  trap 'rm -rf -- "$compare_dir"' EXIT
+  compare_config="$compare_dir/config.json"
+  render_xray_config "$compare_config" >/dev/null 2>&1 || return 1
+  cmp -s -- "$compare_config" "$XRAY_CONFIG"
+)
+
+project_xray_listener_pid() {
+  local pid proc_root executable command_line loaded_user loaded_group runtime_identity
+  project_xray_disk_deployment_is_consistent || return 1
+  pid="$(systemctl show -p MainPID --value xray 2>/dev/null)" || return 1
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  loaded_user="$(systemctl show -p User --value xray 2>/dev/null)" || return 1
+  loaded_user="${loaded_user:-root}"
+  loaded_group="$(systemctl show -p Group --value xray 2>/dev/null)" || return 1
+  if [[ -z "$loaded_group" ]]; then
+    loaded_group="$(id -gn "$loaded_user" 2>/dev/null)" || return 1
+  fi
+  proc_root="$(project_service_proc_root)"
+  [[ -d "$proc_root/$pid" && ! -L "$proc_root/$pid" ]] || return 1
+  runtime_identity="$(stat -c '%U:%G' "$proc_root/$pid" 2>/dev/null)" || return 1
+  [[ "$runtime_identity" == "$loaded_user:$loaded_group" ]] || return 1
+  executable="$(readlink "$proc_root/$pid/exe" 2>/dev/null)" || return 1
+  [[ "$executable" == "$XRAY_BIN" ]] || return 1
+  command_line="$(tr '\0' ' ' <"$proc_root/$pid/cmdline" 2>/dev/null)" || return 1
+  [[ "$command_line" == "$XRAY_BIN run -config $XRAY_CONFIG " ]] || return 1
+  printf '%s\n' "$pid"
+}
+
+listener_output_is_only_expected_service() {
+  local output="$1" process="$2" pid="$3" line stripped found=0
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    [[ "$line" == *"\"$process\""* && "$line" == *"pid=$pid,"* ]] || return 1
+    stripped="${line//pid=$pid,/}"
+    [[ "$stripped" != *'pid='* ]] || return 1
+    found=1
+  done <<<"$output"
+  [[ "$found" == "1" ]]
+}
+
+hysteria_range_conflicts() {
+  local port output owned_pid=""
+  HY2_CONFLICT_DETAILS=""
+  parse_port_range "$HY2_PORT_RANGE" || die "Invalid Hysteria2 UDP range: $HY2_PORT_RANGE"
+  owned_pid="$(project_hysteria_listener_pid 2>/dev/null || true)"
+  for ((port = 10#$HY2_PORT_START; port <= 10#$HY2_PORT_END; port++)); do
+    output="$(ss -H -lnup "sport = :$port" 2>&1)" ||
+      die "Unable to inspect UDP port $port: $output"
+    if [[ -n "$output" ]]; then
+      if listener_output_is_only_expected_service "$output" hysteria "$owned_pid"; then
+        continue
+      fi
+      [[ -z "$HY2_CONFLICT_DETAILS" ]] || HY2_CONFLICT_DETAILS+=$'\n'
+      HY2_CONFLICT_DETAILS+="UDP $port conflict:"$'\n'"$output"
+    fi
+  done
+  [[ -n "$HY2_CONFLICT_DETAILS" ]]
+}
+
+shadowsocks_port_conflicts() {
+  local owned_pid=""
+  valid_port "$SS_PORT" || die "Invalid Shadowsocks port: $SS_PORT"
+  SS_PORT="$(normalize_port "$SS_PORT")"
+  SS_CONFLICT_DETAILS="$(ss -H -lntup "sport = :$SS_PORT" 2>&1)" ||
+    die "Unable to inspect TCP/UDP port $SS_PORT: $SS_CONFLICT_DETAILS"
+  owned_pid="$(project_xray_listener_pid 2>/dev/null || true)"
+  if [[ -n "$SS_CONFLICT_DETAILS" ]] &&
+    listener_output_is_only_expected_service "$SS_CONFLICT_DETAILS" xray "$owned_pid"; then
+    SS_CONFLICT_DETAILS=""
+  fi
+  [[ -n "$SS_CONFLICT_DETAILS" ]]
+}
+
 stdin_is_tty() { [[ -t 0 ]]; }
 
 complete_listener_diagnostics() {
@@ -1662,15 +2541,80 @@ $full_listeners"
   die "Unable to select an available Cloudflare port after 5 attempts"
 }
 
+resolve_hysteria_port_range() {
+  local attempt replacement
+  hysteria_range_conflicts || return 0
+  for attempt in 1 2 3 4 5; do
+    warn "Hysteria2 UDP range $HY2_PORT_RANGE is unavailable: $HY2_CONFLICT_DETAILS"
+    read -r -p "Enter a replacement Hysteria2 UDP range START-END (or q to cancel): " replacement ||
+      die "Port selection cancelled"
+    [[ "$replacement" != "q" && "$replacement" != "Q" ]] || die "Port selection cancelled"
+    parse_port_range "$replacement" || {
+      warn "Hysteria2 requires START-END with a span no larger than 1000"
+      continue
+    }
+    HY2_PORT_RANGE="$HY2_PORT_START-$HY2_PORT_END"
+    hysteria_range_conflicts || return 0
+  done
+  die "Unable to select an available Hysteria2 UDP range after 5 attempts"
+}
+
+resolve_shadowsocks_port() {
+  local attempt replacement
+  shadowsocks_port_conflicts || return 0
+  for attempt in 1 2 3 4 5; do
+    warn "Shadowsocks TCP/UDP port $SS_PORT is unavailable: $SS_CONFLICT_DETAILS"
+    read -r -p "Enter a replacement Shadowsocks TCP/UDP port (or q to cancel): " replacement ||
+      die "Port selection cancelled"
+    [[ "$replacement" != "q" && "$replacement" != "Q" ]] || die "Port selection cancelled"
+    valid_port "$replacement" || {
+      warn "Shadowsocks requires a port from 1 through 65535"
+      continue
+    }
+    SS_PORT="$(normalize_port "$replacement")"
+    shadowsocks_port_conflicts || return 0
+  done
+  die "Unable to select an available Shadowsocks port after 5 attempts"
+}
+
+resolve_direct_port_conflicts() {
+  local hy2_conflict=0 ss_conflict=0 message=""
+  if mode_has_hysteria && hysteria_range_conflicts; then
+    hy2_conflict=1
+  fi
+  if mode_has_shadowsocks && shadowsocks_port_conflicts; then
+    ss_conflict=1
+  fi
+  if ((hy2_conflict == 0 && ss_conflict == 0)); then
+    return 0
+  fi
+  if ! stdin_is_tty; then
+    if ((hy2_conflict == 1)); then
+      message="Hysteria2 UDP range $HY2_PORT_RANGE is occupied. Rerun using --hy2-port-range START-END. Conflict details:"$'\n'"$HY2_CONFLICT_DETAILS"
+    fi
+    if ((ss_conflict == 1)); then
+      [[ -z "$message" ]] || message+=$'\n'
+      message+="Shadowsocks TCP/UDP port $SS_PORT is occupied. Rerun using --ss-port PORT. Conflict details:"$'\n'"$SS_CONFLICT_DETAILS"
+    fi
+    die "$message"
+  fi
+  ((hy2_conflict == 0)) || resolve_hysteria_port_range
+  ((ss_conflict == 0)) || resolve_shadowsocks_port
+}
+
 resolve_public_port_conflicts() {
   local full_listeners=""
-  mode_has_cloudflare || return 0
-  resolve_cloudflare_port
-  if port_listener_conflicts acme 80; then
-    full_listeners="$(complete_listener_diagnostics)"
-    die "TCP port 80 is unavailable for the ACME HTTP-01 challenge. Conflict: $PORT_CONFLICT_DETAILS
+  if mode_has_cloudflare; then
+    resolve_cloudflare_port
+    if port_listener_conflicts acme 80; then
+      full_listeners="$(complete_listener_diagnostics)"
+      die "TCP port 80 is unavailable for the ACME HTTP-01 challenge. Conflict: $PORT_CONFLICT_DETAILS
 ss -lntp output:
 $full_listeners"
+    fi
+  fi
+  if mode_has_hysteria || mode_has_shadowsocks; then
+    resolve_direct_port_conflicts
   fi
 }
 
@@ -1760,22 +2704,26 @@ install_required_packages() {
   else
     base_packages+=(iproute)
   fi
-  install_packages "${base_packages[@]}"
   if mode_has_cloudflare; then
-    install_packages nginx certbot
-    if ! install_packages python3-certbot-nginx; then
+    run_guarded_service_action nginx install_packages "${base_packages[@]}"
+    run_guarded_service_action nginx install_packages nginx certbot
+    if ! run_guarded_service_action nginx install_packages python3-certbot-nginx; then
       warn "The optional certbot Nginx plugin is unavailable; webroot issuance will still be used."
     fi
+  else
+    install_packages "${base_packages[@]}"
   fi
 }
 
-install_xray_core() {
+install_xray_core() (
   local installer
   log "Installing or updating Xray from the official XTLS installer..."
   installer="$(curl -LfsS --connect-timeout 10 --max-time 120 "$XRAY_INSTALL_URL")"
   [[ -n "$installer" ]] || die "The official Xray installer download was empty"
-  bash -c "$installer" @ install
-}
+  unset DAT_PATH JSON_PATH JSONS_PATH BASH_ENV ENV check_all_service_files XRAY_CUSTOMIZE
+  DAT_PATH="$XRAY_DATA_DIR" JSON_PATH="$(dirname "$XRAY_CONFIG")" \
+    bash -c "$installer" @ install
+)
 
 stage_hysteria_binary() (
   local staged="$1" staged_dir effective_file="" hashes_file="" effective_url=""
@@ -1871,6 +2819,102 @@ install_validated_hysteria_binary() {
   install -o root -g root -m 0755 "$staged" "$HYSTERIA_BIN"
 }
 
+write_hysteria_account_record() {
+  printf '%s\n' "$2" >"$1"
+}
+
+record_hysteria_account_state() {
+  local user_state="$1" group_state="$2" journal="${BACKUP_DIR:-}/accounts"
+  local mode owner temp_path record
+  case "$user_state" in absent|preexisting|created) ;; *) return 1 ;; esac
+  case "$group_state" in preexisting|created) ;; *) return 1 ;; esac
+  [[ -f "$journal" && ! -L "$journal" ]] || return 1
+  mode="$(stat -c '%a' "$journal" 2>/dev/null)" || return 1
+  owner="$(stat -c '%u' "$journal" 2>/dev/null)" || return 1
+  [[ "$mode" == "600" && "$owner" == "0" ]] || return 1
+  temp_path="$(mktemp "$BACKUP_DIR/.accounts.XXXXXX")" || return 1
+  record="hysteria"$'\t'"$user_state"$'\t'"$group_state"
+  if ! write_hysteria_account_record "$temp_path" "$record" ||
+    ! chmod 0600 "$temp_path" || ! mv -f -- "$temp_path" "$journal"; then
+    rm -f -- "$temp_path"
+    return 1
+  fi
+  [[ -f "$journal" && ! -L "$journal" ]] || return 1
+  mode="$(stat -c '%a' "$journal" 2>/dev/null)" || return 1
+  owner="$(stat -c '%u' "$journal" 2>/dev/null)" || return 1
+  [[ "$mode" == "600" && "$owner" == "0" ]]
+}
+
+hysteria_system_account_limits() {
+  local login_defs="${LOGIN_DEFS_FILE:-/etc/login.defs}" uid_max="999" gid_max="999" value
+  if [[ -f "$login_defs" && ! -L "$login_defs" ]]; then
+    value="$(awk '$1 == "SYS_UID_MAX" && $2 ~ /^[0-9]+$/ { found=$2 } END { if (found != "") print found }' "$login_defs")"
+    [[ -z "$value" ]] || uid_max="$value"
+    value="$(awk '$1 == "SYS_GID_MAX" && $2 ~ /^[0-9]+$/ { found=$2 } END { if (found != "") print found }' "$login_defs")"
+    [[ -z "$value" ]] || gid_max="$value"
+  fi
+  [[ "$uid_max" =~ ^[1-9][0-9]*$ && "$gid_max" =~ ^[1-9][0-9]*$ ]] || return 1
+  printf '%s:%s\n' "$uid_max" "$gid_max"
+}
+
+hysteria_account_identity_is_safe() {
+  local passwd_entry group_entry limits uid gid passwd_gid primary_gid groups primary_name home shell members_field
+  passwd_entry="$(getent passwd hysteria 2>/dev/null)" || return 1
+  group_entry="$(getent group hysteria 2>/dev/null)" || return 1
+  limits="$(hysteria_system_account_limits)" || return 1
+  uid="$(awk -F: '{print $3}' <<<"$passwd_entry")"
+  passwd_gid="$(awk -F: '{print $4}' <<<"$passwd_entry")"
+  gid="$(awk -F: '{print $3}' <<<"$group_entry")"
+  members_field="$(awk -F: '{print $4}' <<<"$group_entry")"
+  home="$(awk -F: '{print $6}' <<<"$passwd_entry")"
+  shell="$(awk -F: '{print $7}' <<<"$passwd_entry")"
+  [[ "$uid" =~ ^[1-9][0-9]*$ && "$gid" =~ ^[1-9][0-9]*$ && "$passwd_gid" == "$gid" ]] || return 1
+  [[ -z "$members_field" ]] || return 1
+  ((10#$uid <= 10#${limits%%:*} && 10#$gid <= 10#${limits#*:})) || return 1
+  [[ "$home" == "/nonexistent" ]] || return 1
+  [[ "$shell" == "/usr/sbin/nologin" || "$shell" == "/sbin/nologin" ]] || return 1
+  [[ "$(id -u hysteria 2>/dev/null)" == "$uid" ]] || return 1
+  primary_gid="$(id -g hysteria 2>/dev/null)" || return 1
+  [[ "$primary_gid" == "$gid" ]] || return 1
+  primary_name="$(id -gn hysteria 2>/dev/null)" || return 1
+  [[ "$primary_name" == "hysteria" ]] || return 1
+  groups="$(id -G hysteria 2>/dev/null)" || return 1
+  [[ "$groups" == "$gid" ]] || return 1
+  printf '%s:%s\n' "$uid" "$gid"
+}
+
+ensure_hysteria_account() {
+  local user_state="preexisting" group_state="preexisting"
+  if ! getent group hysteria >/dev/null 2>&1; then
+    groupadd --system hysteria
+    group_state="created"
+    if ! record_hysteria_account_state absent "$group_state"; then
+      groupdel hysteria >/dev/null 2>&1 || true
+      die "Hysteria2 account journal could not record the created group"
+    fi
+  fi
+  if ! id hysteria >/dev/null 2>&1; then
+    useradd --system --gid hysteria --home-dir /nonexistent --shell /usr/sbin/nologin hysteria
+    user_state="created"
+    if ! record_hysteria_account_state "$user_state" "$group_state"; then
+      userdel hysteria >/dev/null 2>&1 || true
+      [[ "$group_state" != "created" ]] || groupdel hysteria >/dev/null 2>&1 || true
+      die "Hysteria2 account journal could not record the created user"
+    fi
+  fi
+  hysteria_account_identity_is_safe >/dev/null ||
+    die "Hysteria2 account must be a non-root system identity without supplementary groups or other group members"
+  if ! record_hysteria_account_state "$user_state" "$group_state"; then
+    if [[ "$user_state" == "created" ]]; then
+      userdel hysteria >/dev/null 2>&1 || true
+    fi
+    if [[ "$group_state" == "created" ]]; then
+      groupdel hysteria >/dev/null 2>&1 || true
+    fi
+    die "Hysteria2 account journal could not record the validated account"
+  fi
+}
+
 generate_hysteria_certificate_files() (
   local staged_cert="$1" staged_key="$2" config="" pin cert_dir key_dir
   local keep_files="0"
@@ -1933,7 +2977,8 @@ generate_hysteria_certificate() {
 
 render_hysteria_config() (
   local output_path="$1" cert_path="$2" key_path="$3" acl_path="$4"
-  local output_dir temp_path="" render_status="0" source_path
+  local listen_value="${5:-$HY2_PORT_RANGE}"
+  local output_dir temp_path="" render_status="0" source_path normalized_port
   cleanup_hysteria_config_render() {
     [[ -z "$temp_path" ]] || rm -f -- "$temp_path" || true
   }
@@ -1942,7 +2987,12 @@ render_hysteria_config() (
   trap 'exit 130' INT
   trap 'exit 143' TERM
   unexport_sensitive_runtime_values
-  valid_hy2_port_range "$HY2_PORT_RANGE" || die "Invalid Hysteria2 port range"
+  if valid_port "$listen_value"; then
+    normalized_port="$(normalize_port "$listen_value")"
+    listen_value="$normalized_port"
+  else
+    valid_hy2_port_range "$listen_value" || die "Invalid Hysteria2 listen port or range"
+  fi
   valid_hy2_secret "$HY2_AUTH" || die "Invalid Hysteria2 authentication value"
   valid_hy2_secret "$HY2_OBFS_PASSWORD" || die "Invalid Hysteria2 obfuscation value"
   for source_path in "$cert_path" "$key_path" "$acl_path"; do
@@ -1956,7 +3006,7 @@ render_hysteria_config() (
   temp_path="$(mktemp "$output_dir/.hysteria-config.XXXXXX")" ||
     die "Unable to create the Hysteria2 config staging file"
   printf '%s\0%s\0%s\0%s\0%s\0%s\0' \
-    "$HY2_PORT_RANGE" "$HY2_AUTH" "$HY2_OBFS_PASSWORD" \
+    "$listen_value" "$HY2_AUTH" "$HY2_OBFS_PASSWORD" \
     "$cert_path" "$key_path" "$acl_path" |
     python3 - "$temp_path" 3<&0 <<'PY' || render_status=$?
 import json
@@ -1976,6 +3026,7 @@ def quoted(value):
 
 content = "\n".join(
     [
+        "# Managed by v2ray-onekey: Hysteria2 config v1",
         "listen: " + quoted(":" + port_range),
         "tls:",
         "  cert: " + quoted(cert),
@@ -2019,6 +3070,7 @@ render_hysteria_acl() (
   temp_path="$(mktemp "$output_dir/.hysteria-acl.XXXXXX")" ||
     die "Unable to create the Hysteria2 ACL staging file"
   {
+    printf '%s\n' "$HYSTERIA_ACL_MARKER"
     printf '%s\n' \
       'reject(0.0.0.0/8)' \
       'reject(10.0.0.0/8)' \
@@ -2059,6 +3111,7 @@ render_hysteria_unit() (
   temp_path="$(mktemp "$output_dir/.hysteria-unit.XXXXXX")" ||
     die "Unable to create the Hysteria2 unit staging file"
   cat >"$temp_path" <<'EOF' || return 1
+# Managed by v2ray-onekey: Hysteria2 unit v1
 [Unit]
 Description=Hysteria2 Server
 After=network-online.target
@@ -2098,21 +3151,132 @@ install_hysteria_runtime_files() {
   install -o root -g root -m 0644 "$staged_unit" "$HYSTERIA_UNIT"
 }
 
+verify_hysteria_service_definition() {
+  local loaded_user loaded_group loaded_unit path identity
+  loaded_user="$(systemctl show -p User --value hysteria-server 2>/dev/null)" ||
+    die "Unable to inspect the Hysteria2 service user"
+  loaded_group="$(systemctl show -p Group --value hysteria-server 2>/dev/null)" ||
+    die "Unable to inspect the Hysteria2 service group"
+  [[ "$loaded_user" == "hysteria" && "$loaded_group" == "hysteria" ]] ||
+    die "Hysteria2 is not loaded with the dedicated service identity"
+  loaded_unit="$(systemctl cat hysteria-server 2>/dev/null)" ||
+    die "Unable to inspect the loaded Hysteria2 unit"
+  for identity in \
+    'User=hysteria' \
+    'Group=hysteria' \
+    'ExecStart=/usr/local/bin/hysteria server -c /etc/hysteria/config.yaml' \
+    'AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE' \
+    'CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE' \
+    'NoNewPrivileges=true'; do
+    grep -Fqx "$identity" <<<"$loaded_unit" ||
+      die "Loaded Hysteria2 unit is missing the required identity or capability setting: $identity"
+  done
+  for path in "$HYSTERIA_CONFIG" "$HYSTERIA_ACL" "$HYSTERIA_CERT" "$HYSTERIA_KEY"; do
+    identity="$(stat -c '%U:%G:%a' "$path" 2>/dev/null)" ||
+      die "Unable to inspect Hysteria2 file permissions: $path"
+    [[ "$identity" == "root:hysteria:440" ]] ||
+      die "Unsafe Hysteria2 file permissions on $path: $identity"
+  done
+  [[ "$(stat -c '%U:%G:%a' "$(dirname "$HYSTERIA_CONFIG")" 2>/dev/null)" == "root:hysteria:750" ]] ||
+    die "Unsafe Hysteria2 configuration directory permissions"
+  [[ "$(stat -c '%U:%G:%a' "$HYSTERIA_BIN" 2>/dev/null)" == "root:root:755" ]] ||
+    die "Unsafe Hysteria2 binary permissions"
+  [[ "$(stat -c '%U:%G:%a' "$HYSTERIA_UNIT" 2>/dev/null)" == "root:root:644" ]] ||
+    die "Unsafe Hysteria2 unit permissions"
+}
+
+verify_hysteria_runtime_identity() {
+  local pid diagnostic
+  pid="$(systemctl show -p MainPID --value hysteria-server 2>/dev/null)" ||
+    die "Unable to inspect the Hysteria2 MainPID"
+  diagnostic="$(inspect_hysteria_runtime_identity "$pid")" || die "$diagnostic"
+}
+
 validate_hysteria_staged() (
-  local binary="$1" config="$2" log_path="$3" status
+  local binary="$1" config="$2" log_path="$3" status runner_pid=""
+  terminate_hysteria_smoke() {
+    [[ -n "$runner_pid" ]] || return 0
+    kill -TERM -- "-$runner_pid" >/dev/null 2>&1 || kill -TERM "$runner_pid" >/dev/null 2>&1 || true
+    sleep 1
+    kill -KILL -- "-$runner_pid" >/dev/null 2>&1 || kill -KILL "$runner_pid" >/dev/null 2>&1 || true
+    wait "$runner_pid" >/dev/null 2>&1 || true
+    runner_pid=""
+  }
+  trap terminate_hysteria_smoke EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
   unexport_sensitive_runtime_values
   : >"$log_path"
   chmod 0600 "$log_path"
   set +e
   timeout --signal=TERM --kill-after=2s 4s \
-    "$binary" server -c "$config" >"$log_path" 2>&1
+    "$binary" server -c "$config" >"$log_path" 2>&1 &
+  runner_pid=$!
+  wait "$runner_pid"
   status=$?
+  runner_pid=""
   set -e
   if [[ "$status" != "124" && "$status" != "143" ]] ||
     ! grep -Fq 'server up and running' "$log_path"; then
     die "Hysteria2 staged validation did not become ready"
   fi
 )
+
+hysteria_certificate_pin() {
+  local cert="$1" pin
+  pin="$(
+    openssl x509 -noout -fingerprint -sha256 -in "$cert" 2>/dev/null |
+      awk -F= 'NF == 2 { print $2 }' | tr 'a-f' 'A-F' | tr -d '\r\n'
+  )" || return 1
+  valid_hy2_cert_pin "$pin" || return 1
+  printf '%s\n' "$pin"
+}
+
+require_hysteria_port_hopping_backend() {
+  command -v nft >/dev/null 2>&1 || command -v iptables >/dev/null 2>&1 ||
+    die "Hysteria2 port hopping requires nftables or iptables"
+}
+
+select_hysteria_smoke_port() {
+  local port output
+  for ((port = 49152; port <= 65535; port++)); do
+    if [[ "$port" -ge "${HY2_PORT_START:-0}" && "$port" -le "${HY2_PORT_END:-0}" ]]; then
+      continue
+    fi
+    output="$(ss -H -lnup "sport = :$port" 2>&1)" ||
+      die "Unable to inspect Hysteria2 smoke UDP port $port: $output"
+    if [[ -z "$output" ]]; then
+      printf '%s\n' "$port"
+      return 0
+    fi
+  done
+  die "Unable to find a free high UDP port for Hysteria2 staged validation"
+}
+
+stage_hysteria_bundle() {
+  local staged_binary="$1" staged_config="$2" staged_acl="$3" staged_cert="$4"
+  local staged_key="$5" staged_unit="$6" staged_smoke_config="$7" smoke_log="$8" pin smoke_port
+  require_hysteria_port_hopping_backend
+  stage_hysteria_binary "$staged_binary"
+  render_hysteria_acl "$staged_acl"
+  if [[ "$ROTATE" != "1" ]] && hysteria_ownership_manifest_is_valid; then
+    cp -a -- "$HYSTERIA_CERT" "$staged_cert"
+    cp -a -- "$HYSTERIA_KEY" "$staged_key"
+    chmod 0440 "$staged_cert" "$staged_key"
+    pin="$(hysteria_certificate_pin "$staged_cert")" ||
+      die "Unable to validate the managed Hysteria2 certificate pin"
+    [[ "$pin" == "$HY2_CERT_PIN" ]] ||
+      die "Managed Hysteria2 certificate does not match the saved pin"
+  else
+    generate_hysteria_certificate "$staged_cert" "$staged_key"
+  fi
+  smoke_port="$(select_hysteria_smoke_port)"
+  render_hysteria_config "$staged_smoke_config" "$staged_cert" "$staged_key" "$staged_acl" "$smoke_port"
+  validate_hysteria_staged "$staged_binary" "$staged_smoke_config" "$smoke_log"
+  render_hysteria_config "$staged_config" "$HYSTERIA_CERT" "$HYSTERIA_KEY" "$HYSTERIA_ACL"
+  render_hysteria_unit "$staged_unit"
+}
 
 xray_service_identity() {
   local user group
@@ -2282,24 +3446,99 @@ format_uri_host() {
   esac
 }
 
+append_firewall_record() {
+  printf '%s\t%s\n' "$1" "$2" >>"$BACKUP_DIR/firewall-rules"
+}
+
+record_firewall_addition() {
+  local backend="$1" rule="$2" journal="${BACKUP_DIR:-}/firewall-rules"
+  [[ -f "$journal" && ! -L "$journal" ]] || die "Firewall journal is unavailable"
+  append_firewall_record "$backend" "$rule" || die "Unable to persist firewall rollback rule $rule"
+  chmod 0600 "$journal" || die "Unable to secure firewall rollback journal"
+}
+
+ufw_rule_exists() {
+  local rule="$1" output status=0
+  output="$(LC_ALL=C ufw status 2>/dev/null)" || status=$?
+  [[ "$status" -eq 0 ]] || return 2
+  awk -v wanted="$rule" 'NR > 1 && $1 == wanted { found = 1 } END { exit !found }' <<<"$output"
+}
+
+firewalld_is_active() {
+  local output status=0
+  output="$(LC_ALL=C systemctl is-active firewalld 2>/dev/null)" || status=$?
+  [[ "$output" != *$'\n'* && "$output" =~ ^[a-z-]+$ ]] || return 2
+  if [[ "$status" -eq 0 && "$output" == "active" ]]; then
+    return 0
+  fi
+  if { [[ "$status" -eq 3 && "$output" == "inactive" ]] ||
+    [[ "$status" -eq 4 && "$output" == "unknown" ]]; }; then
+    return 1
+  fi
+  return 2
+}
+
+open_firewall_rule() {
+  local ufw_rule="$1" firewalld_rule="$2" status=0 firewall_state=""
+  if command -v ufw >/dev/null 2>&1; then
+    firewall_state="$(LC_ALL=C ufw status 2>/dev/null)" ||
+      die "Unable to inspect UFW status"
+    if grep -Fqx "Status: active" <<<"$firewall_state"; then
+      if ufw_rule_exists "$ufw_rule"; then
+        :
+      else
+        status=$?
+        [[ "$status" -eq 1 ]] || die "Unable to query active UFW rule $ufw_rule"
+        record_firewall_addition ufw "$ufw_rule"
+        ufw allow "$ufw_rule" >/dev/null || die "UFW failed to allow required rule $ufw_rule"
+      fi
+    elif ! grep -Fqx "Status: inactive" <<<"$firewall_state"; then
+      die "Unable to classify UFW status"
+    fi
+  fi
+
+  if command -v firewall-cmd >/dev/null 2>&1; then
+    if firewalld_is_active; then
+      :
+    else
+      status=$?
+      [[ "$status" -eq 1 ]] && return 0
+      die "Unable to inspect firewalld state"
+    fi
+    if firewall-cmd --query-port="$firewalld_rule" >/dev/null 2>&1; then
+      :
+    else
+      status=$?
+      [[ "$status" -eq 1 ]] || die "Unable to query active firewalld runtime rule $firewalld_rule"
+      record_firewall_addition firewalld-runtime "$firewalld_rule"
+      firewall-cmd --add-port="$firewalld_rule" >/dev/null ||
+        die "firewalld failed to add required runtime rule $firewalld_rule"
+    fi
+    if firewall-cmd --permanent --query-port="$firewalld_rule" >/dev/null 2>&1; then
+      :
+    else
+      status=$?
+      [[ "$status" -eq 1 ]] || die "Unable to query active firewalld permanent rule $firewalld_rule"
+      record_firewall_addition firewalld-permanent "$firewalld_rule"
+      firewall-cmd --permanent --add-port="$firewalld_rule" >/dev/null ||
+        die "firewalld failed to add required permanent rule $firewalld_rule"
+    fi
+  fi
+}
+
 open_firewall_port() {
-  local port="$1"
-  local proto="${2:-tcp}"
+  local port="$1" proto="${2:-tcp}"
+  valid_port "$port" || die "Invalid firewall port: $port"
+  [[ "$proto" == "tcp" || "$proto" == "udp" ]] || die "Invalid firewall protocol: $proto"
+  port="$(normalize_port "$port")"
+  open_firewall_rule "$port/$proto" "$port/$proto"
+}
 
-  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
-    if ! ufw allow "${port}/${proto}" >/dev/null; then
-      warn "UFW failed to allow ${port}/${proto}; add this rule manually"
-    fi
-  fi
-
-  if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld; then
-    if ! firewall-cmd --add-port="${port}/${proto}" >/dev/null; then
-      warn "firewalld failed to add runtime rule ${port}/${proto}; add it manually"
-    fi
-    if ! firewall-cmd --permanent --add-port="${port}/${proto}" >/dev/null; then
-      warn "firewalld failed to add permanent rule ${port}/${proto}; add it manually"
-    fi
-  fi
+open_firewall_range() {
+  local start="$1" end="$2" proto="${3:-udp}"
+  parse_port_range "$start-$end" || die "Invalid firewall port range: $start-$end"
+  [[ "$proto" == "udp" ]] || die "Hysteria2 firewall ranges must use UDP"
+  open_firewall_rule "$HY2_PORT_START:$HY2_PORT_END/$proto" "$HY2_PORT_START-$HY2_PORT_END/$proto"
 }
 
 valid_nginx_webroot() {
@@ -2454,24 +3693,36 @@ service_unit_exists() {
   systemctl cat "$1" >/dev/null 2>&1
 }
 
+stop_project_hysteria_for_cutover() {
+  mode_has_hysteria || return 0
+  service_was_active hysteria-server || return 0
+  project_hysteria_listener_pid >/dev/null ||
+    die "Refusing to stop an unproved or unsafe Hysteria2 service for staged validation"
+  log "Temporarily stopping the existing project Hysteria2 service for cutover..."
+  run_service_mutation hysteria-server stop
+}
+
 stop_legacy_service_for_cutover() {
   if service_was_active xray; then
     log "Temporarily stopping the existing Xray service for cutover..."
-    systemctl stop xray
+    run_service_mutation xray stop
   fi
   if service_was_active v2ray; then
     log "Temporarily stopping V2Ray for the validated cutover..."
-    systemctl stop v2ray
+    run_service_mutation v2ray stop
+  fi
+  if service_was_active hysteria-server; then
+    stop_project_hysteria_for_cutover
   fi
 }
 
 activate_nginx_config() {
   nginx -t
-  systemctl enable nginx
+  run_service_mutation nginx enable
   if systemctl is-active --quiet nginx; then
-    systemctl reload nginx
+    run_service_mutation nginx reload
   else
-    systemctl start nginx
+    run_service_mutation nginx start
   fi
 }
 
@@ -2489,7 +3740,7 @@ release_legacy_nginx_listeners() {
   fi
   if ! mode_has_cloudflare && systemctl is-active --quiet nginx; then
     nginx -t
-    systemctl reload nginx
+    run_service_mutation nginx reload
   fi
 }
 
@@ -2516,6 +3767,51 @@ print_service_diagnostics() {
   journalctl -u "$service" -n 30 --no-pager 2>&1 || true
 }
 
+protocol_listener_output() {
+  local protocol="$1" port="$2"
+  case "$protocol" in
+    tcp) ss -H -lntp "sport = :$port" 2>&1 ;;
+    udp) ss -H -lnup "sport = :$port" 2>&1 ;;
+    *) return 2 ;;
+  esac
+}
+
+multi_protocol_services_ready() {
+  local output
+  systemctl is-active --quiet xray || return 1
+  if mode_has_shadowsocks; then
+    output="$(protocol_listener_output tcp "$SS_PORT")" || return 1
+    [[ -n "$output" && "$output" == *xray* ]] || return 1
+    output="$(protocol_listener_output udp "$SS_PORT")" || return 1
+    [[ -n "$output" && "$output" == *xray* ]] || return 1
+  fi
+  if mode_has_hysteria; then
+    systemctl is-active --quiet hysteria-server || return 1
+    parse_port_range "$HY2_PORT_RANGE" || return 1
+    output="$(protocol_listener_output udp "$HY2_PORT_START")" || return 1
+    [[ -n "$output" && "$output" == *hysteria* ]] || return 1
+  fi
+}
+
+print_multi_protocol_diagnostics() {
+  print_service_diagnostics xray
+  if mode_has_hysteria; then
+    print_service_diagnostics hysteria-server
+  fi
+  warn "Current TCP/UDP listeners:"
+  ss -H -lntup 2>&1 || true
+}
+
+wait_for_multi_protocol_readiness() {
+  local attempt
+  for ((attempt = 1; attempt <= LISTENER_WAIT_ATTEMPTS; attempt++)); do
+    multi_protocol_services_ready && return 0
+    ((attempt < LISTENER_WAIT_ATTEMPTS)) && sleep "$LISTENER_WAIT_INTERVAL"
+  done
+  print_multi_protocol_diagnostics
+  die "Multi-protocol readiness timed out"
+}
+
 wait_for_listener_owner() {
   local port="$1" owner="$2" binding="${3:-}" output attempt
   for ((attempt = 1; attempt <= LISTENER_WAIT_ATTEMPTS; attempt++)); do
@@ -2532,7 +3828,7 @@ wait_for_listener_owner() {
 }
 
 verify_started_services() {
-  systemctl is-active --quiet xray || die "Xray is not active after restart"
+  wait_for_multi_protocol_readiness
   if mode_has_cloudflare; then
     systemctl is-active --quiet nginx || die "Nginx is not active after reload"
     wait_for_listener_owner "$INTERNAL_WS_PORT" xray 127.0.0.1
@@ -2543,7 +3839,7 @@ verify_started_services() {
 
 disable_legacy_v2ray_after_success() {
   if service_unit_exists v2ray; then
-    systemctl disable --now v2ray
+    run_service_mutation v2ray disable --now
   fi
 }
 
@@ -2551,6 +3847,14 @@ configure_firewall() {
   if mode_has_cloudflare; then
     open_firewall_port 80 tcp
     open_firewall_port "$CLOUDFLARE_PORT" tcp
+  fi
+  if mode_has_shadowsocks; then
+    open_firewall_port "$SS_PORT" tcp
+    open_firewall_port "$SS_PORT" udp
+  fi
+  if mode_has_hysteria; then
+    parse_port_range "$HY2_PORT_RANGE" || die "Invalid Hysteria2 UDP range"
+    open_firewall_range "$HY2_PORT_START" "$HY2_PORT_END" udp
   fi
 }
 
@@ -2581,17 +3885,38 @@ print_deployment_summary() {
 
 prepare_runtime_directory() {
   RUNTIME_DIR="${RUNTIME_DIR:-/run/v2ray-onekey/$RUN_TIMESTAMP}"
+  [[ "$RUNTIME_DIR" == /* && "$RUNTIME_DIR" != "/" && "$RUNTIME_DIR" != *$'\n'* ]] ||
+    die "Invalid runtime staging directory"
+  [[ ! -L "$RUNTIME_DIR" ]] || die "Refusing symlink runtime staging directory"
   install -d -m 700 "$RUNTIME_DIR"
+  printf '%s\n' "$RUN_TIMESTAMP" >"$RUNTIME_DIR/.v2ray-onekey-runtime"
+  chmod 0600 "$RUNTIME_DIR/.v2ray-onekey-runtime"
+}
+
+cleanup_runtime_directory() {
+  local marker expected
+  [[ -n "${RUNTIME_DIR:-}" ]] || return 0
+  marker="$RUNTIME_DIR/.v2ray-onekey-runtime"
+  [[ "$RUNTIME_DIR" == /* && "$RUNTIME_DIR" != "/" && -d "$RUNTIME_DIR" && ! -L "$RUNTIME_DIR" ]] ||
+    return 1
+  [[ -f "$marker" && ! -L "$marker" ]] || return 1
+  IFS= read -r expected <"$marker" || return 1
+  [[ -n "$expected" && "$expected" == "${RUN_TIMESTAMP:-$expected}" ]] || return 1
+  rm -rf -- "$RUNTIME_DIR"
+  RUNTIME_DIR=""
 }
 
 deploy_services() {
   local staged_xray staged_nginx_initial staged_nginx_final
+  local staged_hysteria_binary staged_hysteria_config staged_hysteria_acl
+  local staged_hysteria_cert staged_hysteria_key staged_hysteria_unit
+  local staged_hysteria_smoke_config staged_hysteria_smoke_log
 
   require_mode_ready
-  begin_transaction
   validate_managed_destination_ownership
+  begin_transaction
   install_required_packages
-  install_xray_core
+  run_guarded_service_action xray install_xray_core
   prepare_runtime_directory
   generate_runtime_values
   validate_loaded_runtime_values
@@ -2606,6 +3931,21 @@ deploy_services() {
   staged_xray="$RUNTIME_DIR/xray-config.json"
   render_xray_config "$staged_xray"
   xray run -test -config "$staged_xray"
+
+  if mode_has_hysteria; then
+    staged_hysteria_binary="$RUNTIME_DIR/hysteria"
+    staged_hysteria_config="$RUNTIME_DIR/hysteria-config.yaml"
+    staged_hysteria_acl="$RUNTIME_DIR/hysteria-acl.txt"
+    staged_hysteria_cert="$RUNTIME_DIR/hysteria-server.crt"
+    staged_hysteria_key="$RUNTIME_DIR/hysteria-server.key"
+    staged_hysteria_unit="$RUNTIME_DIR/hysteria-server.service"
+    staged_hysteria_smoke_config="$RUNTIME_DIR/hysteria-smoke.yaml"
+    staged_hysteria_smoke_log="$RUNTIME_DIR/hysteria-smoke.log"
+    stage_hysteria_bundle "$staged_hysteria_binary" "$staged_hysteria_config" \
+      "$staged_hysteria_acl" "$staged_hysteria_cert" "$staged_hysteria_key" \
+      "$staged_hysteria_unit" "$staged_hysteria_smoke_config" "$staged_hysteria_smoke_log"
+  fi
+  validate_loaded_runtime_values
 
   stop_legacy_service_for_cutover
   release_legacy_nginx_listeners
@@ -2625,13 +3965,30 @@ deploy_services() {
   fi
 
   install_validated_xray_config "$staged_xray"
+  if mode_has_hysteria; then
+    ensure_hysteria_account
+    install_validated_hysteria_binary "$staged_hysteria_binary"
+    install_hysteria_runtime_files "$staged_hysteria_config" "$staged_hysteria_acl" \
+      "$staged_hysteria_cert" "$staged_hysteria_key" "$staged_hysteria_unit"
+    write_hysteria_ownership_manifest
+  fi
   systemctl daemon-reload
-  systemctl enable --now xray
-  systemctl restart xray
+  if mode_has_hysteria; then
+    verify_hysteria_service_definition
+  fi
+  run_service_mutation xray enable --now
+  run_service_mutation xray restart
+  if mode_has_hysteria; then
+    run_service_mutation hysteria-server enable --now
+    run_service_mutation hysteria-server restart
+  fi
   if mode_has_cloudflare; then
-    systemctl reload nginx
+    run_service_mutation nginx reload
   fi
   verify_started_services
+  if mode_has_hysteria; then
+    verify_hysteria_runtime_identity
+  fi
 
   disable_legacy_v2ray_after_success
   save_state
@@ -2668,6 +4025,7 @@ activate_transaction_traps() {
 }
 
 complete_transaction() {
+  cleanup_runtime_directory
   release_deployment_lock
   TRANSACTION_ACTIVE="0"
   trap - EXIT ERR INT TERM
@@ -2725,7 +4083,7 @@ if not re.fullmatch(r"(?:[0-9A-F]{2}:){31}[0-9A-F]{2}", pin):
 if not re.fullmatch(r"[1-9][0-9]{0,4}-[1-9][0-9]{0,4}", port_range):
     raise SystemExit("invalid port range")
 start, end = (int(value) for value in port_range.split("-", 1))
-if not (1 <= start <= end <= 65535 and end - start + 1 <= 1000):
+if not (1 <= start <= end <= 65535 and end - start <= 1000):
     raise SystemExit("invalid port range")
 try:
     parsed_address = ipaddress.ip_address(address)
