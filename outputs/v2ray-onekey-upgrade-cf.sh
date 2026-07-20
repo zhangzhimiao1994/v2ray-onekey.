@@ -2765,13 +2765,32 @@ install_xray_core() (
     bash -c "$installer" @ install
 )
 
+create_hysteria_validation_copy() {
+  local source="$1" validation_dir validation_path mode owner
+  [[ -f "$source" && ! -L "$source" && -s "$source" ]] || return 1
+  validation_dir="${HYSTERIA_VALIDATION_DIR:-$(dirname "$HYSTERIA_BIN")}"
+  [[ "$validation_dir" == /* && "$validation_dir" != "/" &&
+    -d "$validation_dir" && ! -L "$validation_dir" ]] || return 1
+  mode="$(stat -c '%a' "$validation_dir" 2>/dev/null)" || return 1
+  owner="$(stat -c '%u' "$validation_dir" 2>/dev/null)" || return 1
+  [[ "$owner" == "0" ]] || return 1
+  (( (8#$mode & 0022) == 0 )) || return 1
+  validation_path="$(mktemp "$validation_dir/.v2ray-onekey-hysteria-validate.XXXXXX")" || return 1
+  if ! install -o root -g root -m 0700 "$source" "$validation_path"; then
+    rm -f -- "$validation_path"
+    return 1
+  fi
+  printf '%s\n' "$validation_path"
+}
+
 stage_hysteria_binary() (
   local staged="$1" staged_dir effective_file="" hashes_file="" effective_url=""
   local release_version="" hashes_url line expected_hash="" actual_hash checksum_output
-  local target_count=0 valid_count=0 keep_binary="0"
+  local target_count=0 valid_count=0 keep_binary="0" validation_binary="" version_output=""
   cleanup_hysteria_download() {
     [[ -z "$effective_file" ]] || rm -f -- "$effective_file" || true
     [[ -z "$hashes_file" ]] || rm -f -- "$hashes_file" || true
+    [[ -z "$validation_binary" ]] || rm -f -- "$validation_binary" || true
     if [[ "$keep_binary" != "1" ]]; then
       rm -f -- "$staged" || true
     fi
@@ -2843,9 +2862,13 @@ stage_hysteria_binary() (
     die "Hysteria2 binary checksum mismatch"
 
   chmod 0700 "$staged" || die "Unable to protect the staged Hysteria2 binary"
-  if ! "$staged" version >/dev/null 2>&1; then
-    die "Hysteria2 version validation failed"
+  validation_binary="$(create_hysteria_validation_copy "$staged")" ||
+    die "Unable to create the Hysteria2 executable validation copy"
+  if ! version_output="$("$validation_binary" version 2>&1)"; then
+    die "Hysteria2 version validation failed: ${version_output:-no diagnostic output}"
   fi
+  rm -f -- "$validation_binary" || die "Unable to remove the Hysteria2 executable validation copy"
+  validation_binary=""
   chmod 0755 "$staged" || die "Unable to finalize the staged Hysteria2 binary"
   keep_binary="1"
 )
@@ -3233,25 +3256,30 @@ verify_hysteria_runtime_identity() {
 }
 
 validate_hysteria_staged() (
-  local binary="$1" config="$2" log_path="$3" status runner_pid=""
+  local binary="$1" config="$2" log_path="$3" status runner_pid="" execution_binary=""
   terminate_hysteria_smoke() {
-    [[ -n "$runner_pid" ]] || return 0
-    kill -TERM -- "-$runner_pid" >/dev/null 2>&1 || kill -TERM "$runner_pid" >/dev/null 2>&1 || true
-    sleep 1
-    kill -KILL -- "-$runner_pid" >/dev/null 2>&1 || kill -KILL "$runner_pid" >/dev/null 2>&1 || true
-    wait "$runner_pid" >/dev/null 2>&1 || true
-    runner_pid=""
+    if [[ -n "$runner_pid" ]]; then
+      kill -TERM -- "-$runner_pid" >/dev/null 2>&1 || kill -TERM "$runner_pid" >/dev/null 2>&1 || true
+      sleep 1
+      kill -KILL -- "-$runner_pid" >/dev/null 2>&1 || kill -KILL "$runner_pid" >/dev/null 2>&1 || true
+      wait "$runner_pid" >/dev/null 2>&1 || true
+      runner_pid=""
+    fi
+    [[ -z "$execution_binary" ]] || rm -f -- "$execution_binary" || true
+    execution_binary=""
   }
   trap terminate_hysteria_smoke EXIT
   trap 'exit 129' HUP
   trap 'exit 130' INT
   trap 'exit 143' TERM
   unexport_sensitive_runtime_values
+  execution_binary="$(create_hysteria_validation_copy "$binary")" ||
+    die "Unable to create the Hysteria2 smoke-test executable copy"
   : >"$log_path"
   chmod 0600 "$log_path"
   set +e
   timeout --signal=TERM --kill-after=2s 4s \
-    "$binary" server -c "$config" >"$log_path" 2>&1 &
+    "$execution_binary" server -c "$config" >"$log_path" 2>&1 &
   runner_pid=$!
   wait "$runner_pid"
   status=$?

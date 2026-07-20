@@ -454,6 +454,7 @@ fi
 cat >"$output" <<'BIN'
 #!/usr/bin/env bash
 printf '%s mode=%s\n' "$*" "$(stat -c '%a' "$0")" >>"$HY2_BINARY_LOG"
+printf '%s\n' "$0" >>"$HY2_EXECUTED_PATH_LOG"
 [[ "${1:-}" == "version" ]]
 BIN
 HY2_DOWNLOADED_BINARY="$output"
@@ -470,8 +471,12 @@ EOF
   chmod +x "$temp_dir/bin/curl"
   : >"$temp_dir/curl.log"
   : >"$temp_dir/binary.log"
+  : >"$temp_dir/executed-path.log"
   export HY2_CURL_LOG="$temp_dir/curl.log" HY2_BINARY_LOG="$temp_dir/binary.log"
+  export HY2_EXECUTED_PATH_LOG="$temp_dir/executed-path.log"
   export HY2_DOWNLOADED_BINARY="$temp_dir/runtime/hysteria"
+  HYSTERIA_VALIDATION_DIR="$temp_dir/validation-bin"
+  install -d -m 700 "$HYSTERIA_VALIDATION_DIR"
   PATH="$temp_dir/bin:$PATH"
   HY2_CURL_SCENARIO="success"
   export HY2_CURL_SCENARIO
@@ -491,6 +496,10 @@ EOF
     "$temp_dir/curl.log" || fail "Hysteria2 hashes URL did not use the exact binary release"
   assert_eq "version mode=700" "$(cat "$temp_dir/binary.log")" \
     "Hysteria2 binary must execute privately only after checksum validation"
+  executed_path="$(cat "$temp_dir/executed-path.log")"
+  [[ "$executed_path" == "$HYSTERIA_VALIDATION_DIR"/.v2ray-onekey-hysteria-validate.* ]] ||
+    fail "Hysteria2 validation did not use the executable validation directory"
+  [[ ! -e "$executed_path" ]] || fail "Hysteria2 executable validation copy was not removed"
   [[ -z "$(find "$temp_dir/runtime" -maxdepth 1 -type f \
     \( -name '.hysteria-effective.*' -o -name '.hysteria-hashes.*' \) -print -quit)" ]] ||
     fail "successful Hysteria2 staging leaked checksum temporary files"
@@ -518,7 +527,8 @@ EOF
       fail "failed Hysteria2 staging leaked checksum temporary files for $scenario"
   done
   PATH="$old_path"
-  unset HY2_CURL_LOG HY2_BINARY_LOG HY2_CURL_SCENARIO HY2_DOWNLOADED_BINARY
+  unset HY2_CURL_LOG HY2_BINARY_LOG HY2_EXECUTED_PATH_LOG HY2_CURL_SCENARIO \
+    HY2_DOWNLOADED_BINARY HYSTERIA_VALIDATION_DIR
 
   reset_options
   MODE="direct"
