@@ -4892,6 +4892,7 @@ test_task6_direct_without_project_nginx_has_zero_nginx_calls() (
   }
   record_service_states
   grep -Fqx nginx "$command_log" && fail "direct transaction inspected unrelated Nginx service state"
+  return 0
 )
 
 test_task6_direct_without_project_nginx_has_zero_nginx_calls
