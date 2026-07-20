@@ -87,6 +87,39 @@ if upgrade_nginx_path_matches; then
   exit 1
 fi
 
+XRAY_CONFIG="$permission_root/existing-full-xray.json"
+CLOUDFLARE_UUID="22222222-2222-4222-8222-222222222222"
+WS_PATH="/legacy-ws-path"
+INTERNAL_WS_PORT="31814"
+cat >"$XRAY_CONFIG" <<'JSON'
+{
+  "inbounds": [
+    {
+      "listen": "127.0.0.1",
+      "port": 31814,
+      "protocol": "vless",
+      "settings": {
+        "clients": [{"id": "22222222-2222-4222-8222-222222222222"}]
+      },
+      "streamSettings": {
+        "network": "ws",
+        "security": "none",
+        "wsSettings": {"path": "/legacy-ws-path"}
+      }
+    },
+    {
+      "port": 8388,
+      "protocol": "shadowsocks",
+      "settings": {"method": "2022-blake3-aes-128-gcm", "password": "test"}
+    }
+  ]
+}
+JSON
+inspect_existing_cloudflare_xray || {
+  printf 'existing Cloudflare inbound was confused with the trailing Shadowsocks inbound\n' >&2
+  exit 1
+}
+
 DOMAIN="vpn.example.com"
 LETSENCRYPT_LIVE_ROOT="$permission_root/letsencrypt/live"
 archive_dir="$permission_root/letsencrypt/archive/$DOMAIN"

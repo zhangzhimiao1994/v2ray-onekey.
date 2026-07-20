@@ -4437,6 +4437,7 @@ for inbound in config.get("inbounds", []):
 if len(matches) != 1:
     raise SystemExit("Existing Xray configuration must contain exactly one project Cloudflare WebSocket inbound")
 inbound = matches[0]
+stream = inbound.get("streamSettings", {})
 clients = inbound.get("settings", {}).get("clients", [])
 paths = stream.get("wsSettings", {}).get("path")
 if (str(inbound.get("port")) != wanted_port or paths != wanted_path or
