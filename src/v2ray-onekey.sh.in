@@ -1698,6 +1698,16 @@ backup_file() {
   fi
 }
 
+backup_payload_matches_current_file() {
+  local backup_path="$1" current_path="$2" backup_identity current_identity
+  [[ -f "$backup_path" && ! -L "$backup_path" ]] || return 1
+  [[ -f "$current_path" && ! -L "$current_path" ]] || return 1
+  cmp -s -- "$backup_path" "$current_path" || return 1
+  backup_identity="$(stat -c '%u:%g:%a:%s:%y' "$backup_path" 2>/dev/null)" || return 1
+  current_identity="$(stat -c '%u:%g:%a:%s:%y' "$current_path" 2>/dev/null)" || return 1
+  [[ "$backup_identity" == "$current_identity" ]]
+}
+
 systemd_property_value() {
   local service="$1" property="$2" output="" status=0
   output="$(systemctl show -p "$property" --value "$service" 2>/dev/null)" || status=$?
@@ -2166,6 +2176,9 @@ rollback_current_run() {
         warn "Missing backup payload: $path"
         continue
       }
+      if backup_payload_matches_current_file "$backup_path" "$path"; then
+        continue
+      fi
       mkdir -p "$(dirname "$path")"
       rm -f -- "$path"
       cp -a -- "$backup_path" "$path"
@@ -2383,6 +2396,7 @@ project_service_proc_root() {
 inspect_hysteria_runtime_identity() {
   local pid="${1:-}" proc_root status_file runtime_identity executable command_line
   local loaded_user loaded_group field value numeric account_ids account_uid account_gid
+  local current_digest runtime_digest
   local expected_cap_mask=$(( (1 << 10) | (1 << 12) ))
   [[ "$pid" =~ ^[1-9][0-9]*$ ]] || {
     printf 'Hysteria2 does not have a live MainPID\n'
@@ -2423,10 +2437,25 @@ inspect_hysteria_runtime_identity() {
     printf 'Unable to inspect the Hysteria2 runtime executable\n'
     return 1
   }
-  [[ "$executable" == "$HYSTERIA_BIN" ]] || {
+  if [[ "$executable" == "$HYSTERIA_BIN (deleted)" ]]; then
+    current_digest="$(sha256sum -- "$HYSTERIA_BIN" 2>/dev/null)" || {
+      printf 'Unable to hash the current Hysteria2 executable\n'
+      return 1
+    }
+    runtime_digest="$(sha256sum -- "$proc_root/$pid/exe" 2>/dev/null)" || {
+      printf 'Unable to hash the deleted Hysteria2 runtime executable\n'
+      return 1
+    }
+    current_digest="${current_digest%% *}"
+    runtime_digest="${runtime_digest%% *}"
+    [[ "$current_digest" =~ ^[0-9a-f]{64}$ && "$runtime_digest" == "$current_digest" ]] || {
+      printf 'Deleted Hysteria2 runtime executable does not match the managed binary\n'
+      return 1
+    }
+  elif [[ "$executable" != "$HYSTERIA_BIN" ]]; then
     printf 'Hysteria2 is running an unexpected executable: %s\n' "$executable"
     return 1
-  }
+  fi
   command_line="$(tr '\0' ' ' <"$proc_root/$pid/cmdline" 2>/dev/null)" || {
     printf 'Unable to inspect the Hysteria2 runtime command line\n'
     return 1

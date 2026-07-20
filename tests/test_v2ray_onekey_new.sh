@@ -2181,6 +2181,13 @@ EOF
   assert_eq "2" "$(wc -l <"$BACKUP_DIR/manifest" | tr -d ' ')" "duplicate manifest entries"
   assert_eq "700" "$(stat -c '%a' "$BACKUP_DIR")" "backup directory mode"
   assert_eq "600" "$(stat -c '%a' "$BACKUP_DIR/manifest")" "manifest mode"
+  local untouched_link="$temp_dir/untouched-config-link"
+  ln "$XRAY_CONFIG" "$untouched_link"
+  systemctl() { :; }
+  rollback_current_run
+  [[ "$XRAY_CONFIG" -ef "$untouched_link" ]] ||
+    fail "rollback replaced an untouched managed file inode"
+  rm -f "$untouched_link"
   ln -s "$XRAY_CONFIG" "$temp_dir/symlink"
   original_mode="$XRAY_CONFIG"
   XRAY_CONFIG="$temp_dir/symlink"
@@ -2821,6 +2828,22 @@ EOF
       command stat "$@"
     fi
   }
+  readlink() {
+    local path="${*: -1}"
+    if [[ "$path" == "$SERVICE_PROC_ROOT/4242/exe" && "$runtime_mode" == deleted-* ]]; then
+      printf '%s (deleted)\n' "$HYSTERIA_BIN"
+    else
+      command readlink "$@"
+    fi
+  }
+  sha256sum() {
+    local path="${*: -1}"
+    if [[ "$path" == "$SERVICE_PROC_ROOT/4242/exe" && "$runtime_mode" == "deleted-mismatch" ]]; then
+      printf '%064d  %s\n' 0 "$path"
+    else
+      command sha256sum "$@"
+    fi
+  }
   ss() {
     case "$*:$listener_mode" in
       *'-H -lnup'*':20000:owned')
@@ -2889,6 +2912,19 @@ EOF
   [[ ! -e "$stop_log" ]] || fail "Hysteria2 process without NoNewPrivileges was stopped"
   sed -i 's/NoNewPrivs:\t0/NoNewPrivs:\t1/' "$SERVICE_PROC_ROOT/4242/status"
 
+  runtime_mode="deleted-identical"
+  hysteria_range_conflicts && fail "matching deleted Hysteria2 executable blocked a rerun"
+  : >"$stop_log"
+  stop_project_hysteria_for_cutover
+  grep -Fqx 'stop' "$stop_log" || fail "matching deleted Hysteria2 executable was not stopped for recovery"
+
+  runtime_mode="deleted-mismatch"
+  : >"$stop_log"
+  hysteria_range_conflicts || fail "mismatched deleted Hysteria2 executable was treated as project-owned"
+  assert_fails "Refusing to stop" stop_project_hysteria_for_cutover
+  [[ ! -s "$stop_log" ]] || fail "mismatched deleted Hysteria2 executable was stopped"
+
+  runtime_mode="valid"
   hysteria_range_conflicts && fail "fully valid old Hysteria2 process blocked a rerun"
   stop_project_hysteria_for_cutover
   grep -Fqx 'stop' "$stop_log" || fail "fully valid old Hysteria2 process was not stopped for cutover"
