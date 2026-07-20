@@ -859,6 +859,7 @@ import urllib.parse
 
 links = os.fdopen(3, "rb").read().decode("utf-8").split("\0")[:-1]
 expected_hosts = ["192.0.2.10", "2001:db8::10", "vpn.example.net", "vpn.example.net"]
+compact_pin = sys.argv[4].replace(":", "")
 for link, host in zip(links, expected_hosts):
     parsed = urllib.parse.urlsplit(link)
     assert parsed.scheme == "hysteria2"
@@ -871,7 +872,8 @@ for link, host in zip(links, expected_hosts):
         "obfs-password": [sys.argv[2]],
         "sni": [sys.argv[3]],
         "insecure": ["1"],
-        "pinSHA256": [sys.argv[4]],
+        "pcs": [compact_pin],
+        "pinSHA256": [compact_pin],
     }
     assert urllib.parse.unquote(parsed.fragment) == "Hysteria2-direct"
 assert "@[2001:db8::10]:20000-20100" in links[1]

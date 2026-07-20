@@ -4620,7 +4620,7 @@ make_shadowsocks_link() {
 }
 
 make_hysteria_link() {
-  local link_status="0" port_spec
+  local link_status="0" port_spec compact_pin
   unexport_sensitive_runtime_values
   if ! valid_server_address "$SERVER_ADDRESS" ||
     ! valid_hy2_port_range "$HY2_PORT_RANGE" ||
@@ -4632,9 +4632,12 @@ make_hysteria_link() {
   fi
   port_spec="$(hysteria_effective_port_spec "$HY2_PORT_RANGE")" ||
     die "Invalid Hysteria2 port specification"
+  compact_pin="${HY2_CERT_PIN//:/}"
+  [[ "$compact_pin" =~ ^[0-9A-F]{64}$ ]] ||
+    die "Invalid compact Hysteria2 certificate pin"
   printf '%s\0%s\0%s\0%s\0%s\0%s\0' \
     "$HY2_AUTH" "$SERVER_ADDRESS" "$port_spec" \
-    "$HY2_OBFS_PASSWORD" "$HY2_SNI" "$HY2_CERT_PIN" |
+    "$HY2_OBFS_PASSWORD" "$HY2_SNI" "$compact_pin" |
     python3 - 3<&0 <<'PY' || link_status=$?
 import ipaddress
 import os
@@ -4652,7 +4655,7 @@ if not re.fullmatch(r"[A-Za-z0-9_-]{43}", obfs_password):
     raise SystemExit("invalid obfuscation password")
 if not re.fullmatch(r"[0-9a-f]{16}\.invalid", sni):
     raise SystemExit("invalid SNI")
-if not re.fullmatch(r"(?:[0-9A-F]{2}:){31}[0-9A-F]{2}", pin):
+if not re.fullmatch(r"[0-9A-F]{64}", pin):
     raise SystemExit("invalid certificate pin")
 if not re.fullmatch(r"[1-9][0-9]{0,4}(?:-[1-9][0-9]{0,4})?", port_range):
     raise SystemExit("invalid port specification")
@@ -4676,6 +4679,7 @@ query = urllib.parse.urlencode(
         ("obfs-password", obfs_password),
         ("sni", sni),
         ("insecure", "1"),
+        ("pcs", pin),
         ("pinSHA256", pin),
     ],
     quote_via=urllib.parse.quote,
