@@ -753,6 +753,14 @@ generate_runtime_values() {
   fi
 }
 
+validate_pre_certificate_runtime_values() {
+  if mode_has_hysteria && [[ -z "$HY2_CERT_PIN" ]]; then
+    validate_loaded_runtime_values 1
+  else
+    validate_loaded_runtime_values
+  fi
+}
+
 rotate_runtime_values() {
   unexport_sensitive_runtime_values
   CLOUDFLARE_UUID=""
@@ -4047,7 +4055,7 @@ install_mode_dependencies() {
 generate_mode_credentials() {
   prepare_runtime_directory
   generate_runtime_values
-  validate_loaded_runtime_values
+  validate_pre_certificate_runtime_values
 }
 
 stage_mode_configurations() {
@@ -4406,7 +4414,7 @@ stage_upgrade_configurations() {
   prepare_runtime_directory
   rotate_upgrade_direct_values
   generate_runtime_values
-  validate_loaded_runtime_values
+  validate_pre_certificate_runtime_values
   STAGED_XRAY="$RUNTIME_DIR/xray-config.json"
   render_xray_config "$STAGED_XRAY"
   STAGED_HYSTERIA_BINARY="$RUNTIME_DIR/hysteria"

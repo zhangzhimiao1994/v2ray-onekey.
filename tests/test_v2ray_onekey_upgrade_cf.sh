@@ -106,4 +106,20 @@ if upgrade_certificate_is_safe "$live_dir/fullchain.pem"; then
   exit 1
 fi
 
+validation_mode=""
+validate_loaded_runtime_values() { validation_mode="${1:-strict}"; }
+MODE="full"
+HY2_CERT_PIN=""
+validate_pre_certificate_runtime_values
+[[ "$validation_mode" == "1" ]] || {
+  printf 'missing bootstrap Hysteria2 pin was validated strictly before certificate generation\n' >&2
+  exit 1
+}
+HY2_CERT_PIN="AA:BB"
+validate_pre_certificate_runtime_values
+[[ "$validation_mode" == "strict" ]] || {
+  printf 'existing Hysteria2 pin did not use strict validation\n' >&2
+  exit 1
+}
+
 printf 'PASS: existing Cloudflare upgrade installer tests\n'
