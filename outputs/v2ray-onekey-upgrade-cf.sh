@@ -30,6 +30,7 @@ CLOUDFLARE_CONNECT_TIMEOUT="${CLOUDFLARE_CONNECT_TIMEOUT:-10}"
 CLOUDFLARE_MAX_TIME="${CLOUDFLARE_MAX_TIME:-30}"
 LISTENER_WAIT_ATTEMPTS="${LISTENER_WAIT_ATTEMPTS:-15}"
 LISTENER_WAIT_INTERVAL="${LISTENER_WAIT_INTERVAL:-1}"
+HYSTERIA_START_WAIT_ATTEMPTS="${HYSTERIA_START_WAIT_ATTEMPTS:-3}"
 TRANSACTION_ACTIVE="0"
 LOCK_HELD="0"
 LEGACY_NGINX_FILES_CHANGED="0"
@@ -145,6 +146,20 @@ valid_hy2_port_range() {
 normalize_hy2_port_range() {
   [[ "${1:-}" =~ ^([0-9]+)-([0-9]+)$ ]] || return 1
   printf '%s-%s\n' "$(normalize_port "${BASH_REMATCH[1]}")" "$(normalize_port "${BASH_REMATCH[2]}")"
+}
+
+hysteria_effective_port_spec() {
+  parse_port_range "${1:-$HY2_PORT_RANGE}" || return 1
+  if [[ "$HY2_PORT_START" == "$HY2_PORT_END" ]]; then
+    printf '%s\n' "$HY2_PORT_START"
+  else
+    printf '%s-%s\n' "$HY2_PORT_START" "$HY2_PORT_END"
+  fi
+}
+
+hysteria_port_hopping_enabled() {
+  parse_port_range "${1:-$HY2_PORT_RANGE}" || return 1
+  ((10#$HY2_PORT_START < 10#$HY2_PORT_END))
 }
 
 valid_server_address() {
@@ -2116,10 +2131,20 @@ rollback_hysteria_account() {
   while IFS=$'\t' read -r name user_state group_state; do
     [[ "$name" == "hysteria" ]] || continue
     if [[ "$user_state" == "created" ]]; then
-      userdel hysteria >/dev/null 2>&1 || warn "Could not remove the current-run Hysteria2 user"
+      if id hysteria >/dev/null 2>&1; then
+        userdel hysteria >/dev/null 2>&1 || true
+      fi
+      if id hysteria >/dev/null 2>&1; then
+        warn "Could not remove the current-run Hysteria2 user"
+      fi
     fi
     if [[ "$group_state" == "created" ]]; then
-      groupdel hysteria >/dev/null 2>&1 || warn "Could not remove the current-run Hysteria2 group"
+      if getent group hysteria >/dev/null 2>&1; then
+        groupdel hysteria >/dev/null 2>&1 || true
+      fi
+      if getent group hysteria >/dev/null 2>&1; then
+        warn "Could not remove the current-run Hysteria2 group"
+      fi
     fi
   done <"$BACKUP_DIR/accounts"
 }
@@ -3054,7 +3079,12 @@ render_hysteria_config() (
     normalized_port="$(normalize_port "$listen_value")"
     listen_value="$normalized_port"
   else
-    valid_hy2_port_range "$listen_value" || die "Invalid Hysteria2 listen port or range"
+    parse_port_range "$listen_value" || die "Invalid Hysteria2 listen port or range"
+    if [[ "$HY2_PORT_START" == "$HY2_PORT_END" ]]; then
+      listen_value="$HY2_PORT_START"
+    else
+      listen_value="$HY2_PORT_START-$HY2_PORT_END"
+    fi
   fi
   valid_hy2_secret "$HY2_AUTH" || die "Invalid Hysteria2 authentication value"
   valid_hy2_secret "$HY2_OBFS_PASSWORD" || die "Invalid Hysteria2 obfuscation value"
@@ -3214,6 +3244,22 @@ install_hysteria_runtime_files() {
   install -o root -g root -m 0644 "$staged_unit" "$HYSTERIA_UNIT"
 }
 
+install_hysteria_config_atomically() {
+  local staged="$1" config_dir temp_path
+  [[ -f "$staged" && ! -L "$staged" && -s "$staged" ]] ||
+    die "Invalid Hysteria2 fallback config"
+  config_dir="$(dirname "$HYSTERIA_CONFIG")"
+  [[ -d "$config_dir" && ! -L "$config_dir" ]] ||
+    die "Hysteria2 configuration directory is unavailable during fallback"
+  temp_path="$(mktemp "$config_dir/.config.yaml.XXXXXX")" ||
+    die "Unable to stage the Hysteria2 fallback config"
+  if ! install -o root -g hysteria -m 0440 "$staged" "$temp_path" ||
+    ! mv -f -- "$temp_path" "$HYSTERIA_CONFIG"; then
+    rm -f -- "$temp_path"
+    die "Unable to install the Hysteria2 fallback config"
+  fi
+}
+
 verify_hysteria_service_definition() {
   local loaded_user loaded_group loaded_unit path identity
   loaded_user="$(systemctl show -p User --value hysteria-server 2>/dev/null)" ||
@@ -3302,8 +3348,12 @@ hysteria_certificate_pin() {
 }
 
 require_hysteria_port_hopping_backend() {
-  command -v nft >/dev/null 2>&1 || command -v iptables >/dev/null 2>&1 ||
-    die "Hysteria2 port hopping requires nftables or iptables"
+  parse_port_range "$HY2_PORT_RANGE" || die "Invalid Hysteria2 UDP range"
+  [[ "$HY2_PORT_START" != "$HY2_PORT_END" ]] || return 0
+  if ! command -v nft >/dev/null 2>&1 && ! command -v iptables >/dev/null 2>&1; then
+    warn "No nftables or iptables backend is available; using Hysteria2 single-port mode on UDP $HY2_PORT_START."
+    HY2_PORT_RANGE="$HY2_PORT_START-$HY2_PORT_START"
+  fi
 }
 
 select_hysteria_smoke_port() {
@@ -3904,6 +3954,48 @@ protocol_listener_output() {
   esac
 }
 
+hysteria_service_ready() {
+  local output
+  systemctl is-active --quiet hysteria-server || return 1
+  parse_port_range "$HY2_PORT_RANGE" || return 1
+  output="$(protocol_listener_output udp "$HY2_PORT_START")" || return 1
+  [[ -n "$output" && "$output" == *hysteria* ]]
+}
+
+wait_for_hysteria_service_readiness() {
+  local attempts="${1:-$HYSTERIA_START_WAIT_ATTEMPTS}" attempt
+  [[ "$attempts" =~ ^[1-9][0-9]*$ ]] || return 2
+  for ((attempt = 1; attempt <= attempts; attempt++)); do
+    hysteria_service_ready && return 0
+    ((attempt < attempts)) && sleep "$LISTENER_WAIT_INTERVAL"
+  done
+  return 1
+}
+
+fallback_hysteria_to_single_port() {
+  local single_port fallback_config
+  hysteria_port_hopping_enabled "$HY2_PORT_RANGE" || return 1
+  single_port="$HY2_PORT_START"
+  fallback_config="$RUNTIME_DIR/hysteria-config-single-port.yaml"
+  warn "Hysteria2 port hopping could not start on this host; automatically falling back to UDP $single_port."
+  HY2_PORT_RANGE="$single_port-$single_port"
+  render_hysteria_config "$fallback_config" "$HYSTERIA_CERT" "$HYSTERIA_KEY" \
+    "$HYSTERIA_ACL" "$single_port"
+  install_hysteria_config_atomically "$fallback_config"
+  write_hysteria_ownership_manifest
+  run_service_mutation hysteria-server restart
+}
+
+ensure_hysteria_service_ready() {
+  wait_for_hysteria_service_readiness "$HYSTERIA_START_WAIT_ATTEMPTS" && return 0
+  if hysteria_port_hopping_enabled "$HY2_PORT_RANGE"; then
+    fallback_hysteria_to_single_port
+    wait_for_hysteria_service_readiness "$LISTENER_WAIT_ATTEMPTS" && return 0
+  fi
+  print_multi_protocol_diagnostics
+  die "Hysteria2 readiness timed out, including the automatic single-port fallback"
+}
+
 multi_protocol_services_ready() {
   local output
   systemctl is-active --quiet xray || return 1
@@ -3914,10 +4006,7 @@ multi_protocol_services_ready() {
     [[ -n "$output" && "$output" == *xray* ]] || return 1
   fi
   if mode_has_hysteria; then
-    systemctl is-active --quiet hysteria-server || return 1
-    parse_port_range "$HY2_PORT_RANGE" || return 1
-    output="$(protocol_listener_output udp "$HY2_PORT_START")" || return 1
-    [[ -n "$output" && "$output" == *hysteria* ]] || return 1
+    hysteria_service_ready || return 1
   fi
 }
 
@@ -3982,7 +4071,11 @@ configure_firewall() {
   fi
   if mode_has_hysteria; then
     parse_port_range "$HY2_PORT_RANGE" || die "Invalid Hysteria2 UDP range"
-    open_firewall_range "$HY2_PORT_START" "$HY2_PORT_END" udp
+    if [[ "$HY2_PORT_START" == "$HY2_PORT_END" ]]; then
+      open_firewall_port "$HY2_PORT_START" udp
+    else
+      open_firewall_range "$HY2_PORT_START" "$HY2_PORT_END" udp
+    fi
   fi
 }
 
@@ -3994,7 +4087,7 @@ required_public_ports() {
     printf 'TCP %s\nUDP %s\n' "$SS_PORT" "$SS_PORT"
   fi
   if mode_has_hysteria; then
-    printf 'UDP %s\n' "$HY2_PORT_RANGE"
+    printf 'UDP %s\n' "$(hysteria_effective_port_spec "$HY2_PORT_RANGE")"
   fi
 }
 
@@ -4026,7 +4119,7 @@ print_deployment_summary() {
   if mode_has_hysteria; then
     diagnostics+=' hysteria-server'
     journals="journalctl -u xray -u hysteria-server -e"
-    udp_ports+=("$HY2_PORT_RANGE")
+    udp_ports+=("$(hysteria_effective_port_spec "$HY2_PORT_RANGE")")
   fi
   if mode_has_cloudflare; then
     printf 'Diagnostics: %s; %s; nginx -t\n' "$diagnostics" "$journals"
@@ -4165,6 +4258,9 @@ start_mode_services() {
 }
 
 verify_mode_services() {
+  if mode_has_hysteria; then
+    ensure_hysteria_service_ready
+  fi
   verify_started_services
   if mode_has_hysteria; then
     verify_hysteria_runtime_identity
@@ -4524,7 +4620,7 @@ make_shadowsocks_link() {
 }
 
 make_hysteria_link() {
-  local link_status="0"
+  local link_status="0" port_spec
   unexport_sensitive_runtime_values
   if ! valid_server_address "$SERVER_ADDRESS" ||
     ! valid_hy2_port_range "$HY2_PORT_RANGE" ||
@@ -4534,8 +4630,10 @@ make_hysteria_link() {
     ! valid_hy2_cert_pin "$HY2_CERT_PIN"; then
     die "Invalid Hysteria2 link values"
   fi
+  port_spec="$(hysteria_effective_port_spec "$HY2_PORT_RANGE")" ||
+    die "Invalid Hysteria2 port specification"
   printf '%s\0%s\0%s\0%s\0%s\0%s\0' \
-    "$HY2_AUTH" "$SERVER_ADDRESS" "$HY2_PORT_RANGE" \
+    "$HY2_AUTH" "$SERVER_ADDRESS" "$port_spec" \
     "$HY2_OBFS_PASSWORD" "$HY2_SNI" "$HY2_CERT_PIN" |
     python3 - 3<&0 <<'PY' || link_status=$?
 import ipaddress
@@ -4556,11 +4654,14 @@ if not re.fullmatch(r"[0-9a-f]{16}\.invalid", sni):
     raise SystemExit("invalid SNI")
 if not re.fullmatch(r"(?:[0-9A-F]{2}:){31}[0-9A-F]{2}", pin):
     raise SystemExit("invalid certificate pin")
-if not re.fullmatch(r"[1-9][0-9]{0,4}-[1-9][0-9]{0,4}", port_range):
-    raise SystemExit("invalid port range")
-start, end = (int(value) for value in port_range.split("-", 1))
+if not re.fullmatch(r"[1-9][0-9]{0,4}(?:-[1-9][0-9]{0,4})?", port_range):
+    raise SystemExit("invalid port specification")
+if "-" in port_range:
+    start, end = (int(value) for value in port_range.split("-", 1))
+else:
+    start = end = int(port_range)
 if not (1 <= start <= end <= 65535 and end - start <= 1000):
-    raise SystemExit("invalid port range")
+    raise SystemExit("invalid port specification")
 try:
     parsed_address = ipaddress.ip_address(address)
 except ValueError:
@@ -4586,7 +4687,7 @@ parsed = urllib.parse.urlsplit(link)
 if parsed.scheme != "hysteria2" or parsed.hostname != host.strip("[]"):
     raise SystemExit("URI validation failed")
 if not parsed.netloc.endswith(":" + port_range):
-    raise SystemExit("URI port range validation failed")
+    raise SystemExit("URI port validation failed")
 parsed_query = urllib.parse.parse_qs(parsed.query, strict_parsing=True)
 if parsed_query.get("obfs") != ["salamander"]:
     raise SystemExit("URI query validation failed")

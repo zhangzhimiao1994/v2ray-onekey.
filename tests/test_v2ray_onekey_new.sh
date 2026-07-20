@@ -3857,8 +3857,8 @@ EOF
   printf 'hysteria-server\n' >"$BACKUP_DIR/services-touched"
   chmod 0600 "$BACKUP_DIR/services-touched"
   systemctl() { printf '%s\n' "$*" >>"$service_log"; }
-  userdel() { printf 'userdel %s\n' "$*" >>"$account_log"; }
-  groupdel() { printf 'groupdel %s\n' "$*" >>"$account_log"; }
+  userdel() { account_user=0; printf 'userdel %s\n' "$*" >>"$account_log"; }
+  groupdel() { account_group=0; printf 'groupdel %s\n' "$*" >>"$account_log"; }
   printf 'new-binary\n' >"$HYSTERIA_BIN"
   rollback_current_run
   assert_eq "project-owned-hysteria" "$(cat "$HYSTERIA_BIN")" "Hysteria2 binary rollback"
@@ -4171,7 +4171,7 @@ test_task5_refuses_every_unproved_hysteria_deployment_before_mutation
 printf 'PASS: Task 5 third-party Hysteria preflight tests\n'
 
 test_task5_hysteria_directory_transaction_rollback() (
-  local temp_dir config_dir path account_log
+  local temp_dir config_dir path account_log account_user=1 account_group=1
   temp_dir="$(mktemp -d)"
   trap 'rm -rf "$temp_dir"' RETURN
   HYSTERIA_BIN="$temp_dir/usr/local/bin/hysteria"
@@ -4191,10 +4191,13 @@ test_task5_hysteria_directory_transaction_rollback() (
   MODE="direct"
   RUNTIME_DIR=""
   systemctl() { :; }
-  userdel() { printf 'userdel %s\n' "$*" >>"$account_log"; }
+  id() { [[ "$account_user" == "1" ]]; }
+  getent() { [[ "$account_group" == "1" ]]; }
+  userdel() { account_user=0; printf 'userdel %s\n' "$*" >>"$account_log"; }
   groupdel() {
     [[ ! -d "$config_dir" || "$(stat -c '%g' "$config_dir")" == "0" ]] ||
       fail "Hysteria directory still referenced the deleted group"
+    account_group=0
     printf 'groupdel %s\n' "$*" >>"$account_log"
   }
 
@@ -4211,6 +4214,8 @@ test_task5_hysteria_directory_transaction_rollback() (
   grep -Fq 'groupdel hysteria' "$account_log" || fail "fresh failed install did not remove its group"
 
   : >"$account_log"
+  account_user=1
+  account_group=1
   BACKUP_DIR="$temp_dir/fresh-external-backup"
   init_backup_metadata
   record_hysteria_directory_state
@@ -5079,5 +5084,121 @@ test_task6_mode_specific_output() (
 
 test_task6_mode_specific_output
 printf 'PASS: Task 6 mode-specific output tests\n'
+
+test_hysteria_single_port_compatibility() (
+  local temp_dir link firewall_log old_path
+  temp_dir="$(mktemp -d)"
+  trap 'rm -rf "$temp_dir"' RETURN
+  MODE="direct"
+  HY2_PORT_RANGE="20000-20000"
+  HY2_AUTH="$HY2_TEST_AUTH"
+  HY2_OBFS_PASSWORD="$HY2_TEST_OBFS"
+  HY2_SNI="$HY2_TEST_SNI"
+  HY2_CERT_PIN="$HY2_TEST_PIN"
+  SERVER_ADDRESS="192.0.2.10"
+
+  old_path="$PATH"
+  install -d "$temp_dir/empty-path"
+  HY2_PORT_RANGE="21000-21100"
+  PATH="$temp_dir/empty-path"
+  require_hysteria_port_hopping_backend >/dev/null
+  PATH="$old_path"
+  assert_eq "21000-21000" "$HY2_PORT_RANGE" \
+    "missing port-hopping backend single-port fallback"
+  HY2_PORT_RANGE="20000-20000"
+
+  render_hysteria_config "$temp_dir/config.yaml" "$temp_dir/server.crt" \
+    "$temp_dir/server.key" "$temp_dir/acl.txt"
+  grep -Fqx 'listen: ":20000"' "$temp_dir/config.yaml" ||
+    fail "equal Hysteria2 range was not rendered as a single listen port"
+  grep -Fq 'listen: ":20000-20000"' "$temp_dir/config.yaml" &&
+    fail "equal Hysteria2 range still enabled the port-hopping backend"
+
+  link="$(make_hysteria_link)"
+  [[ "$link" == hysteria2://*'@192.0.2.10:20000/'* ]] ||
+    fail "single-port Hysteria2 sharing link is invalid: $link"
+  [[ "$link" != *':20000-20000/'* ]] ||
+    fail "single-port Hysteria2 sharing link still contains an equal range"
+
+  firewall_log="$temp_dir/firewall.log"
+  mode_has_cloudflare() { return 1; }
+  mode_has_shadowsocks() { return 1; }
+  mode_has_hysteria() { return 0; }
+  open_firewall_port() { printf 'port %s %s\n' "$1" "$2" >>"$firewall_log"; }
+  open_firewall_range() { printf 'range %s %s %s\n' "$1" "$2" "$3" >>"$firewall_log"; }
+  configure_firewall
+  assert_eq 'port 20000 udp' "$(cat "$firewall_log")" \
+    "single-port Hysteria2 firewall rule"
+  assert_eq 'UDP 20000' "$(required_public_ports)" \
+    "single-port Hysteria2 public port guidance"
+)
+
+test_hysteria_single_port_compatibility
+printf 'PASS: Hysteria2 single-port compatibility tests\n'
+
+test_hysteria_runtime_falls_back_to_single_port() (
+  local temp_dir event_log
+  temp_dir="$(mktemp -d)"
+  trap 'rm -rf "$temp_dir"' RETURN
+  MODE="direct"
+  HY2_PORT_RANGE="20000-20100"
+  HY2_AUTH="$HY2_TEST_AUTH"
+  HY2_OBFS_PASSWORD="$HY2_TEST_OBFS"
+  HYSTERIA_CONFIG="$temp_dir/etc/hysteria/config.yaml"
+  HYSTERIA_CERT="$temp_dir/etc/hysteria/server.crt"
+  HYSTERIA_KEY="$temp_dir/etc/hysteria/server.key"
+  HYSTERIA_ACL="$temp_dir/etc/hysteria/acl.txt"
+  RUNTIME_DIR="$temp_dir/run"
+  event_log="$temp_dir/events.log"
+  install -d "$RUNTIME_DIR" "$(dirname "$HYSTERIA_CONFIG")"
+
+  hysteria_service_ready() {
+    [[ "$HY2_PORT_RANGE" == "20000-20000" ]]
+  }
+  sleep() { :; }
+  install_hysteria_config_atomically() {
+    cp "$1" "$HYSTERIA_CONFIG"
+    printf 'install\n' >>"$event_log"
+  }
+  write_hysteria_ownership_manifest() { printf 'manifest\n' >>"$event_log"; }
+  run_service_mutation() { printf '%s %s\n' "$1" "$2" >>"$event_log"; }
+
+  ensure_hysteria_service_ready
+  assert_eq "20000-20000" "$HY2_PORT_RANGE" \
+    "runtime fallback effective Hysteria2 range"
+  grep -Fqx 'listen: ":20000"' "$HYSTERIA_CONFIG" ||
+    fail "runtime fallback did not install a single-port Hysteria2 config"
+  assert_eq $'install\nmanifest\nhysteria-server restart' "$(cat "$event_log")" \
+    "runtime fallback mutation order"
+)
+
+test_hysteria_runtime_falls_back_to_single_port
+printf 'PASS: Hysteria2 runtime fallback tests\n'
+
+test_hysteria_account_rollback_accepts_automatic_group_removal() (
+  local temp_dir account_user=1 account_group=1 command_log output
+  temp_dir="$(mktemp -d)"
+  trap 'rm -rf "$temp_dir"' RETURN
+  BACKUP_DIR="$temp_dir/backup"
+  install -d "$BACKUP_DIR"
+  printf 'hysteria\tcreated\tcreated\n' >"$BACKUP_DIR/accounts"
+  command_log="$temp_dir/commands.log"
+  id() { [[ "$account_user" == "1" ]]; }
+  getent() { [[ "$account_group" == "1" ]]; }
+  userdel() {
+    printf 'userdel %s\n' "$*" >>"$command_log"
+    account_user=0
+    account_group=0
+  }
+  groupdel() { printf 'groupdel %s\n' "$*" >>"$command_log"; return 6; }
+
+  output="$(rollback_hysteria_account 2>&1)"
+  assert_eq 'userdel hysteria' "$(cat "$command_log")" \
+    "automatic Hysteria2 private-group removal"
+  [[ -z "$output" ]] || fail "successful idempotent account rollback warned: $output"
+)
+
+test_hysteria_account_rollback_accepts_automatic_group_removal
+printf 'PASS: Hysteria2 idempotent account rollback tests\n'
 
 printf 'PASS: mode and validation tests\n'
