@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-INSTALLER_VARIANT="@INSTALLER_VARIANT@"
+INSTALLER_VARIANT="upgrade-cf"
 
 APP_NAME="v2ray-onekey"
 XRAY_CONFIG="/usr/local/etc/xray/config.json"

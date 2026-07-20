@@ -3,6 +3,7 @@ set -Eeuo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 fresh="$ROOT_DIR/outputs/v2ray-onekey-new.sh"
+upgrade="$ROOT_DIR/outputs/v2ray-onekey-upgrade-cf.sh"
 
 "$ROOT_DIR/tools/build-installers.sh" --check
 
@@ -110,6 +111,7 @@ if compgen -G "$fixture_output.tmp.*" >/dev/null ||
 fi
 
 [[ -x "$fresh" ]]
+[[ -x "$upgrade" ]]
 head -n 1 "$fresh" | grep -Fqx '#!/usr/bin/env bash'
 grep -Fq 'INSTALLER_VARIANT="new"' "$fresh"
 if grep -Fq '@INSTALLER_VARIANT@' "$fresh"; then
@@ -121,4 +123,11 @@ if grep -Eiq -- '--reality-|make_reality_link|xtls-rprx-vision|security=reality|
   exit 1
 fi
 bash -n "$fresh"
+head -n 1 "$upgrade" | grep -Fqx '#!/usr/bin/env bash'
+grep -Fq 'INSTALLER_VARIANT="upgrade-cf"' "$upgrade"
+if grep -Fq '@INSTALLER_VARIANT@' "$upgrade"; then
+  printf 'unexpanded upgrade installer variant\n' >&2
+  exit 1
+fi
+bash -n "$upgrade"
 printf 'PASS: generated fresh installer is current\n'

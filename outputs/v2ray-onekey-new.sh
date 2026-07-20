@@ -8,6 +8,7 @@ BACKUP_ROOT="${BACKUP_ROOT:-/var/backups/v2ray-onekey}"
 DEPLOYMENT_LOCK_DIR="${DEPLOYMENT_LOCK_DIR:-/run/lock/v2ray-onekey}"
 NGINX_SITE="${NGINX_SITE:-/etc/nginx/conf.d/v2ray-onekey.conf}"
 RENEWAL_HOOK="${RENEWAL_HOOK:-/etc/letsencrypt/renewal-hooks/deploy/v2ray-onekey-nginx.sh}"
+LETSENCRYPT_LIVE_ROOT="${LETSENCRYPT_LIVE_ROOT:-/etc/letsencrypt/live}"
 LEGACY_V2RAY_CONFIG="${LEGACY_V2RAY_CONFIG:-/usr/local/etc/v2ray/config.json}"
 XRAY_INSTALL_URL="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
 XRAY_BIN="/usr/local/bin/xray"
@@ -4198,6 +4199,254 @@ complete_transaction() {
   trap - EXIT ERR INT TERM
 }
 
+upgrade_usage() {
+  cat <<'USAGE'
+Usage:
+  sudo bash v2ray-onekey-upgrade-cf.sh [options]
+
+Options:
+  --hy2-port-range START-END
+  --ss-port PORT
+  --server-address ADDRESS
+  --rotate
+  --allow-bittorrent
+  --allow-mail
+  -h, --help
+
+This installer reads the existing project-managed Cloudflare deployment.
+Domain, email, Cloudflare port, WebSocket path, and mode cannot be overridden.
+USAGE
+}
+
+parse_upgrade_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --hy2-port-range)
+        [[ $# -ge 2 && -n "$2" ]] || die "--hy2-port-range requires a value"
+        HY2_PORT_RANGE="$2"; CLI_HY2_PORT_RANGE_SET="1"; shift 2 ;;
+      --ss-port)
+        [[ $# -ge 2 && -n "$2" ]] || die "--ss-port requires a value"
+        SS_PORT="$2"; CLI_SS_PORT_SET="1"; shift 2 ;;
+      --server-address)
+        [[ $# -ge 2 && -n "$2" ]] || die "--server-address requires a value"
+        SERVER_ADDRESS="$2"; CLI_SERVER_ADDRESS_SET="1"; shift 2 ;;
+      --rotate) ROTATE="1"; shift ;;
+      --allow-bittorrent) ALLOW_BITTORRENT="1"; CLI_ALLOW_BITTORRENT_SET="1"; shift ;;
+      --allow-mail) ALLOW_MAIL="1"; CLI_ALLOW_MAIL_SET="1"; shift ;;
+      --mode|--domain|--email|--cloudflare-port|--cloudflare-uuid|--ws-path|--rotate-cloudflare)
+        die "$1 is not accepted by the Cloudflare upgrade installer; this value is read from the existing managed deployment" ;;
+      -h|--help) upgrade_usage; exit 0 ;;
+      *) die "Unknown option: $1" ;;
+    esac
+  done
+}
+
+upgrade_managed_file_is_safe() {
+  local path="$1" owner mode
+  [[ -f "$path" && ! -L "$path" ]] || return 1
+  owner="$(stat -c '%u' "$path" 2>/dev/null)" || return 1
+  mode="$(stat -c '%a' "$path" 2>/dev/null)" || return 1
+  [[ "$owner" == "0" ]] || return 1
+  (( (8#$mode & 0077) == 0 ))
+}
+
+upgrade_certificate_is_safe() {
+  local path="$1" owner mode
+  [[ -f "$path" ]] || return 1
+  owner="$(stat -c '%u' "$path" 2>/dev/null)" || return 1
+  mode="$(stat -c '%a' "$path" 2>/dev/null)" || return 1
+  [[ "$owner" == "0" ]] || return 1
+  (( (8#$mode & 0077) == 0 ))
+}
+
+inspect_existing_cloudflare_xray() {
+  python3 - "$XRAY_CONFIG" "$CLOUDFLARE_UUID" "$WS_PATH" "$INTERNAL_WS_PORT" <<'PY'
+import json
+import sys
+
+path, wanted_uuid, wanted_path, wanted_port = sys.argv[1:]
+try:
+    with open(path, encoding="utf-8") as handle:
+        config = json.load(handle)
+except (OSError, ValueError):
+    raise SystemExit("Unable to parse the existing Xray configuration")
+
+matches = []
+for inbound in config.get("inbounds", []):
+    stream = inbound.get("streamSettings", {})
+    if (inbound.get("protocol") == "vless" and
+        inbound.get("listen") in ("127.0.0.1", "::1") and
+        stream.get("network") == "ws" and
+        stream.get("security") == "none"):
+        matches.append(inbound)
+if len(matches) != 1:
+    raise SystemExit("Existing Xray configuration must contain exactly one project Cloudflare WebSocket inbound")
+inbound = matches[0]
+clients = inbound.get("settings", {}).get("clients", [])
+paths = stream.get("wsSettings", {}).get("path")
+if (str(inbound.get("port")) != wanted_port or paths != wanted_path or
+    len(clients) != 1 or clients[0].get("id") != wanted_uuid):
+    raise SystemExit("Existing Xray Cloudflare UUID, path, or internal port does not match managed state")
+PY
+}
+
+inspect_existing_cloudflare() {
+  local cert_dir
+  MODE="full"
+  load_state
+  [[ "$MODE" == "full" || "$MODE" == "cloudflare" ]] ||
+    die "The existing state is not a Cloudflare deployment"
+  mode_has_cloudflare || die "The existing state has no Cloudflare entry"
+  MODE="full"
+  upgrade_managed_file_is_safe "$STATE_FILE" || die "State file ownership or permissions are unsafe"
+  upgrade_managed_file_is_safe "$XRAY_CONFIG" || die "Xray config ownership or permissions are unsafe"
+  upgrade_managed_file_is_safe "$NGINX_SITE" || die "Project Nginx config is missing or unsafe"
+  current_nginx_config_is_project_owned "$NGINX_SITE" ||
+    die "Existing Nginx config is not owned by v2ray-onekey"
+  upgrade_managed_file_is_safe "$RENEWAL_HOOK" || die "Project renewal hook is missing or unsafe"
+  current_renewal_hook_is_project_owned "$RENEWAL_HOOK" || die "Renewal hook ownership check failed"
+  grep -Eq "^[[:space:]]*server_name[[:space:]]+$DOMAIN;" "$NGINX_SITE" ||
+    die "Nginx server_name does not match managed state"
+  grep -Fq "location $WS_PATH" "$NGINX_SITE" || die "Nginx WebSocket path does not match managed state"
+  grep -Fq "proxy_pass http://127.0.0.1:$INTERNAL_WS_PORT;" "$NGINX_SITE" ||
+    die "Nginx upstream does not match managed state"
+  cert_dir="$LETSENCRYPT_LIVE_ROOT/$DOMAIN"
+  upgrade_certificate_is_safe "$cert_dir/fullchain.pem" || die "Managed certificate is missing or unsafe"
+  upgrade_certificate_is_safe "$cert_dir/privkey.pem" || die "Managed private key is missing or unsafe"
+  "$XRAY_BIN" run -test -config "$XRAY_CONFIG" || die "Existing Xray config test failed"
+  nginx -t || die "Existing Nginx config test failed"
+  systemctl is-active --quiet xray || die "Existing Xray service is not active"
+  systemctl is-active --quiet nginx || die "Existing Nginx service is not active"
+  inspect_existing_cloudflare_xray
+  PRESERVED_DOMAIN="$DOMAIN"
+  PRESERVED_EMAIL="$EMAIL"
+  PRESERVED_CLOUDFLARE_PORT="$CLOUDFLARE_PORT"
+  PRESERVED_CLOUDFLARE_UUID="$CLOUDFLARE_UUID"
+  PRESERVED_WS_PATH="$WS_PATH"
+  PRESERVED_INTERNAL_WS_PORT="$INTERNAL_WS_PORT"
+  PRESERVED_NGINX_SHA256="$(sha256sum "$NGINX_SITE" | awk '{print $1}')"
+  PRESERVED_HOOK_SHA256="$(sha256sum "$RENEWAL_HOOK" | awk '{print $1}')"
+  PRESERVED_CLOUDFLARE_LINK="$(make_cloudflare_link)"
+}
+
+assert_preserved_cloudflare_values() {
+  [[ "$DOMAIN" == "$PRESERVED_DOMAIN" && "$EMAIL" == "$PRESERVED_EMAIL" &&
+    "$CLOUDFLARE_PORT" == "$PRESERVED_CLOUDFLARE_PORT" &&
+    "$CLOUDFLARE_UUID" == "$PRESERVED_CLOUDFLARE_UUID" &&
+    "$WS_PATH" == "$PRESERVED_WS_PATH" &&
+    "$INTERNAL_WS_PORT" == "$PRESERVED_INTERNAL_WS_PORT" ]] ||
+    die "Cloudflare values changed during upgrade"
+  [[ "$(sha256sum "$NGINX_SITE" | awk '{print $1}')" == "$PRESERVED_NGINX_SHA256" ]] ||
+    die "Cloudflare Nginx config changed during upgrade"
+  [[ "$(sha256sum "$RENEWAL_HOOK" | awk '{print $1}')" == "$PRESERVED_HOOK_SHA256" ]] ||
+    die "Cloudflare renewal hook changed during upgrade"
+  [[ "$(make_cloudflare_link)" == "$PRESERVED_CLOUDFLARE_LINK" ]] ||
+    die "Cloudflare sharing link changed during upgrade"
+}
+
+prepare_upgrade_inputs() {
+  validate_options state
+  [[ "$CLI_ALLOW_BITTORRENT_SET" != "1" ]] || ALLOW_BITTORRENT="1"
+  [[ "$CLI_ALLOW_MAIL_SET" != "1" ]] || ALLOW_MAIL="1"
+  [[ "$CLI_HY2_PORT_RANGE_SET" != "1" ]] || {
+    valid_hy2_port_range "$HY2_PORT_RANGE" || die "Invalid Hysteria2 port range: $HY2_PORT_RANGE"
+  }
+  [[ "$CLI_SS_PORT_SET" != "1" ]] || {
+    valid_port "$SS_PORT" || die "Invalid Shadowsocks port: $SS_PORT"
+  }
+  if [[ -z "$SERVER_ADDRESS" ]]; then
+    SERVER_ADDRESS="$(curl -4fsS --connect-timeout 5 --max-time 10 https://api.ipify.org 2>/dev/null || true)"
+  fi
+  valid_server_address "$SERVER_ADDRESS" ||
+    die "A valid --server-address is required when the existing state has no direct server address"
+  resolve_direct_port_conflicts
+  assert_preserved_cloudflare_values
+}
+
+rotate_upgrade_direct_values() {
+  [[ "$ROTATE" == "1" ]] || return 0
+  HY2_AUTH=""
+  HY2_OBFS_PASSWORD=""
+  HY2_SNI=""
+  HY2_CERT_PIN=""
+  SS_KEY=""
+}
+
+install_upgrade_dependencies() {
+  local -a packages=(curl ca-certificates openssl python3 coreutils gawk)
+  if [[ "$PKG_MANAGER" == "apt" ]]; then packages+=(iproute2); else packages+=(iproute); fi
+  install_packages "${packages[@]}"
+  run_guarded_service_action xray install_xray_core
+}
+
+stage_upgrade_configurations() {
+  prepare_runtime_directory
+  rotate_upgrade_direct_values
+  generate_runtime_values
+  validate_loaded_runtime_values
+  STAGED_XRAY="$RUNTIME_DIR/xray-config.json"
+  render_xray_config "$STAGED_XRAY"
+  STAGED_HYSTERIA_BINARY="$RUNTIME_DIR/hysteria"
+  STAGED_HYSTERIA_CONFIG="$RUNTIME_DIR/hysteria-config.yaml"
+  STAGED_HYSTERIA_ACL="$RUNTIME_DIR/hysteria-acl.txt"
+  STAGED_HYSTERIA_CERT="$RUNTIME_DIR/hysteria-server.crt"
+  STAGED_HYSTERIA_KEY="$RUNTIME_DIR/hysteria-server.key"
+  STAGED_HYSTERIA_UNIT="$RUNTIME_DIR/hysteria-server.service"
+  STAGED_HYSTERIA_SMOKE_CONFIG="$RUNTIME_DIR/hysteria-smoke.yaml"
+  STAGED_HYSTERIA_SMOKE_LOG="$RUNTIME_DIR/hysteria-smoke.log"
+  stage_hysteria_bundle "$STAGED_HYSTERIA_BINARY" "$STAGED_HYSTERIA_CONFIG" \
+    "$STAGED_HYSTERIA_ACL" "$STAGED_HYSTERIA_CERT" "$STAGED_HYSTERIA_KEY" \
+    "$STAGED_HYSTERIA_UNIT" "$STAGED_HYSTERIA_SMOKE_CONFIG" "$STAGED_HYSTERIA_SMOKE_LOG"
+}
+
+validate_upgrade_staged_configurations() {
+  "$XRAY_BIN" run -test -config "$STAGED_XRAY" || die "Staged Xray config test failed"
+  validate_loaded_runtime_values
+  [[ "$(grep -Eic 'REALITY|X25519|SHORT_ID|REALITY_TARGET' "$STAGED_XRAY" || true)" == "0" ]] ||
+    die "Staged Xray config still contains retired REALITY state"
+}
+
+install_upgrade_staged_configurations() {
+  install_validated_xray_config "$STAGED_XRAY"
+  ensure_hysteria_account
+  install_validated_hysteria_binary "$STAGED_HYSTERIA_BINARY"
+  install_hysteria_runtime_files "$STAGED_HYSTERIA_CONFIG" "$STAGED_HYSTERIA_ACL" \
+    "$STAGED_HYSTERIA_CERT" "$STAGED_HYSTERIA_KEY" "$STAGED_HYSTERIA_UNIT"
+  write_hysteria_ownership_manifest
+}
+
+deploy_upgrade_cf() {
+  inspect_existing_cloudflare
+  prepare_upgrade_inputs
+  acquire_deployment_lock
+  begin_transaction
+  install_upgrade_dependencies
+  stage_upgrade_configurations
+  validate_upgrade_staged_configurations
+  stop_mode_services
+  install_upgrade_staged_configurations
+  start_mode_services
+  verify_mode_services
+  assert_preserved_cloudflare_values
+  save_state
+  ! grep -Eiq 'REALITY|X25519|SHORT_ID|REALITY_TARGET' "$STATE_FILE" ||
+    die "Saved state contains retired REALITY fields"
+  configure_firewall
+  check_cloudflare_edge
+  print_deployment_summary
+  complete_transaction
+}
+
+main_upgrade_cf() {
+  set -Eeuo pipefail
+  reset_options
+  MODE="full"
+  parse_upgrade_args "$@"
+  [[ "$(id -u)" -eq 0 ]] || die "Please run as root: sudo bash v2ray-onekey-upgrade-cf.sh"
+  preflight_environment
+  deploy_upgrade_cf
+}
+
 make_cloudflare_link() {
   unexport_sensitive_runtime_values
   printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=chrome&type=ws&host=%s&path=%s#%s\n' \
@@ -4300,5 +4549,9 @@ main() {
 }
 
 if [[ "${V2RAY_ONEKEY_SOURCE_ONLY:-0}" != "1" ]]; then
-  main "$@"
+  case "$INSTALLER_VARIANT" in
+    new) main "$@" ;;
+    upgrade-cf) main_upgrade_cf "$@" ;;
+    *) die "Unknown installer variant: $INSTALLER_VARIANT" ;;
+  esac
 fi

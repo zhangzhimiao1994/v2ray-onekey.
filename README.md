@@ -1,5 +1,25 @@
 # V2Ray One-Key Installer
 
+## Installers
+
+The repository provides two native systemd installers. Docker is only used for
+local tests and is not installed on the VPS.
+
+```bash
+sudo bash outputs/v2ray-onekey-new.sh
+sudo bash outputs/v2ray-onekey-upgrade-cf.sh
+```
+
+The first command installs a new direct/full deployment. The second command
+accepts only a Cloudflare deployment previously managed by this repository. It
+reads the existing domain, email, port, UUID, WebSocket path, Nginx site,
+renewal hook, and certificate paths. By default it preserves the Cloudflare
+link and those files byte-for-byte, removes the old REALITY inbound from active
+Xray state, and adds Hysteria2 plus Shadowsocks 2022. Use `--rotate` only for
+the new direct credentials. The old Xray/state files are backed up before any
+package, service, firewall, or configuration mutation; failures restore the
+previous deployment automatically.
+
 面向 Linux 服务器的原生 Xray 一键部署脚本，支持三种安装模式：
 
 - `reality`：直连 `VLESS + REALITY + XTLS Vision`，不需要域名。
