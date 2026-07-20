@@ -4247,16 +4247,27 @@ upgrade_managed_file_is_safe() {
   owner="$(stat -c '%u' "$path" 2>/dev/null)" || return 1
   mode="$(stat -c '%a' "$path" 2>/dev/null)" || return 1
   [[ "$owner" == "0" ]] || return 1
-  (( (8#$mode & 0077) == 0 ))
+  (( (8#$mode & 0022) == 0 ))
 }
 
 upgrade_certificate_is_safe() {
-  local path="$1" owner mode
+  local path="$1" resolved_path allowed_archive owner mode
   [[ -f "$path" ]] || return 1
-  owner="$(stat -c '%u' "$path" 2>/dev/null)" || return 1
-  mode="$(stat -c '%a' "$path" 2>/dev/null)" || return 1
+  resolved_path="$path"
+  if [[ -L "$path" ]]; then
+    [[ "$(stat -c '%u' "$path" 2>/dev/null)" == "0" ]] || return 1
+    resolved_path="$(readlink -f -- "$path" 2>/dev/null)" || return 1
+    allowed_archive="$(readlink -f -- "$(dirname "$LETSENCRYPT_LIVE_ROOT")/archive/$DOMAIN" 2>/dev/null)" || return 1
+    case "$resolved_path" in
+      "$allowed_archive"/*) ;;
+      *) return 1 ;;
+    esac
+  fi
+  [[ -f "$resolved_path" && ! -L "$resolved_path" ]] || return 1
+  owner="$(stat -c '%u' "$resolved_path" 2>/dev/null)" || return 1
+  mode="$(stat -c '%a' "$resolved_path" 2>/dev/null)" || return 1
   [[ "$owner" == "0" ]] || return 1
-  (( (8#$mode & 0077) == 0 ))
+  (( (8#$mode & 0022) == 0 ))
 }
 
 inspect_existing_cloudflare_xray() {

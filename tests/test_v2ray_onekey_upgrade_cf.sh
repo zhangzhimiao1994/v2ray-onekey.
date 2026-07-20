@@ -36,4 +36,38 @@ if grep -Eiq 'security[=:]reality|xtls-rprx-vision|"tag"[[:space:]]*:[[:space:]]
   exit 1
 fi
 
+permission_root="$(mktemp -d)"
+trap 'rm -rf -- "$permission_root"' EXIT
+managed_config="$permission_root/config.json"
+printf '{}\n' >"$managed_config"
+chmod 0644 "$managed_config"
+upgrade_managed_file_is_safe "$managed_config" || {
+  printf 'root-owned 0644 managed config was rejected\n' >&2
+  exit 1
+}
+chmod 0664 "$managed_config"
+if upgrade_managed_file_is_safe "$managed_config"; then
+  printf 'group-writable managed config was accepted\n' >&2
+  exit 1
+fi
+
+DOMAIN="vpn.example.com"
+LETSENCRYPT_LIVE_ROOT="$permission_root/letsencrypt/live"
+archive_dir="$permission_root/letsencrypt/archive/$DOMAIN"
+live_dir="$LETSENCRYPT_LIVE_ROOT/$DOMAIN"
+mkdir -p "$archive_dir" "$live_dir"
+printf 'certificate\n' >"$archive_dir/fullchain1.pem"
+chmod 0644 "$archive_dir/fullchain1.pem"
+ln -s "../../archive/$DOMAIN/fullchain1.pem" "$live_dir/fullchain.pem"
+upgrade_certificate_is_safe "$live_dir/fullchain.pem" || {
+  printf 'standard Certbot live certificate symlink was rejected\n' >&2
+  exit 1
+}
+printf 'external\n' >"$permission_root/external.pem"
+ln -sfn "$permission_root/external.pem" "$live_dir/fullchain.pem"
+if upgrade_certificate_is_safe "$live_dir/fullchain.pem"; then
+  printf 'certificate symlink escaping the Certbot archive was accepted\n' >&2
+  exit 1
+fi
+
 printf 'PASS: existing Cloudflare upgrade installer tests\n'
