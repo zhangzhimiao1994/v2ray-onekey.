@@ -3320,15 +3320,14 @@ xray_service_identity() {
 }
 
 install_validated_xray_config() {
-  local staged="$1" identity user group config_dir temp
+  local staged="$1" identity group config_dir temp
   [[ -f "$staged" && ! -L "$staged" ]] || die "Validated Xray staging file is missing"
   identity="$(xray_service_identity)"
-  user="${identity%%:*}"
   group="${identity#*:}"
   config_dir="$(dirname "$XRAY_CONFIG")"
   install -d -o root -g root -m 0755 "$config_dir"
   temp="$(mktemp "$config_dir/.config.json.XXXXXX")"
-  if ! install -o "$user" -g "$group" -m 0400 "$staged" "$temp"; then
+  if ! install -o root -g "$group" -m 0440 "$staged" "$temp"; then
     rm -f -- "$temp"
     return 1
   fi
@@ -4250,6 +4249,15 @@ upgrade_managed_file_is_safe() {
   (( (8#$mode & 0022) == 0 ))
 }
 
+upgrade_xray_config_is_safe() {
+  local path="$1" actual_identity expected_identity
+  upgrade_managed_file_is_safe "$path" && return 0
+  [[ -f "$path" && ! -L "$path" ]] || return 1
+  actual_identity="$(stat -c '%U:%G:%a' "$path" 2>/dev/null)" || return 1
+  expected_identity="$(xray_service_identity):400" || return 1
+  [[ "$actual_identity" == "$expected_identity" ]]
+}
+
 upgrade_certificate_is_safe() {
   local path="$1" resolved_path allowed_archive owner mode
   [[ -f "$path" ]] || return 1
@@ -4310,7 +4318,7 @@ inspect_existing_cloudflare() {
   mode_has_cloudflare || die "The existing state has no Cloudflare entry"
   MODE="full"
   upgrade_managed_file_is_safe "$STATE_FILE" || die "State file ownership or permissions are unsafe"
-  upgrade_managed_file_is_safe "$XRAY_CONFIG" || die "Xray config ownership or permissions are unsafe"
+  upgrade_xray_config_is_safe "$XRAY_CONFIG" || die "Xray config ownership or permissions are unsafe"
   upgrade_managed_file_is_safe "$NGINX_SITE" || die "Project Nginx config is missing or unsafe"
   current_nginx_config_is_project_owned "$NGINX_SITE" ||
     die "Existing Nginx config is not owned by v2ray-onekey"

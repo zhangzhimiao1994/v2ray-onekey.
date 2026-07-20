@@ -4507,8 +4507,9 @@ test_packages_permissions_and_firewall() (
   current_group="$(id -gn)"
   xray_service_identity() { printf '%s:%s\n' "$current_user" "$current_group"; }
   install_validated_xray_config "$temp_dir/staged.json"
-  assert_eq "400" "$(stat -c '%a' "$XRAY_CONFIG")" "Xray private config mode"
-  assert_eq "$(id -u)" "$(stat -c '%u' "$XRAY_CONFIG")" "Xray config owner"
+  assert_eq "440" "$(stat -c '%a' "$XRAY_CONFIG")" "Xray private config mode"
+  assert_eq "0" "$(stat -c '%u' "$XRAY_CONFIG")" "Xray config owner"
+  assert_eq "$(id -g)" "$(stat -c '%g' "$XRAY_CONFIG")" "Xray config group"
 
   firewall_log="$temp_dir/firewall.log"
   ufw_state="inactive"

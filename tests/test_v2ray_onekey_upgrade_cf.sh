@@ -51,6 +51,29 @@ if upgrade_managed_file_is_safe "$managed_config"; then
   exit 1
 fi
 
+legacy_xray_config="$permission_root/legacy-xray.json"
+printf '{}\n' >"$legacy_xray_config"
+chown nobody:nogroup "$legacy_xray_config"
+chmod 0400 "$legacy_xray_config"
+xray_service_identity() { printf 'nobody:nogroup\n'; }
+upgrade_xray_config_is_safe "$legacy_xray_config" || {
+  printf 'legacy service-owned 0400 Xray config was rejected\n' >&2
+  exit 1
+}
+chmod 0600 "$legacy_xray_config"
+if upgrade_xray_config_is_safe "$legacy_xray_config"; then
+  printf 'legacy service-owned writable Xray config was accepted\n' >&2
+  exit 1
+fi
+
+printf '{}\n' >"$permission_root/staged-xray.json"
+XRAY_CONFIG="$permission_root/installed-xray.json"
+install_validated_xray_config "$permission_root/staged-xray.json"
+[[ "$(stat -c '%U:%G:%a' "$XRAY_CONFIG")" == "root:nogroup:440" ]] || {
+  printf 'installed Xray config did not use root-owned group-readable permissions\n' >&2
+  exit 1
+}
+
 DOMAIN="vpn.example.com"
 LETSENCRYPT_LIVE_ROOT="$permission_root/letsencrypt/live"
 archive_dir="$permission_root/letsencrypt/archive/$DOMAIN"
