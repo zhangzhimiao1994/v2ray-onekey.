@@ -4278,6 +4278,10 @@ upgrade_certificate_is_safe() {
   (( (8#$mode & 0022) == 0 ))
 }
 
+upgrade_nginx_path_matches() {
+  grep -Fq "location = $WS_PATH {" "$NGINX_SITE"
+}
+
 inspect_existing_cloudflare_xray() {
   python3 - "$XRAY_CONFIG" "$CLOUDFLARE_UUID" "$WS_PATH" "$INTERNAL_WS_PORT" <<'PY'
 import json
@@ -4326,7 +4330,7 @@ inspect_existing_cloudflare() {
   current_renewal_hook_is_project_owned "$RENEWAL_HOOK" || die "Renewal hook ownership check failed"
   grep -Eq "^[[:space:]]*server_name[[:space:]]+$DOMAIN;" "$NGINX_SITE" ||
     die "Nginx server_name does not match managed state"
-  grep -Fq "location $WS_PATH" "$NGINX_SITE" || die "Nginx WebSocket path does not match managed state"
+  upgrade_nginx_path_matches || die "Nginx WebSocket path does not match managed state"
   grep -Fq "proxy_pass http://127.0.0.1:$INTERNAL_WS_PORT;" "$NGINX_SITE" ||
     die "Nginx upstream does not match managed state"
   cert_dir="$LETSENCRYPT_LIVE_ROOT/$DOMAIN"

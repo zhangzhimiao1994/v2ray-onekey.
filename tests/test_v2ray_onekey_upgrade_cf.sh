@@ -74,6 +74,19 @@ install_validated_xray_config "$permission_root/staged-xray.json"
   exit 1
 }
 
+NGINX_SITE="$permission_root/v2ray-onekey.conf"
+WS_PATH="/legacy-ws-path"
+printf '    location = %s {\n' "$WS_PATH" >"$NGINX_SITE"
+upgrade_nginx_path_matches || {
+  printf 'legacy managed Nginx exact-match WebSocket path was rejected\n' >&2
+  exit 1
+}
+printf '    location = /different-path {\n' >"$NGINX_SITE"
+if upgrade_nginx_path_matches; then
+  printf 'different Nginx WebSocket path was accepted\n' >&2
+  exit 1
+fi
+
 DOMAIN="vpn.example.com"
 LETSENCRYPT_LIVE_ROOT="$permission_root/letsencrypt/live"
 archive_dir="$permission_root/letsencrypt/archive/$DOMAIN"
