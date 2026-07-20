@@ -31,6 +31,7 @@ LISTENER_WAIT_ATTEMPTS="${LISTENER_WAIT_ATTEMPTS:-15}"
 LISTENER_WAIT_INTERVAL="${LISTENER_WAIT_INTERVAL:-1}"
 TRANSACTION_ACTIVE="0"
 LOCK_HELD="0"
+LEGACY_NGINX_FILES_CHANGED="0"
 
 log() { printf '\033[1;32m[%s]\033[0m %s\n' "$APP_NAME" "$*"; }
 warn() { printf '\033[1;33m[%s]\033[0m %s\n' "$APP_NAME" "$*"; }
@@ -919,6 +920,22 @@ download_cloudflare_ranges() (
   mv -f -- "$temp_v6" "$v6"
 )
 
+validate_cloudflare_preflight() (
+  local preflight_dir="" temp_root="${TMPDIR:-/tmp}"
+  cleanup_cloudflare_preflight() {
+    [[ -z "$preflight_dir" ]] || rm -rf -- "$preflight_dir" || true
+  }
+  trap cleanup_cloudflare_preflight EXIT
+  [[ -d "$temp_root" && ! -L "$temp_root" ]] || die "Invalid temporary directory: $temp_root"
+  preflight_dir="$(mktemp -d "$temp_root/v2ray-onekey-preflight.XXXXXX")"
+  chmod 0700 "$preflight_dir"
+  RUNTIME_DIR="$preflight_dir"
+  CLOUDFLARE_IPV4_FILE="$preflight_dir/ips-v4"
+  CLOUDFLARE_IPV6_FILE="$preflight_dir/ips-v6"
+  download_cloudflare_ranges
+  validate_cloudflare_domain
+)
+
 write_builtin_cloudflare_ranges() (
   local run_dir v4 v6
   run_dir="${RUNTIME_DIR:-/run/v2ray-onekey}"
@@ -1166,7 +1183,8 @@ current_nginx_config_is_project_owned() {
 }
 
 validate_managed_destination_ownership() {
-  if mode_has_hysteria && hysteria_managed_deployment_exists &&
+  if hysteria_managed_deployment_exists &&
+    { mode_has_hysteria || systemctl is-active --quiet hysteria-server; } &&
     ! hysteria_deployment_is_strictly_project_owned; then
     die "Refusing unmanaged Hysteria2 files; the exact v2ray-onekey ownership manifest is missing or does not match"
   fi
@@ -1389,6 +1407,14 @@ legacy_project_nginx_exists() {
     legacy_nginx_config_is_project_owned "$path" && return 0
   done < <(legacy_nginx_config_paths)
   return 1
+}
+
+project_nginx_configuration_exists() {
+  current_nginx_config_is_project_owned "$NGINX_SITE" || legacy_project_nginx_exists
+}
+
+mode_manages_nginx() {
+  mode_has_cloudflare || project_nginx_configuration_exists
 }
 
 legacy_nginx_config_paths() {
@@ -1695,8 +1721,11 @@ recorded_service_state_is_restorable() {
 
 record_service_states() {
   local service state active unit
+  local -a services=(v2ray xray)
+  mode_manages_nginx && services+=(nginx)
+  services+=(hysteria-server)
   : >"$BACKUP_DIR/services"
-  for service in v2ray xray nginx hysteria-server; do
+  for service in "${services[@]}"; do
     state="$(query_service_state "$service")" || die "Unable to inspect exact service state: $service"
     active="${state%%$'\t'*}"
     unit="${state#*$'\t'}"
@@ -1978,6 +2007,7 @@ begin_transaction() {
 
 disable_owned_legacy_nginx_files() {
   local path disabled
+  LEGACY_NGINX_FILES_CHANGED="0"
   [[ -f "$BACKUP_DIR/legacy-files" ]] || return 0
   while IFS= read -r path; do
     [[ -n "$path" && -f "$path" && ! -L "$path" ]] || continue
@@ -1986,6 +2016,7 @@ disable_owned_legacy_nginx_files() {
     [[ ! -e "$disabled" ]] || die "Legacy Nginx disabled path already exists: $disabled"
     mv -- "$path" "$disabled"
     printf '%s\t%s\n' "$path" "$disabled" >>"$BACKUP_DIR/legacy-renames"
+    LEGACY_NGINX_FILES_CHANGED="1"
   done <"$BACKUP_DIR/legacy-files"
 }
 
@@ -2651,7 +2682,7 @@ check_internal_ws_port_listener() {
 }
 
 direct_bundle_ready() {
-  return 1
+  return 0
 }
 
 require_mode_ready() {
@@ -3622,6 +3653,63 @@ EOF
   mv -f -- "$temp_path" "$output_path"
 )
 
+validate_staged_nginx_config() (
+  local staged="$1" phase="$2" prefix="" candidate nginx_config
+  local test_cert test_key source_cert source_key
+  cleanup_staged_nginx_validation() {
+    [[ -z "$prefix" ]] || rm -rf -- "$prefix" || true
+  }
+  trap cleanup_staged_nginx_validation EXIT
+
+  [[ "$phase" == "initial" || "$phase" == "final" ]] ||
+    die "Invalid staged Nginx validation phase: $phase"
+  [[ -f "$staged" && ! -L "$staged" ]] || die "Staged Nginx config is missing: $staged"
+  [[ -n "${RUNTIME_DIR:-}" && -d "$RUNTIME_DIR" && ! -L "$RUNTIME_DIR" ]] ||
+    die "Runtime directory is unavailable for staged Nginx validation"
+  prefix="$(mktemp -d "$RUNTIME_DIR/nginx-validate.XXXXXX")"
+  chmod 0700 "$prefix"
+  candidate="$prefix/site.conf"
+  nginx_config="$prefix/nginx.conf"
+
+  if [[ "$phase" == "final" ]]; then
+    test_cert="$prefix/test.crt"
+    test_key="$prefix/test.key"
+    openssl req -x509 -newkey rsa:2048 -sha256 -nodes -days 1 \
+      -subj '/CN=v2ray-onekey.invalid' -keyout "$test_key" -out "$test_cert" >/dev/null 2>&1 ||
+      die "Unable to generate an isolated Nginx validation certificate"
+    chmod 0600 "$test_key"
+    chmod 0644 "$test_cert"
+    source_cert="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
+    source_key="/etc/letsencrypt/live/$DOMAIN/privkey.pem"
+    python3 - "$staged" "$candidate" "$source_cert" "$source_key" "$test_cert" "$test_key" <<'PY'
+import pathlib
+import sys
+
+source, destination, source_cert, source_key, test_cert, test_key = sys.argv[1:]
+content = pathlib.Path(source).read_text(encoding="utf-8")
+if content.count(source_cert) != 1 or content.count(source_key) != 1:
+    raise SystemExit("staged certificate paths are missing or duplicated")
+content = content.replace(source_cert, test_cert).replace(source_key, test_key)
+pathlib.Path(destination).write_text(content, encoding="utf-8")
+PY
+  else
+    cp -- "$staged" "$candidate"
+  fi
+  chmod 0600 "$candidate"
+  cat >"$nginx_config" <<EOF
+worker_processes 1;
+pid "$prefix/nginx.pid";
+error_log stderr notice;
+events { worker_connections 16; }
+http {
+    access_log off;
+    include "$candidate";
+}
+EOF
+  chmod 0600 "$nginx_config"
+  nginx -t -p "$prefix/" -c "$nginx_config"
+)
+
 request_certificate() {
   local acme_webroot="${ACME_WEBROOT:-/var/www/v2ray-onekey}"
   valid_domain "$DOMAIN" || die "Invalid domain: $DOMAIN"
@@ -3694,7 +3782,6 @@ service_unit_exists() {
 }
 
 stop_project_hysteria_for_cutover() {
-  mode_has_hysteria || return 0
   service_was_active hysteria-server || return 0
   project_hysteria_listener_pid >/dev/null ||
     die "Refusing to stop an unproved or unsafe Hysteria2 service for staged validation"
@@ -3727,9 +3814,12 @@ activate_nginx_config() {
 }
 
 release_legacy_nginx_listeners() {
+  local nginx_configuration_changed="0"
   disable_owned_legacy_nginx_files
+  [[ "$LEGACY_NGINX_FILES_CHANGED" == "0" ]] || nginx_configuration_changed="1"
   if ! mode_has_cloudflare && current_nginx_config_is_project_owned "$NGINX_SITE"; then
     rm -f -- "$NGINX_SITE"
+    nginx_configuration_changed="1"
   fi
   if ! mode_has_cloudflare && [[ -e "$RENEWAL_HOOK" ]]; then
     if current_renewal_hook_is_project_owned "$RENEWAL_HOOK"; then
@@ -3738,9 +3828,11 @@ release_legacy_nginx_listeners() {
       warn "Leaving unrecognized renewal hook unchanged: $RENEWAL_HOOK"
     fi
   fi
-  if ! mode_has_cloudflare && systemctl is-active --quiet nginx; then
+  if ! mode_has_cloudflare && [[ "$nginx_configuration_changed" == "1" ]]; then
     nginx -t
-    run_service_mutation nginx reload
+    if systemctl is-active --quiet nginx; then
+      run_service_mutation nginx reload
+    fi
   fi
 }
 
@@ -3859,28 +3951,58 @@ configure_firewall() {
 }
 
 required_public_ports() {
-  local -a ports=()
-  mode_has_cloudflare && ports+=(80 "$CLOUDFLARE_PORT")
-  ((${#ports[@]} > 0)) && printf '%s\n' "${ports[@]}"
+  if mode_has_cloudflare; then
+    printf 'TCP %s\n' 80 "$CLOUDFLARE_PORT"
+  fi
+  if mode_has_shadowsocks; then
+    printf 'TCP %s\nUDP %s\n' "$SS_PORT" "$SS_PORT"
+  fi
+  if mode_has_hysteria; then
+    printf 'UDP %s\n' "$HY2_PORT_RANGE"
+  fi
 }
 
 print_deployment_summary() {
-  local port_list=""
-  port_list="$(required_public_ports | paste -sd, -)"
+  local diagnostics="systemctl status xray" journals="journalctl -u xray -e"
+  local -a tcp_ports=() udp_ports=()
   printf '\n'
   if mode_has_cloudflare; then
     printf 'Cloudflare entry: VLESS + WebSocket + TLS\n'
     make_cloudflare_link
   fi
+  if mode_has_hysteria; then
+    printf 'Hysteria2 entry: Salamander + pinned certificate\n'
+    make_hysteria_link
+  fi
+  if mode_has_shadowsocks; then
+    printf 'Shadowsocks entry: %s\n' "$SS_METHOD"
+    make_shadowsocks_link
+  fi
   printf 'State file: %s\n' "$STATE_FILE"
   printf 'Backup: %s\n' "$BACKUP_DIR"
   if mode_has_cloudflare; then
-    printf 'Open these TCP ports in the cloud security group: %s\n' "$port_list"
-    printf 'Diagnostics: systemctl status xray; journalctl -u xray -e; nginx -t\n'
-  else
-    printf 'No public listeners are configured for direct mode in this installer stage.\n'
-    printf 'Diagnostics: systemctl status xray; journalctl -u xray -e\n'
+    tcp_ports+=(80 "$CLOUDFLARE_PORT")
   fi
+  if mode_has_shadowsocks; then
+    tcp_ports+=("$SS_PORT")
+    udp_ports+=("$SS_PORT")
+  fi
+  if mode_has_hysteria; then
+    diagnostics+=' hysteria-server'
+    journals="journalctl -u xray -u hysteria-server -e"
+    udp_ports+=("$HY2_PORT_RANGE")
+  fi
+  if mode_has_cloudflare; then
+    printf 'Diagnostics: %s; %s; nginx -t\n' "$diagnostics" "$journals"
+  else
+    printf 'Diagnostics: %s; %s\n' "$diagnostics" "$journals"
+  fi
+  printf 'Cloud security group: TCP %s' "$(IFS=,; printf '%s' "${tcp_ports[*]}")"
+  if ((${#udp_ports[@]} > 0)); then
+    printf ' and UDP %s' "$(IFS=,; printf '%s' "${udp_ports[*]}")"
+  fi
+  printf '\n'
+  printf 'Warning: only the Cloudflare path avoids direct client connections to the server IP; Hysteria2 and Shadowsocks still connect directly, and no protocol can guarantee that an IP will never be blocked.\n'
 }
 
 prepare_runtime_directory() {
@@ -3906,72 +4028,94 @@ cleanup_runtime_directory() {
   RUNTIME_DIR=""
 }
 
-deploy_services() {
-  local staged_xray staged_nginx_initial staged_nginx_final
-  local staged_hysteria_binary staged_hysteria_config staged_hysteria_acl
-  local staged_hysteria_cert staged_hysteria_key staged_hysteria_unit
-  local staged_hysteria_smoke_config staged_hysteria_smoke_log
-
+prepare_fresh_inputs() {
   require_mode_ready
   validate_managed_destination_ownership
-  begin_transaction
+  if mode_has_cloudflare; then
+    [[ -n "$INTERNAL_WS_PORT" ]] || INTERNAL_WS_PORT="$(random_internal_ws_port)"
+    validate_cloudflare_preflight
+  fi
+  check_public_port_listeners
+  check_internal_ws_port_listener
+}
+
+install_mode_dependencies() {
   install_required_packages
   run_guarded_service_action xray install_xray_core
+}
+
+generate_mode_credentials() {
   prepare_runtime_directory
   generate_runtime_values
   validate_loaded_runtime_values
+}
+
+stage_mode_configurations() {
+  STAGED_XRAY="$RUNTIME_DIR/xray-config.json"
+  render_xray_config "$STAGED_XRAY"
 
   if mode_has_cloudflare; then
-    download_cloudflare_ranges
-    validate_cloudflare_domain
+    STAGED_NGINX_INITIAL="$RUNTIME_DIR/nginx-initial.conf"
+    STAGED_NGINX_FINAL="$RUNTIME_DIR/nginx-final.conf"
+    render_nginx_site "$STAGED_NGINX_INITIAL" initial
+    render_nginx_site "$STAGED_NGINX_FINAL" final
   fi
-
-  check_public_port_listeners
-  check_internal_ws_port_listener
-  staged_xray="$RUNTIME_DIR/xray-config.json"
-  render_xray_config "$staged_xray"
-  xray run -test -config "$staged_xray"
 
   if mode_has_hysteria; then
-    staged_hysteria_binary="$RUNTIME_DIR/hysteria"
-    staged_hysteria_config="$RUNTIME_DIR/hysteria-config.yaml"
-    staged_hysteria_acl="$RUNTIME_DIR/hysteria-acl.txt"
-    staged_hysteria_cert="$RUNTIME_DIR/hysteria-server.crt"
-    staged_hysteria_key="$RUNTIME_DIR/hysteria-server.key"
-    staged_hysteria_unit="$RUNTIME_DIR/hysteria-server.service"
-    staged_hysteria_smoke_config="$RUNTIME_DIR/hysteria-smoke.yaml"
-    staged_hysteria_smoke_log="$RUNTIME_DIR/hysteria-smoke.log"
-    stage_hysteria_bundle "$staged_hysteria_binary" "$staged_hysteria_config" \
-      "$staged_hysteria_acl" "$staged_hysteria_cert" "$staged_hysteria_key" \
-      "$staged_hysteria_unit" "$staged_hysteria_smoke_config" "$staged_hysteria_smoke_log"
+    STAGED_HYSTERIA_BINARY="$RUNTIME_DIR/hysteria"
+    STAGED_HYSTERIA_CONFIG="$RUNTIME_DIR/hysteria-config.yaml"
+    STAGED_HYSTERIA_ACL="$RUNTIME_DIR/hysteria-acl.txt"
+    STAGED_HYSTERIA_CERT="$RUNTIME_DIR/hysteria-server.crt"
+    STAGED_HYSTERIA_KEY="$RUNTIME_DIR/hysteria-server.key"
+    STAGED_HYSTERIA_UNIT="$RUNTIME_DIR/hysteria-server.service"
+    STAGED_HYSTERIA_SMOKE_CONFIG="$RUNTIME_DIR/hysteria-smoke.yaml"
+    STAGED_HYSTERIA_SMOKE_LOG="$RUNTIME_DIR/hysteria-smoke.log"
+    stage_hysteria_bundle "$STAGED_HYSTERIA_BINARY" "$STAGED_HYSTERIA_CONFIG" \
+      "$STAGED_HYSTERIA_ACL" "$STAGED_HYSTERIA_CERT" "$STAGED_HYSTERIA_KEY" \
+      "$STAGED_HYSTERIA_UNIT" "$STAGED_HYSTERIA_SMOKE_CONFIG" "$STAGED_HYSTERIA_SMOKE_LOG"
+  fi
+}
+
+validate_staged_configurations() {
+  xray run -test -config "$STAGED_XRAY"
+  if mode_has_cloudflare; then
+    validate_staged_nginx_config "$STAGED_NGINX_INITIAL" initial ||
+      die "Staged initial Nginx configuration failed syntax validation"
+    validate_staged_nginx_config "$STAGED_NGINX_FINAL" final ||
+      die "Staged final Nginx configuration failed syntax validation"
   fi
   validate_loaded_runtime_values
+}
 
+stop_mode_services() {
   stop_legacy_service_for_cutover
+}
+
+install_staged_configurations() {
   release_legacy_nginx_listeners
 
   if mode_has_cloudflare; then
-    staged_nginx_initial="$RUNTIME_DIR/nginx-initial.conf"
-    staged_nginx_final="$RUNTIME_DIR/nginx-final.conf"
     install -d -m 755 "${ACME_WEBROOT:-/var/www/v2ray-onekey}"
-    render_nginx_site "$staged_nginx_initial" initial
-    install_nginx_config_atomically "$staged_nginx_initial"
+    install_nginx_config_atomically "$STAGED_NGINX_INITIAL"
     activate_nginx_config
     request_certificate
-    render_nginx_site "$staged_nginx_final" final
-    install_nginx_config_atomically "$staged_nginx_final"
+    install_nginx_config_atomically "$STAGED_NGINX_FINAL"
     nginx -t
+    run_service_mutation nginx reload
     create_renewal_hook "$RENEWAL_HOOK"
   fi
 
-  install_validated_xray_config "$staged_xray"
+  install_validated_xray_config "$STAGED_XRAY"
   if mode_has_hysteria; then
     ensure_hysteria_account
-    install_validated_hysteria_binary "$staged_hysteria_binary"
-    install_hysteria_runtime_files "$staged_hysteria_config" "$staged_hysteria_acl" \
-      "$staged_hysteria_cert" "$staged_hysteria_key" "$staged_hysteria_unit"
+    install_validated_hysteria_binary "$STAGED_HYSTERIA_BINARY"
+    install_hysteria_runtime_files "$STAGED_HYSTERIA_CONFIG" "$STAGED_HYSTERIA_ACL" \
+      "$STAGED_HYSTERIA_CERT" "$STAGED_HYSTERIA_KEY" "$STAGED_HYSTERIA_UNIT"
     write_hysteria_ownership_manifest
   fi
+}
+
+start_mode_services() {
   systemctl daemon-reload
   if mode_has_hysteria; then
     verify_hysteria_service_definition
@@ -3982,21 +4126,44 @@ deploy_services() {
     run_service_mutation hysteria-server enable --now
     run_service_mutation hysteria-server restart
   fi
-  if mode_has_cloudflare; then
-    run_service_mutation nginx reload
-  fi
+}
+
+verify_mode_services() {
   verify_started_services
   if mode_has_hysteria; then
     verify_hysteria_runtime_identity
+  elif hysteria_deployment_is_strictly_project_owned; then
+    run_service_mutation hysteria-server disable --now
   fi
-
   disable_legacy_v2ray_after_success
+}
+
+verify_cloudflare_when_enabled() {
+  mode_has_cloudflare && check_cloudflare_edge
+  return 0
+}
+
+deploy_services() {
+  local preflight_complete="${1:-0}"
+  [[ "$preflight_complete" == "0" || "$preflight_complete" == "1" ]] ||
+    die "Invalid deployment preflight state"
+  if [[ "$preflight_complete" == "0" ]]; then
+    prepare_fresh_inputs
+  fi
+  begin_transaction
+  install_mode_dependencies
+  generate_mode_credentials
+  stage_mode_configurations
+  validate_staged_configurations
+  stop_mode_services
+  install_staged_configurations
+  start_mode_services
+  verify_mode_services
   save_state
   configure_firewall
-  if mode_has_cloudflare; then
-    check_cloudflare_edge
-  fi
+  verify_cloudflare_when_enabled
   print_deployment_summary
+  complete_transaction
 }
 
 transaction_exit_handler() {
@@ -4126,10 +4293,10 @@ main() {
   [[ "$(id -u)" -eq 0 ]] || die "Please run as root: sudo bash v2ray-onekey.sh"
   prepare_configuration
   preflight_environment
+  prepare_fresh_inputs
   activate_transaction_traps
   acquire_deployment_lock
-  deploy_services
-  complete_transaction
+  deploy_services 1
 }
 
 if [[ "${V2RAY_ONEKEY_SOURCE_ONLY:-0}" != "1" ]]; then

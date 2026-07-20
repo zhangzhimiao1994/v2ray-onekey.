@@ -116,5 +116,9 @@ if grep -Fq '@INSTALLER_VARIANT@' "$fresh"; then
   printf 'unexpanded installer variant\n' >&2
   exit 1
 fi
+if grep -Eiq -- '--reality-|make_reality_link|xtls-rprx-vision|security=reality|"tag"[[:space:]]*:[[:space:]]*"reality-in"' "$fresh"; then
+  printf 'retired REALITY implementation remains in fresh installer\n' >&2
+  exit 1
+fi
 bash -n "$fresh"
 printf 'PASS: generated fresh installer is current\n'

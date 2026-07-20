@@ -1394,7 +1394,7 @@ EOF
   assert_eq "" "$HY2_CERT_PIN" "legacy bootstrap pin remains deferred"
   [[ ! -e "$HYSTERIA_CERT" && ! -e "$HYSTERIA_KEY" ]] ||
     fail "legacy state read generated Hysteria2 certificate files"
-  assert_fails "Direct bundle is not available in this build yet" require_mode_ready
+  require_mode_ready
 
   STATE_FILE="$temp_dir/reality-state.env"
   chmod 0600 "$STATE_FILE"
@@ -1640,18 +1640,18 @@ test_cloudflare_preflight() (
 
 test_cloudflare_preflight
 
-test_task5_direct_bundle_gate_remains_closed() (
+test_task6_direct_bundle_gate_is_open() (
   reset_options
   MODE="direct"
-  assert_fails "Direct bundle is not available in this build yet" require_mode_ready
+  require_mode_ready
   MODE="full"
-  assert_fails "Direct bundle is not available in this build yet" require_mode_ready
+  require_mode_ready
   MODE="cloudflare"
   require_mode_ready
 )
 
-test_task5_direct_bundle_gate_remains_closed
-printf 'PASS: Task 5 direct bundle gate boundary tests\n'
+test_task6_direct_bundle_gate_is_open
+printf 'PASS: Task 6 direct bundle gate tests\n'
 
 test_environment_preflight() (
   reset_options
@@ -3306,6 +3306,7 @@ test_task5_external_installer_service_mutations_are_transactional() (
       esac ;;
     esac
   }
+  prepare_fresh_inputs() { :; }
   generate_runtime_values() { return 1; }
 
   set +e
@@ -4609,99 +4610,318 @@ test_listener_timeout_prints_service_diagnostics() (
 test_listener_timeout_prints_service_diagnostics
 printf 'PASS: listener failure diagnostic tests\n'
 
-test_deployment_order_and_failure_trap() (
-  local temp_dir order_log status
+test_task6_real_preflight_order_and_zero_mutation() (
+  local temp_dir event_log mutation_log status
+  temp_dir="$(mktemp -d)"
+  trap 'rm -rf "$temp_dir"' RETURN
+  event_log="$temp_dir/events.log"
+  mutation_log="$temp_dir/mutations.log"
+  event() { printf '%s\n' "$1" >>"$event_log"; }
+  reset_options
+  MODE="cloudflare"
+  INTERNAL_WS_PORT="31001"
+  require_mode_ready() { event ready; }
+  validate_managed_destination_ownership() { event ownership; }
+  validate_cloudflare_preflight() { event cf-domain; }
+  check_public_port_listeners() { event public-ports; }
+  check_internal_ws_port_listener() { event internal-port; }
+  begin_transaction() { event backup; }
+  install_mode_dependencies() { event packages; }
+  generate_mode_credentials() { event values; }
+  stage_mode_configurations() { event stage; }
+  validate_staged_configurations() { event validate; }
+  stop_mode_services() { event stop; }
+  install_staged_configurations() { event install; }
+  start_mode_services() { event start; }
+  verify_mode_services() { event readiness; }
+  save_state() { event state; }
+  configure_firewall() { event firewall; }
+  verify_cloudflare_when_enabled() { event edge; }
+  print_deployment_summary() { event summary; }
+  complete_transaction() { event commit; }
+
+  deploy_services
+  assert_eq \
+    "ready ownership cf-domain public-ports internal-port backup packages values stage validate stop install start readiness state firewall edge summary commit" \
+    "$(paste -sd' ' "$event_log")" "real preflight order"
+
+  : >"$event_log"
+  validate_cloudflare_preflight() { event cf-domain-failed; return 71; }
+  begin_transaction() { printf 'backup\n' >>"$mutation_log"; }
+  install_mode_dependencies() { printf 'packages\n' >>"$mutation_log"; }
+  stop_mode_services() { printf 'service\n' >>"$mutation_log"; }
+  set +e
+  ( set -Eeuo pipefail; deploy_services ) >/dev/null 2>&1
+  status=$?
+  set -e
+  [[ "$status" -ne 0 ]] || fail "failed preflight unexpectedly reached deployment"
+  [[ ! -e "$mutation_log" ]] || fail "failed preflight caused mutations: $(cat "$mutation_log")"
+  assert_eq "ready ownership cf-domain-failed" "$(paste -sd' ' "$event_log")" \
+    "failed preflight event boundary"
+)
+
+test_task6_real_preflight_order_and_zero_mutation
+printf 'PASS: Task 6 real preflight boundary tests\n'
+
+test_task6_cloudflare_preflight_temp_cleanup() (
+  local temp_dir status
+  temp_dir="$(mktemp -d)"
+  trap 'rm -rf "$temp_dir"' RETURN
+  TMPDIR="$temp_dir"
+  MODE="cloudflare"
+  DOMAIN="vpn.example.com"
+  download_cloudflare_ranges() {
+    install -d -m 700 "$(dirname "$CLOUDFLARE_IPV4_FILE")"
+    printf '104.16.0.0/13\n' >"$CLOUDFLARE_IPV4_FILE"
+    printf '2606:4700::/32\n' >"$CLOUDFLARE_IPV6_FILE"
+  }
+  validate_cloudflare_domain() { return 73; }
+
+  set +e
+  validate_cloudflare_preflight >/dev/null 2>&1
+  status=$?
+  set -e
+  [[ "$status" -ne 0 ]] || fail "invalid Cloudflare preflight unexpectedly passed"
+  [[ -z "$(find "$temp_dir" -mindepth 1 -print -quit)" ]] ||
+    fail "Cloudflare preflight left temporary range data"
+)
+
+test_task6_cloudflare_preflight_temp_cleanup
+printf 'PASS: Task 6 Cloudflare preflight cleanup tests\n'
+
+test_task6_deployment_stage_order() (
+  local temp_dir order_log expected mode
   temp_dir="$(mktemp -d)"
   trap 'rm -rf "$temp_dir"' RETURN
   order_log="$temp_dir/order.log"
   event() { printf '%s\n' "$1" >>"$order_log"; }
-  reset_options
-  MODE="direct"
-  direct_bundle_ready() { return 0; }
-  HY2_PORT_RANGE="20000-20100"
-  SS_PORT="8388"
-  RUNTIME_DIR="$temp_dir/run"
-  ACME_WEBROOT="$temp_dir/acme"
-  begin_transaction() {
-    RUN_TIMESTAMP="test"
-    BACKUP_DIR="$temp_dir/backup"
-    init_backup_metadata
-    cat >"$BACKUP_DIR/services" <<'EOF'
-v2ray	inactive	disabled
-xray	inactive	disabled
-nginx	inactive	disabled
-hysteria-server	inactive	disabled
-EOF
-    event backup
-  }
-  validate_managed_destination_ownership() { event ownership; }
-  install_required_packages() { event packages; }
-  install_xray_core() { event xray-install; }
-  run_guarded_service_action() { local service="$1"; shift; event "guard:$service"; "$@"; }
-  generate_runtime_values() { event generate; }
-  validate_loaded_runtime_values() { event runtime-validate; }
-  download_cloudflare_ranges() { event cf-download; }
-  check_public_port_listeners() { event public-ports; }
-  check_internal_ws_port_listener() { event internal-port; }
-  render_xray_config() { printf '{}\n' >"$1"; event render; }
-  xray() { event xray-test; }
-  stage_hysteria_bundle() { event hysteria-stage; }
-  stop_legacy_service_for_cutover() { event v2ray-stop; }
-  release_legacy_nginx_listeners() { event nginx-release; }
-  install_validated_xray_config() { event config-install; }
-  ensure_hysteria_account() { event hysteria-account; }
-  install_validated_hysteria_binary() { event hysteria-binary-install; }
-  install_hysteria_runtime_files() { event hysteria-files-install; }
-  write_hysteria_ownership_manifest() { event hysteria-manifest; }
-  verify_hysteria_service_definition() { event hysteria-definition; }
-  verify_hysteria_runtime_identity() { event hysteria-runtime; }
-  systemctl() { event "systemctl:$*"; }
-  verify_started_services() { event listeners-ok; }
-  disable_legacy_v2ray_after_success() { event v2ray-disable; }
-  save_state() { event state-save; }
+  prepare_fresh_inputs() { event preflight; }
+  begin_transaction() { event backup; }
+  install_mode_dependencies() { event packages; }
+  generate_mode_credentials() { event values; }
+  stage_mode_configurations() { event stage; }
+  validate_staged_configurations() { event validate; }
+  stop_mode_services() { event stop; }
+  install_staged_configurations() { event install; }
+  start_mode_services() { event start; }
+  verify_mode_services() { event readiness; }
+  save_state() { event state; }
   configure_firewall() { event firewall; }
-  print_deployment_summary() { event output; }
-  set +e
-  ( set -Eeuo pipefail; deploy_services )
-  status=$?
-  set -e
-  [[ "$status" -eq 0 ]] || fail "mock deployment failed unexpectedly: $(tr '\n' ',' <"$order_log")"
-  grep -Fq 'cf-download' "$order_log" && fail "direct-only downloaded Cloudflare ranges"
-  [[ "$(grep -n '^xray-test$' "$order_log" | cut -d: -f1)" -lt "$(grep -n '^config-install$' "$order_log" | cut -d: -f1)" ]] ||
-    fail "Xray test did not precede config installation"
-  [[ "$(grep -n '^public-ports$' "$order_log" | cut -d: -f1)" -lt \
-    "$(grep -n '^hysteria-stage$' "$order_log" | cut -d: -f1)" && \
-    "$(grep -n '^hysteria-stage$' "$order_log" | cut -d: -f1)" -lt \
-    "$(grep -n '^v2ray-stop$' "$order_log" | cut -d: -f1)" ]] ||
-    fail "Hysteria2 staging did not finish before cutover stop"
-  [[ "$(grep -n '^listeners-ok$' "$order_log" | cut -d: -f1)" -lt "$(grep -n '^v2ray-disable$' "$order_log" | cut -d: -f1)" ]] ||
-    fail "V2Ray was disabled before listener validation"
-  [[ "$(grep -n '^listeners-ok$' "$order_log" | cut -d: -f1)" -lt \
-    "$(grep -n '^hysteria-runtime$' "$order_log" | cut -d: -f1)" ]] ||
-    fail "Hysteria2 runtime identity was checked before readiness"
-  [[ "$(grep -n '^hysteria-runtime$' "$order_log" | cut -d: -f1)" -lt \
-    "$(grep -n '^state-save$' "$order_log" | cut -d: -f1)" ]] ||
-    fail "state was saved before Hysteria2 runtime identity validation"
+  verify_cloudflare_when_enabled() { event edge; }
+  print_deployment_summary() { event summary; }
+  complete_transaction() { event commit; }
+  expected="preflight backup packages values stage validate stop install start readiness state firewall edge summary commit"
 
-  : >"$order_log"
-  verify_started_services() { event listeners-failed; return 1; }
-  rollback_current_run() { event rollback; }
-  set +e
-  (
-    set -Eeuo pipefail
-    activate_transaction_traps
+  for mode in direct cloudflare full; do
+    : >"$order_log"
+    MODE="$mode"
     deploy_services
-  ) >/dev/null 2>&1
-  status=$?
-  set -e
-  [[ "$status" -ne 0 ]] || fail "failed deployment unexpectedly succeeded"
-  grep -Fq 'rollback' "$order_log" || fail "ERR trap did not roll back"
-  grep -Fq 'v2ray-disable' "$order_log" && fail "failed deployment disabled V2Ray"
-  :
+    assert_eq "$expected" "$(paste -sd' ' "$order_log")" "$mode deployment stage order"
+  done
 )
 
-test_deployment_order_and_failure_trap
-printf 'PASS: deployment ordering tests\n'
+test_task6_deployment_stage_order
+printf 'PASS: Task 6 deployment stage ordering tests\n'
+
+test_task6_stage_mode_isolation() (
+  local temp_dir event_log mode
+  temp_dir="$(mktemp -d)"
+  trap 'rm -rf "$temp_dir"' RETURN
+  event_log="$temp_dir/events.log"
+  event() { printf '%s\n' "$1" >>"$event_log"; }
+  reset_options
+  RUNTIME_DIR="$temp_dir/run"
+  install -d "$RUNTIME_DIR"
+  ACME_WEBROOT="$temp_dir/acme"
+  RENEWAL_HOOK="$temp_dir/renewal-hook"
+  HY2_PORT_RANGE="20000-20100"
+  SS_PORT="8388"
+
+  download_cloudflare_ranges() { event cf-ranges; }
+  validate_cloudflare_domain() { event cf-domain; }
+  check_public_port_listeners() { event public-ports; }
+  check_internal_ws_port_listener() {
+    if mode_has_cloudflare; then
+      event cf-internal-port
+    fi
+  }
+  render_xray_config() { event xray-render; }
+  stage_hysteria_bundle() { event hy2-stage; }
+  xray() { event xray-validate; }
+  validate_staged_nginx_config() { event "cf-staged-validate:$2"; }
+  validate_loaded_runtime_values() { event values-validate; }
+  release_legacy_nginx_listeners() { event listener-release; }
+  render_nginx_site() { event "cf-render:$2"; }
+  install_nginx_config_atomically() { event cf-install; }
+  activate_nginx_config() { event cf-activate; }
+  request_certificate() { event cf-certificate; }
+  nginx() { event cf-nginx-test; }
+  create_renewal_hook() { event cf-renewal; }
+  install_validated_xray_config() { event xray-install; }
+  ensure_hysteria_account() { event hy2-account; }
+  install_validated_hysteria_binary() { event hy2-binary; }
+  install_hysteria_runtime_files() { event hy2-files; }
+  write_hysteria_ownership_manifest() { event hy2-manifest; }
+  verify_hysteria_service_definition() { event hy2-unit-verify; }
+  run_service_mutation() { event "service:$1:$2"; }
+  systemctl() { event "systemctl:$*"; }
+  check_cloudflare_edge() { event cf-edge; }
+
+  for mode in direct cloudflare full; do
+    : >"$event_log"
+    MODE="$mode"
+    event stage-boundary
+    stage_mode_configurations
+    event validate-boundary
+    validate_staged_configurations
+    event stop-boundary
+    event install-boundary
+    install_staged_configurations
+    start_mode_services
+    verify_cloudflare_when_enabled
+    case "$mode" in
+      direct)
+        ! grep -q '^cf-' "$event_log" || fail "direct stages touched Cloudflare: $(tr '\n' ',' <"$event_log")"
+        grep -Fqx 'hy2-stage' "$event_log" || fail "direct stages omitted Hysteria2"
+        grep -Fqx 'service:hysteria-server:restart' "$event_log" || fail "direct stages did not start Hysteria2"
+        ;;
+      cloudflare)
+        ! grep -q '^hy2-' "$event_log" || fail "Cloudflare stages touched Hysteria2: $(tr '\n' ',' <"$event_log")"
+        ! grep -q 'service:hysteria-server' "$event_log" || fail "Cloudflare stages started Hysteria2"
+        grep -Fqx 'cf-certificate' "$event_log" || fail "Cloudflare stages omitted certificate flow"
+        grep -Fqx 'cf-edge' "$event_log" || fail "Cloudflare stages omitted edge verification"
+        assert_eq "2" "$(grep -c '^cf-render:' "$event_log")" "Cloudflare staged Nginx render count"
+        assert_eq "2" "$(grep -c '^cf-staged-validate:' "$event_log")" "Cloudflare staged Nginx validation count"
+        [[ "$(grep -n '^cf-render:' "$event_log" | tail -n 1 | cut -d: -f1)" -lt \
+          "$(grep -n '^validate-boundary$' "$event_log" | cut -d: -f1)" ]] ||
+          fail "Cloudflare Nginx rendering occurred after the stage boundary"
+        [[ "$(grep -n '^cf-staged-validate:' "$event_log" | tail -n 1 | cut -d: -f1)" -lt \
+          "$(grep -n '^stop-boundary$' "$event_log" | cut -d: -f1)" ]] ||
+          fail "Cloudflare Nginx validation occurred after the stop boundary"
+        ;;
+      full)
+        grep -Fqx 'hy2-stage' "$event_log" || fail "full stages omitted Hysteria2"
+        grep -Fqx 'cf-certificate' "$event_log" || fail "full stages omitted Cloudflare certificate flow"
+        grep -Fqx 'service:hysteria-server:restart' "$event_log" || fail "full stages did not start Hysteria2"
+        grep -Fqx 'cf-edge' "$event_log" || fail "full stages omitted edge verification"
+        [[ "$(grep -n '^cf-render:' "$event_log" | tail -n 1 | cut -d: -f1)" -lt \
+          "$(grep -n '^stop-boundary$' "$event_log" | cut -d: -f1)" ]] ||
+          fail "full mode first rendered Nginx after stopping services"
+        ;;
+    esac
+  done
+)
+
+test_task6_stage_mode_isolation
+printf 'PASS: Task 6 stage mode isolation tests\n'
+
+test_task6_staged_nginx_validation_is_isolated() (
+  local temp_dir nginx_log initial final original_final candidate config prefix status
+  temp_dir="$(mktemp -d)"
+  trap 'rm -rf "$temp_dir"' RETURN
+  RUNTIME_DIR="$temp_dir/runtime"
+  install -d -m 700 "$RUNTIME_DIR"
+  DOMAIN="vpn.example.com"
+  CLOUDFLARE_PORT="8443"
+  INTERNAL_WS_PORT="31001"
+  WS_PATH="/staged-validation"
+  ACME_WEBROOT="$temp_dir/acme"
+  initial="$RUNTIME_DIR/nginx-initial.conf"
+  final="$RUNTIME_DIR/nginx-final.conf"
+  nginx_log="$temp_dir/nginx.log"
+  render_nginx_site "$initial" initial
+  render_nginx_site "$final" final
+  original_final="$(cat "$final")"
+
+  nginx() {
+    [[ "$1" == "-t" && "$2" == "-p" && "$4" == "-c" ]] ||
+      fail "staged Nginx validation did not use isolated -t/-p/-c: $*"
+    prefix="${3%/}"
+    config="$5"
+    [[ "$prefix" == "$RUNTIME_DIR"/nginx-validate.* ]] || fail "Nginx validation prefix escaped runtime"
+    [[ "$config" == "$prefix/nginx.conf" ]] || fail "Nginx validation used an unexpected config"
+    candidate="$(awk '$1 == "include" { value=$2; gsub(/[";]/, "", value); print value }' "$config")"
+    [[ -f "$candidate" ]] || fail "isolated Nginx candidate is missing"
+    grep -Fq 'this_directive_is_invalid' "$candidate" && return 1
+    if grep -Fq 'listen 8443 ssl;' "$candidate"; then
+      grep -Fq '/etc/letsencrypt/' "$candidate" &&
+        fail "staged final validation referenced production certificates"
+    fi
+    printf '%s\n' "$*" >>"$nginx_log"
+  }
+
+  validate_staged_nginx_config "$initial" initial
+  validate_staged_nginx_config "$final" final
+  assert_eq "2" "$(wc -l <"$nginx_log" | tr -d ' ')" "isolated Nginx syntax test count"
+  assert_eq "$original_final" "$(cat "$final")" "staged final config mutation"
+  [[ -z "$(find "$RUNTIME_DIR" -maxdepth 1 -type d -name 'nginx-validate.*' -print -quit)" ]] ||
+    fail "Nginx validation left an isolated prefix"
+
+  printf '\nthis_directive_is_invalid;\n' >>"$initial"
+  set +e
+  validate_staged_nginx_config "$initial" initial >/dev/null 2>&1
+  status=$?
+  set -e
+  [[ "$status" -ne 0 ]] || fail "invalid staged Nginx syntax unexpectedly passed"
+)
+
+test_task6_staged_nginx_validation_is_isolated
+printf 'PASS: Task 6 isolated Nginx validation tests\n'
+
+test_task6_direct_without_project_nginx_has_zero_nginx_calls() (
+  local temp_dir command_log
+  temp_dir="$(mktemp -d)"
+  trap 'rm -rf "$temp_dir"' RETURN
+  MODE="direct"
+  NGINX_SITE="$temp_dir/nginx/v2ray-onekey.conf"
+  RENEWAL_HOOK="$temp_dir/hooks/v2ray-onekey-nginx.sh"
+  BACKUP_DIR="$temp_dir/backup"
+  command_log="$temp_dir/commands.log"
+  init_backup_metadata
+  legacy_nginx_config_paths() { :; }
+  command() { printf 'command %s\n' "$*" >>"$command_log"; return 127; }
+  nginx() { printf 'nginx %s\n' "$*" >>"$command_log"; return 1; }
+  systemctl() { printf 'systemctl %s\n' "$*" >>"$command_log"; return 1; }
+
+  release_legacy_nginx_listeners
+  [[ ! -e "$command_log" ]] || fail "unrelated Nginx was touched during direct cleanup: $(cat "$command_log")"
+
+  query_service_state() {
+    printf '%s\n' "$1" >>"$command_log"
+    printf 'inactive\tdisabled\n'
+  }
+  record_service_states
+  grep -Fqx nginx "$command_log" && fail "direct transaction inspected unrelated Nginx service state"
+)
+
+test_task6_direct_without_project_nginx_has_zero_nginx_calls
+printf 'PASS: Task 6 unrelated Nginx isolation tests\n'
+
+test_task6_cloudflare_transition_retires_project_hysteria() (
+  local temp_dir service_log
+  temp_dir="$(mktemp -d)"
+  trap 'rm -rf "$temp_dir"' RETURN
+  service_log="$temp_dir/services.log"
+  reset_options
+  MODE="cloudflare"
+  service_was_active() { [[ "$1" == "hysteria-server" ]]; }
+  project_hysteria_listener_pid() { printf '4242\n'; }
+  run_service_mutation() { printf '%s %s %s\n' "$1" "$2" "${3:-}" >>"$service_log"; }
+  stop_mode_services
+  grep -Fqx 'hysteria-server stop ' "$service_log" ||
+    fail "Cloudflare transition did not stop the project Hysteria2 service"
+
+  : >"$service_log"
+  hysteria_deployment_is_strictly_project_owned() { return 0; }
+  verify_started_services() { :; }
+  disable_legacy_v2ray_after_success() { :; }
+  verify_mode_services
+  grep -Fqx 'hysteria-server disable --now' "$service_log" ||
+    fail "Cloudflare transition did not disable the project Hysteria2 service"
+)
+
+test_task6_cloudflare_transition_retires_project_hysteria
+printf 'PASS: Task 6 Cloudflare transition tests\n'
 
 test_transaction_exit_trap() (
   local temp_dir managed rollback_log status
@@ -4781,30 +5001,71 @@ test_transaction_exit_trap() (
 test_transaction_exit_trap
 printf 'PASS: transaction EXIT trap tests\n'
 
-test_mode_specific_output() (
+test_task6_mode_specific_output() (
   reset_options
   MODE="full"
   DOMAIN="vpn.example.com"
   CLOUDFLARE_PORT="2053"
   CLOUDFLARE_UUID="22222222-2222-4222-8222-222222222222"
   WS_PATH="/saved-path"
+  SERVER_ADDRESS="2001:db8::10"
+  HY2_PORT_RANGE="20000-20100"
+  HY2_AUTH="$HY2_TEST_AUTH"
+  HY2_OBFS_PASSWORD="$HY2_TEST_OBFS"
+  HY2_SNI="0123456789abcdef.invalid"
+  HY2_CERT_PIN="AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA:AA"
+  SS_PORT="8388"
+  SS_METHOD="2022-blake3-aes-128-gcm"
+  SS_KEY="$SS_TEST_KEY"
   STATE_FILE="/etc/v2ray-onekey/state.env"
   BACKUP_DIR="/var/backups/v2ray-onekey/test"
-  local output
+  local output cloudflare_line hysteria_line shadowsocks_line
   output="$(print_deployment_summary)"
   [[ "$output" == *'Cloudflare entry: VLESS + WebSocket + TLS'* ]] || fail "full output lacks Cloudflare label"
   [[ "$output" == *'@vpn.example.com:2053'* ]] || fail "full output omits the Cloudflare link"
+  [[ "$output" == *'Hysteria2 entry: Salamander + pinned certificate'* ]] || fail "full output lacks Hysteria2 label"
+  [[ "$output" == *'hysteria2://'*'@[2001:db8::10]:20000-20100/'* ]] || fail "full output omits IPv6 Hysteria2 link"
+  [[ "$output" == *'Shadowsocks entry: 2022-blake3-aes-128-gcm'* ]] || fail "full output lacks Shadowsocks label"
+  [[ "$output" == *'ss://'*'@[2001:db8::10]:8388#'* ]] || fail "full output omits IPv6 Shadowsocks link"
   [[ "$output" != *'REALITY'* ]] || fail "full output exposes retired protocol behavior"
+  cloudflare_line="$(grep -n '^vless://' <<<"$output" | cut -d: -f1)"
+  hysteria_line="$(grep -n '^hysteria2://' <<<"$output" | cut -d: -f1)"
+  shadowsocks_line="$(grep -n '^ss://' <<<"$output" | cut -d: -f1)"
+  (( cloudflare_line < hysteria_line && hysteria_line < shadowsocks_line )) ||
+    fail "full output link order is not Cloudflare, Hysteria2, Shadowsocks"
+  [[ "$output" == *'Diagnostics: systemctl status xray hysteria-server; journalctl -u xray -u hysteria-server -e; nginx -t'* ]] ||
+    fail "full diagnostics omit an active service"
+  [[ "$output" == *'Cloud security group: TCP 80,2053,8388 and UDP 8388,20000-20100'* ]] ||
+    fail "full cloud security group guidance is incomplete"
+  assert_eq $'TCP 80\nTCP 2053\nTCP 8388\nUDP 8388\nUDP 20000-20100' \
+    "$(required_public_ports)" "full required public ports"
+  [[ "$output" == *'only the Cloudflare path avoids direct client connections to the server IP'* ]] ||
+    fail "full output lacks direct-IP warning"
+
   MODE="direct"
   output="$(print_deployment_summary)"
-  [[ "$output" != *'vless://'* ]] || fail "direct output contains an unimplemented public link"
-  [[ "$output" == *'No public listeners are configured for direct mode'* ]] || fail "direct output does not explain the interim listener state"
+  [[ "$output" != *'vless://'* ]] || fail "direct output contains a Cloudflare link"
+  [[ "$output" == *'hysteria2://'* && "$output" == *'ss://'* ]] || fail "direct output omits direct links"
+  [[ "$output" == *'Diagnostics: systemctl status xray hysteria-server; journalctl -u xray -u hysteria-server -e'* ]] ||
+    fail "direct diagnostics are incomplete"
+  [[ "$output" != *'nginx -t'* ]] || fail "direct diagnostics contain Nginx"
+  [[ "$output" == *'Cloud security group: TCP 8388 and UDP 8388,20000-20100'* ]] ||
+    fail "direct cloud security group guidance is incomplete"
+  assert_eq $'TCP 8388\nUDP 8388\nUDP 20000-20100' \
+    "$(required_public_ports)" "direct required public ports"
+
   MODE="cloudflare"
   output="$(print_deployment_summary)"
   [[ "$output" == *'Cloudflare entry:'* && "$output" == *'@vpn.example.com:2053'* ]] || fail "Cloudflare output labels are wrong"
+  ! grep -qE '^(hysteria2|ss)://' <<<"$output" || fail "Cloudflare-only output contains direct links"
+  [[ "$output" == *'Diagnostics: systemctl status xray; journalctl -u xray -e; nginx -t'* ]] ||
+    fail "Cloudflare diagnostics are wrong"
+  [[ "$output" == *'Cloud security group: TCP 80,2053'* ]] || fail "Cloudflare ports are wrong"
+  [[ "$output" != *'UDP '* && "$output" != *'8388'* ]] || fail "Cloudflare-only output contains direct ports"
+  assert_eq $'TCP 80\nTCP 2053' "$(required_public_ports)" "Cloudflare required public ports"
 )
 
-test_mode_specific_output
-printf 'PASS: mode-specific output tests\n'
+test_task6_mode_specific_output
+printf 'PASS: Task 6 mode-specific output tests\n'
 
 printf 'PASS: mode and validation tests\n'
