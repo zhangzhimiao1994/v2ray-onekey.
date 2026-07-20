@@ -122,4 +122,24 @@ validate_pre_certificate_runtime_values
   exit 1
 }
 
+transaction_log="$permission_root/upgrade-transaction.log"
+inspect_existing_cloudflare() { :; }
+prepare_upgrade_inputs() { :; }
+activate_transaction_traps() { printf 'activate\n' >>"$transaction_log"; }
+acquire_deployment_lock() { printf 'lock\n' >>"$transaction_log"; }
+begin_transaction() { printf 'backup\n' >>"$transaction_log"; exit 23; }
+set +e
+(deploy_upgrade_cf)
+transaction_status=$?
+set -e
+[[ "$transaction_status" -eq 23 ]] || {
+  printf 'upgrade transaction ordering probe returned an unexpected status\n' >&2
+  exit 1
+}
+printf 'activate\nlock\nbackup\n' >"$permission_root/expected-transaction.log"
+cmp -s "$permission_root/expected-transaction.log" "$transaction_log" || {
+  printf 'upgrade transaction protection was not activated before locking and backup\n' >&2
+  exit 1
+}
+
 printf 'PASS: existing Cloudflare upgrade installer tests\n'

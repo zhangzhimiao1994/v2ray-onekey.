@@ -4449,6 +4449,7 @@ install_upgrade_staged_configurations() {
 deploy_upgrade_cf() {
   inspect_existing_cloudflare
   prepare_upgrade_inputs
+  activate_transaction_traps
   acquire_deployment_lock
   begin_transaction
   install_upgrade_dependencies
