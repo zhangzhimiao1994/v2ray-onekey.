@@ -369,7 +369,7 @@ acl:
   file: /etc/hysteria/acl.txt
 ```
 
-Assert the unit executes `/usr/local/bin/hysteria server -c /etc/hysteria/config.yaml`, runs as `hysteria`, and grants only `CAP_NET_ADMIN` and `CAP_NET_BIND_SERVICE`. Assert the URI contains `obfs=salamander`, `obfs-password`, `sni`, `insecure=1`, `pinSHA256`, and `20000-20100`.
+Assert the unit executes `/usr/local/bin/hysteria server -c /etc/hysteria/config.yaml`, runs as `hysteria`, and grants only `CAP_NET_ADMIN` and `CAP_NET_BIND_SERVICE`. Assert the URI contains `obfs=salamander`, `obfs-password`, `sni`, `pinSHA256`, and `20000-20100`, without `insecure` or `allowInsecure`.
 
 - [ ] **Step 2: Run the tests and verify they fail**
 
@@ -473,7 +473,7 @@ Add:
 
 ```bash
 make_hysteria_link() {
-  printf 'hysteria2://%s@%s:%s/?obfs=salamander&obfs-password=%s&sni=%s&insecure=1&pinSHA256=%s#%s\n' \
+  printf 'hysteria2://%s@%s:%s/?obfs=salamander&obfs-password=%s&sni=%s&pinSHA256=%s#%s\n' \
     "$(urlencode "$HY2_AUTH")" "$(format_uri_host "$SERVER_ADDRESS")" "$HY2_PORT_RANGE" \
     "$(urlencode "$HY2_OBFS_PASSWORD")" "$(urlencode "$HY2_SNI")" \
     "$(urlencode "$HY2_CERT_PIN")" "$(urlencode 'Hysteria2-direct')"

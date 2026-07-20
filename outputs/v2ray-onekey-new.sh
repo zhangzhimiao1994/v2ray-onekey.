@@ -4708,7 +4708,6 @@ query = urllib.parse.urlencode(
         ("obfs", "salamander"),
         ("obfs-password", obfs_password),
         ("sni", sni),
-        ("insecure", "1"),
         ("pcs", pin),
         ("pinSHA256", pin),
     ],

@@ -96,7 +96,7 @@ Defaults:
 - Listen and hopping range: UDP `20000-20100`.
 - Client hopping interval: randomized within a conservative supported range.
 - TLS: a generated self-signed certificate with a generated DNS SAN.
-- Client verification: `insecure=1` together with `pinSHA256`; the pin is mandatory in generated output.
+- Client verification: mandatory `pinSHA256` certificate pinning without `insecure`/`allowInsecure`.
 
 Salamander is selected instead of an HTTP/3 masquerade because the official Hysteria2 documentation states that enabling obfuscation makes the endpoint incompatible with ordinary QUIC. The installer must not claim both behaviors simultaneously.
 

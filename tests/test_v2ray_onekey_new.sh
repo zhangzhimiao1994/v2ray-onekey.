@@ -871,7 +871,6 @@ for link, host in zip(links, expected_hosts):
         "obfs": ["salamander"],
         "obfs-password": [sys.argv[2]],
         "sni": [sys.argv[3]],
-        "insecure": ["1"],
         "pcs": [compact_pin],
         "pinSHA256": [compact_pin],
     }
